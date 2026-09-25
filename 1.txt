@@ -1,0 +1,94 @@
+# 1. 起靶机(可换 banner: Apache/2.4.49 | 2.4.50 | 2.4.51)
+./bin/labtarget.exe -addr 127.0.0.1:8080 -banner Apache/2.4.49
+
+# 2. passive(看 banner)
+./bin/gopoc.exe scan -u http://127.0.0.1:8080 --allow 127.0.0.1
+
+# 3. active-canary(真读文件确认)
+./bin/gopoc.exe scan -u http://127.0.0.1:8080 --mode active-canary --config examples/canary.yaml --cve CVE-2021-41773,CVE-2021-42013
+
+
+
+方向
+
+多协议、低误报、证据链驱动的高危漏洞评估框架
+confirmed 尽量接近零误报；likely 极低误报；detected 明确不等于漏洞成立。
+
+
+                ┌─ CVE Checker
+                │
+Target → Fingerprint
+                │
+                ├─ Known Vuln Rules
+                │
+                ├─ Passive Analysis
+                │
+                ├─ Active Probe
+                │
+                ├─ Fuzz Engine
+                │
+                ├─ State Machine Tester
+                │
+                ├─ Differential Tester
+                │
+                └─ Source Audit
+                       ↓
+                 Suspicious Finding
+                       ↓
+                 Reproduce / Confirm
+                       ↓
+                    Finding
+
+对，核心就锁这个。
+
+外面的扫描器很多，真正有差异化价值的不是“能扫多少 CVE”，而是这三点同时成立：
+
+- **多协议**：不只 HTTP，还能处理 T3、IIOP、原始 TCP、后面甚至可以继续扩 TLS 上层协议。
+- **低误报**：版本命中只算 `detected`，危险面成立才到 `likely`，`confirmed` 必须有硬证据链。
+- **证据链驱动**：每个结论都能解释“为什么这么判”，而不是黑盒打分。
+
+这会让你的产品从“漏洞库”变成“评估引擎”。
+
+后面的开发原则我建议也锁死：
+
+```text
+不追求 CVE 数量
+先追求判断可信度
+
+不追求 confirmed 数量
+先保证 confirmed 绝不乱报
+
+不追求 exploit 能力
+先保证安全、可重复、可解释
+
+不把端口开放当漏洞
+不把版本命中当可利用
+不把状态码当确认
+```
+
+真正形成壁垒的，是这套：
+
+```text
+目标
+↓
+产品指纹
+↓
+版本 / build / patch
+↓
+协议级确认
+↓
+配置 / 暴露面判断
+↓
+安全行为证据
+↓
+negative control
+↓
+repeat / diff
+↓
+detected / likely / confirmed
+```
+
+这套如果做好，以后即使只覆盖 100 个高危 CVE，也可能比很多覆盖几千条规则但误报一堆的扫描器更有价值。
+
+所以现在最值得做的下一步就是：**停扩 CVE，开始全框架审计和误报专项测试。**这会是你这个项目真正拉开差距的一步。
+

@@ -1,0 +1,21 @@
+http:
+  timeout: 5s
+  max_body_size: 1048576
+  concurrency: 20
+  per_host: 2
+  rate: 2
+
+allowlist:
+  - 127.0.0.1
+  - "::1"
+
+active:
+  enabled: true
+  canary:
+    # URL prefix configured as an Alias on your lab server.
+    alias_path: /canary-alias/
+    # Filesystem directory depth of the Alias destination.
+    traversal_depth: 4
+    # Place this ordinary text file on the lab server in advance.
+    file_path: /tmp/gopoc-canary.txt
+    expected: GOPOC-CANARY-7f732a64b98947ed

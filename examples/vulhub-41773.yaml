@@ -1,0 +1,23 @@
+http:
+  timeout: 5s
+  max_body_size: 1048576
+  concurrency: 20
+  per_host: 2
+  rate: 2
+
+allowlist:
+  - 127.0.0.1
+  - "::1"
+
+active:
+  enabled: true
+  canary:
+    # vulhub httpd:2.4.49 ships /icons/ as an Alias to
+    # /usr/local/apache2/icons/, which is 4 directories below /.
+    alias_path: /icons/
+    traversal_depth: 4
+    # Place this file inside the container before scanning:
+    #   docker compose exec -T apache sh -c \
+    #     'printf %s GOPOC-CANARY-7f732a64b98947ed > /tmp/gopoc-canary.txt'
+    file_path: /tmp/gopoc-canary.txt
+    expected: GOPOC-CANARY-7f732a64b98947ed

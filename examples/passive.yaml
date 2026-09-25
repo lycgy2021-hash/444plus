@@ -1,0 +1,17 @@
+http:
+  timeout: 5s
+  max_body_size: 1048576
+  concurrency: 20
+  per_host: 2
+  rate: 2
+  redirects: 3
+  user_agent: gopoc/0.1
+  proxy: ""
+  dns: ""
+  insecure_tls: false
+
+# Empty means the explicit input targets define the scope.
+allowlist: []
+
+active:
+  enabled: false
