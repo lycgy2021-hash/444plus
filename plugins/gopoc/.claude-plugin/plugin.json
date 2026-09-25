@@ -1,0 +1,12 @@
+{
+  "name": "gopoc",
+  "displayName": "gopoc",
+  "version": "0.1.0",
+  "description": "Go HTTP vulnerability detection framework: CVE checkers, evidence-tiered verdicts, JSON/SQLite reporting",
+  "author": {
+    "name": "lycgy2021-hash"
+  },
+  "repository": "https://github.com/lycgy2021-hash/444plus",
+  "license": "UNLICENSED",
+  "keywords": ["security", "cve", "vulnerability-scanner", "http"]
+}

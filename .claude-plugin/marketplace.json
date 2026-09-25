@@ -4,5 +4,11 @@
   "owner": {
     "name": "lycgy2021-hash"
   },
-  "plugins": []
+  "plugins": [
+    {
+      "name": "gopoc",
+      "source": "./plugins/gopoc",
+      "description": "Go HTTP vulnerability detection framework: CVE checkers, evidence-tiered verdicts, JSON/SQLite reporting"
+    }
+  ]
 }
