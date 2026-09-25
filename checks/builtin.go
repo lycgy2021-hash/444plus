@@ -6,6 +6,7 @@ import (
 	"gopoc/checks/apache"
 	"gopoc/checks/fortinet"
 	"gopoc/checks/ingressnginx"
+	"gopoc/checks/jbosswildfly"
 	"gopoc/checks/netscaler"
 	"gopoc/checks/nginx"
 	"gopoc/checks/nginxui"
@@ -32,6 +33,7 @@ func Builtin(client httpx.Probe, mode model.Mode, canary model.CanaryConfig) (*r
 		weblogic.NewCVE202660198(client), weblogic.NewCVE202660202(client),
 		oracleproxy.NewCVE202621962(client), oracleproxy.NewCVE202660364(client),
 		netscaler.NewCVE20257775(client), netscaler.NewCVE20256543(client),
+		jbosswildfly.NewUnauthenticatedManagement(client),
 	} {
 		if err := r.Register(c); err != nil {
 			return nil, err

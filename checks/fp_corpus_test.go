@@ -127,6 +127,28 @@ func TestFalsePositiveCorpusHTTP(t *testing.T) {
 			w.WriteHeader(401)
 			w.Write([]byte(`{"message":"Authorization failed"}`))
 		}},
+		// Adversarial: an ordinary, unrelated Digest challenge must not be read as
+		// JBoss/WildFly's management interface just because it is a 401.
+		{"plain_digest_401", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("WWW-Authenticate", `Digest realm="corporate-intranet", qop="auth"`)
+			w.WriteHeader(401)
+		}},
+		// Adversarial: a generic Java admin console must not be fingerprinted as
+		// JBoss/WildFly.
+		{"generic_java_admin", "Apache-Coyote/1.1", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html><body><h1>Admin Console</h1><form>Login</form></body></html>`))
+		}},
+		// Adversarial: the literal string "ManagementRealm" sitting in a page BODY
+		// (not a WWW-Authenticate header) must not be mistaken for the real
+		// challenge, whatever else the page says.
+		{"managementrealm_text_in_body", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html>Contact support to reset your ManagementRealm password.</html>`))
+		}},
+		// Adversarial: a forged WildFly welcome page, unsupported by any real
+		// management-interface evidence, must never reach likely/confirmed.
+		{"fake_wildfly_welcome", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html><body>Welcome to WildFly - powered by our totally unrelated product</body></html>`))
+		}},
 	}
 	for _, tc := range corpus {
 		t.Run(tc.name, func(t *testing.T) {
