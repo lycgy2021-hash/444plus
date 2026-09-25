@@ -105,6 +105,16 @@ func TestUnauthManagementLadder(t *testing.T) {
 			version: "31.0.1.Final",
 		},
 		{
+			// Regression: a real WildFly GET /management returns the bare DMR root
+			// resource with NO "outcome" wrapper (confirmed on live 41.0.1.Final);
+			// this must still reach likely.
+			name:    "unauth_management_bare_get",
+			probe:   mockProbe{fpBody: "<html>Welcome to WildFly</html>", mgmtStatus: 200, mgmtBody: `{"management-major-version" : 34, "management-micro-version" : 0, "management-minor-version" : 0, "name" : "8f788e71215a", "product-name" : "WildFly", "product-version" : "41.0.1.Final", "release-version" : "33.0.1.Final"}`},
+			want:    model.VerdictLikely,
+			reason:  "unauthenticated_management_exposed",
+			version: "41.0.1.Final",
+		},
+		{
 			name:   "management_state_unclear",
 			probe:  mockProbe{fpBody: "<html>Welcome to WildFly</html>", mgmtStatus: 200, mgmtBody: "<html>some other page</html>"},
 			want:   model.VerdictUnknown,

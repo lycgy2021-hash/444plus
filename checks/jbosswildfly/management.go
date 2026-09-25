@@ -87,13 +87,22 @@ func requiresAuth(r httpx.Response) bool {
 	return strings.Contains(strings.ToLower(r.Get("WWW-Authenticate")), "managementrealm")
 }
 
-// unauthenticatedData reports whether r is the management API answering the
-// default read-resource GET with product/version data and NO authentication
-// challenge — the misconfiguration this package exists to find.
+// unauthenticatedData reports whether r is the management API answering with
+// product/version data and NO authentication challenge — the misconfiguration
+// this package exists to find. A GET read-resource on WildFly returns the bare
+// DMR root JSON (product-name/product-version/release-version plus the kernel's
+// own "management-major-version"), with NO "outcome" wrapper (confirmed on a live
+// WildFly 41.0.1.Final with management auth removed); "outcome" only wraps POST
+// operation results. So we accept either shape, but still require the WildFly
+// management kernel's own metadata field so an unrelated JSON API that merely
+// carries a "product-version" string is not mistaken for this interface.
 func unauthenticatedData(r httpx.Response) bool {
 	if r.StatusCode != 200 {
 		return false
 	}
 	body := string(r.Body)
-	return strings.Contains(body, `"outcome"`) && managementDataRE.MatchString(body)
+	if !managementDataRE.MatchString(body) {
+		return false
+	}
+	return strings.Contains(body, `"management-major-version"`) || strings.Contains(body, `"outcome"`)
 }

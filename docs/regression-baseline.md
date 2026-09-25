@@ -40,6 +40,26 @@ Deterministic (no live target needed): `go test ./checks/weblogic/ -run
 TestSharedAssessmentCache` proves the 8 WebLogic CVEs share one assessment
 (2 TCP + 3 GET) vs 8× uncached.
 
+## JBoss/WildFly management interface (two-state, real-validated)
+
+Real WildFly (`quay.io/wildfly/wildfly:latest`, 41.0.1.Final; mgmt on 9990). Probe
+from **inside WSL** (Docker-Desktop Windows→WSL forwarding is flaky; the container
+itself is stable). `MISCONFIG-JBOSSWILDFLY-UNAUTH-MGMT`:
+
+| Management config | `/management` response | Expected verdict |
+| --- | --- | --- |
+| default (secure) | `401 WWW-Authenticate: Digest realm="ManagementRealm"` | `detected` / `management_requires_auth` |
+| auth removed (open) | `200` + bare DMR JSON (`product-version`, `management-major-version`) | `likely` / `unauthenticated_management_exposed` |
+
+Open it on a running container:
+```
+docker exec gopoc-wildfly sed -i 's/ http-authentication-factory="[^"]*"//' \
+  /opt/jboss/wildfly/standalone/configuration/standalone.xml
+docker restart gopoc-wildfly
+```
+Note: real GET /management returns the DMR root **without** an `"outcome"` wrapper
+(that only wraps POST results) — the checker must match the bare-GET shape.
+
 ## Standing gates (must stay green on every change)
 
 - `go build ./... && go vet ./... && go test ./...`

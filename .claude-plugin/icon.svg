@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">444.PLUS</title>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1">
+      <stop stop-color="#102844"></stop>
+      <stop offset="1" stop-color="#030C1B"></stop>
+    </linearGradient>
+    <linearGradient id="shield" x2=".3" y2="1">
+      <stop stop-color="#155DB1"></stop>
+      <stop offset="1" stop-color="#09254B"></stop>
+    </linearGradient>
+    <linearGradient id="edge" x2=".6" y2="1">
+      <stop stop-color="#75E7FF"></stop>
+      <stop offset=".5" stop-color="#318CFF"></stop>
+      <stop offset="1" stop-color="#1755CB"></stop>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="4" width="248" height="248" rx="48" fill="url(#bg)"></rect>
+  <rect x="5" y="5" width="246" height="246" rx="47" fill="none" stroke="#23466B" stroke-opacity=".7"></rect>
+
+  <path d="M128 25 211 57V107C211 160 177 198 128 225
+           79 198 45 160 45 107V57Z" fill="url(#shield)" stroke="url(#edge)" stroke-width="7" stroke-linejoin="round"></path>
+  <path d="M128 39 198 66V107C198 152 169 186 128 210
+           87 186 58 152 58 107V66Z" fill="none" stroke="#91DFFF" stroke-opacity=".19" stroke-width="1.5"></path>
+  <path d="M61 69 128 43 195 69" fill="none" stroke="#97EFFF" stroke-opacity=".22" stroke-width="2"></path>
+  <rect x="115" y="63" width="26" height="4" rx="2" fill="#73E3FF"></rect>
+
+  <g fill="#F4FAFF" fill-rule="evenodd">
+    <path d="M20 0H32V29H38V39H32V52H21V39H0V29ZM21 14 10 29H21Z" transform="translate(65 89)"></path>
+    <path d="M20 0H32V29H38V39H32V52H21V39H0V29ZM21 14 10 29H21Z" transform="translate(109 89)"></path>
+    <path d="M20 0H32V29H38V39H32V52H21V39H0V29ZM21 14 10 29H21Z" transform="translate(153 89)"></path>
+  </g>
+
+  <g fill="#85E5FF" fill-rule="evenodd">
+    <path d="M86 174H90V178H86Z"></path>
+    <path d="M0 18V0H8Q14 0 14 6T8 12H4V18Z
+             M4 4V8H8Q10 8 10 6T8 4Z" transform="translate(96 160)"></path>
+    <path d="M0 0H4V14H13V18H0Z" transform="translate(116 160)"></path>
+    <path d="M0 0H4V11Q4 14 7 14T10 11V0H14V11Q14 18 7 18T0 11Z" transform="translate(135 160)"></path>
+    <path d="M14 0V4H5Q4 4 4 5T5 7H9Q15 7 15 12V13
+             Q15 18 9 18H0V14H9Q11 14 11 12T9 10H6Q0 10 0 5T6 0Z" transform="translate(155 160)"></path>
+  </g>
+
+  <path d="M128 190V201" stroke="#55BAFF" stroke-width="2" stroke-linecap="round"></path>
+  <circle cx="128" cy="203" r="3" fill="#71DDFF"></circle>
+</svg>
