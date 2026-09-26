@@ -1,6 +1,7 @@
 package research
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -123,8 +124,8 @@ func TestActionSuggestionIsFreelyConstructibleAndAdvisoryOnly(t *testing.T) {
 
 func TestStateFingerprintHashesAreConstructorDerivedNeverCallerSupplied(t *testing.T) {
 	// Same facts (any key order), same raw bytes -> identical fingerprint hashes.
-	f1 := NewStateFingerprint("scope-1", []byte("raw-bytes"), map[string]string{"role": "user", "stage": "login"})
-	f2 := NewStateFingerprint("scope-1", []byte("raw-bytes"), map[string]string{"stage": "login", "role": "user"})
+	f1 := newStateFingerprint("scope-1", []byte("raw-bytes"), map[string]string{"role": "user", "stage": "login"})
+	f2 := newStateFingerprint("scope-1", []byte("raw-bytes"), map[string]string{"stage": "login", "role": "user"})
 	if f1.StateFingerprintHash() != f2.StateFingerprintHash() {
 		t.Fatal("identical facts (any map iteration/insertion order) must hash identically")
 	}
@@ -134,7 +135,7 @@ func TestStateFingerprintHashesAreConstructorDerivedNeverCallerSupplied(t *testi
 
 	// A single changed fact value must change StateFingerprintHash but NOT
 	// RawStateArtifactHash (the two hashes are independent, per different inputs).
-	f3 := NewStateFingerprint("scope-1", []byte("raw-bytes"), map[string]string{"role": "admin", "stage": "login"})
+	f3 := newStateFingerprint("scope-1", []byte("raw-bytes"), map[string]string{"role": "admin", "stage": "login"})
 	if f3.StateFingerprintHash() == f1.StateFingerprintHash() {
 		t.Fatal("a changed fact value must change StateFingerprintHash")
 	}
@@ -144,7 +145,7 @@ func TestStateFingerprintHashesAreConstructorDerivedNeverCallerSupplied(t *testi
 
 	// Different raw bytes, same facts -> different RawStateArtifactHash but the
 	// SAME StateFingerprintHash (it depends only on facts).
-	f4 := NewStateFingerprint("scope-1", []byte("different-raw-bytes"), map[string]string{"role": "user", "stage": "login"})
+	f4 := newStateFingerprint("scope-1", []byte("different-raw-bytes"), map[string]string{"role": "user", "stage": "login"})
 	if f4.RawStateArtifactHash() == f1.RawStateArtifactHash() {
 		t.Fatal("different raw bytes must change RawStateArtifactHash")
 	}
@@ -154,12 +155,12 @@ func TestStateFingerprintHashesAreConstructorDerivedNeverCallerSupplied(t *testi
 
 	// There is no constructor parameter through which a caller could supply
 	// either hash directly — this test documents that absence: the ONLY inputs
-	// NewStateFingerprint accepts are scopeHash, rawArtifact bytes, and facts.
+	// newStateFingerprint accepts are scopeHash, rawArtifact bytes, and facts.
 }
 
 func TestStateFingerprintIsImmutable(t *testing.T) {
 	facts := map[string]string{"role": "user"}
-	fp := NewStateFingerprint("scope-1", []byte("raw-artifact"), facts)
+	fp := newStateFingerprint("scope-1", []byte("raw-artifact"), facts)
 
 	// Mutating the caller's original map after construction must not affect the
 	// fingerprint (facts were copied in) — and, since the hash was computed from
@@ -185,7 +186,7 @@ func TestStateFingerprintIsImmutable(t *testing.T) {
 
 func TestRecoveredRequiresSameScopeAndSameFingerprint(t *testing.T) {
 	fp := func(scope string, facts map[string]string) StateFingerprint {
-		return NewStateFingerprint(scope, []byte("raw"), facts)
+		return newStateFingerprint(scope, []byte("raw"), facts)
 	}
 	sameFacts := map[string]string{"stage": "idle"}
 	diffFacts := map[string]string{"stage": "busy"}
@@ -247,7 +248,7 @@ func TestRecoveredRequiresSameScopeAndSameFingerprint(t *testing.T) {
 }
 
 func TestStateTransitionScopeConsistent(t *testing.T) {
-	fp := func(scope string) StateFingerprint { return NewStateFingerprint(scope, []byte("raw"), nil) }
+	fp := func(scope string) StateFingerprint { return newStateFingerprint(scope, []byte("raw"), nil) }
 	consistent := StateTransition{
 		ScopeHash:         "scope-1",
 		BeforeFingerprint: fp("scope-1"),
@@ -269,5 +270,49 @@ func TestStateTransitionScopeConsistent(t *testing.T) {
 	var empty StateTransition
 	if empty.ScopeConsistent() {
 		t.Fatal("an empty/zero-value transition must not report itself consistent")
+	}
+}
+
+// --- StateProjector: the ONLY authoritative source of Facts. ---
+
+// stateProjectorStub is a TEST-ONLY mock proving the StateProjector interface
+// is usable and that a real implementation would be deterministic — it is NOT
+// a production projector (none exists yet; see StateProjector's own doc). Using
+// it here does not pre-empt "no implementation exists yet": nothing in the
+// non-test source calls it or anything like it.
+type stateProjectorStub struct{}
+
+func (stateProjectorStub) ID() ProjectorID { return "stub-v1" }
+
+func (stateProjectorStub) Project(a StateArtifact) (StateFingerprint, error) {
+	return newStateFingerprint(a.ScopeHash, a.Raw, map[string]string{"len": strconv.Itoa(len(a.Raw))}), nil
+}
+
+func TestStateProjectorInterfaceShapeAndDeterminism(t *testing.T) {
+	var p StateProjector = stateProjectorStub{}
+	if p.ID() != "stub-v1" {
+		t.Fatalf("ID() = %q", p.ID())
+	}
+	fp1, err := p.Project(StateArtifact{ScopeHash: "s1", Raw: []byte("hello")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp1.ScopeHash() != "s1" {
+		t.Fatalf("projected fingerprint scope = %q, want s1", fp1.ScopeHash())
+	}
+	// Determinism: the same raw artifact must always project to the same
+	// fingerprint — this is the whole point of routing Facts through a
+	// StateProjector instead of letting a caller assert them directly.
+	fp2, err := p.Project(StateArtifact{ScopeHash: "s1", Raw: []byte("hello")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp1.StateFingerprintHash() != fp2.StateFingerprintHash() {
+		t.Fatal("a StateProjector must be deterministic: identical raw input must project identically")
+	}
+	// Different raw input must (in this stub) project differently.
+	fp3, _ := p.Project(StateArtifact{ScopeHash: "s1", Raw: []byte("goodbye")})
+	if fp3.StateFingerprintHash() == fp1.StateFingerprintHash() {
+		t.Fatal("different raw input should project to a different fingerprint in this stub")
 	}
 }

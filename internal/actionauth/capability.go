@@ -59,18 +59,22 @@ type RegisteredAction struct {
 // "this action may run no matter the current state". ValidFor is how a future
 // Executor is required to re-verify this immediately before running the
 // action — never trusting that a BoundAction obtained earlier is still good.
+// The v1 registry (once implemented) is IMMUTABLE for the lifetime of a
+// process — no hot reload. This is a deliberate scope decision, not an
+// oversight: a revision-tagged capability (so a stale binding can't resolve to
+// a *different* action after a hot-reloaded registry changes what a
+// RegistryKey means) is real future work, but ValidFor below does not check
+// one, and a field that isn't checked would be worse than no field at all — it
+// would look like protection that isn't actually enforced. If the registry
+// ever needs to support revisions, ValidFor's signature must grow a revision
+// parameter AT THAT TIME, not before.
 type BoundAction struct {
 	id ActionID
 	// scopeHash and authorizedStateHash are the ExplorationScope.Hash() and
 	// StateFingerprint.StateFingerprintHash() the future ActionPolicy observed
-	// at the moment of binding. registryRevision is an optional, recommended
-	// tag of the registry state at that moment (e.g. so a hot-reloaded registry
-	// cannot make a stale binding resolve to a different, newer action under
-	// the same RegistryKey); it is not yet checked by anything since no
-	// registry with a revision concept exists.
+	// at the moment of binding.
 	scopeHash           string
 	authorizedStateHash string
-	registryRevision    string
 }
 
 // ID returns the action identity this capability was bound to. Safe to expose:

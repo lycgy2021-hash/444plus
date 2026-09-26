@@ -17,17 +17,22 @@ import (
 // ActionPolicy, or any code that takes an action, until this contract itself
 // has been reviewed and frozen.
 //
-// Eleven boundaries are enforced by the TYPE SHAPES below (and, for the most
-// important ones, by a PACKAGE boundary and constructor-only hashing), not
-// merely by comment, because a boundary a bad actor (or an over-eager future
-// implementer) can route around by adding one field — or one file to the same
-// package, or one caller-supplied hash — is not a boundary:
+// Twelve boundaries are enforced by the TYPE SHAPES below (and, for the most
+// important ones, by a PACKAGE boundary, constructor-only hashing, and an
+// unexported-and-uncalled constructor), not merely by comment, because a
+// boundary a bad actor (or an over-eager future implementer) can route around
+// by adding one field — or one file to the same package, or one caller-supplied
+// hash or fact — is not a boundary:
 //
 //  1. No type in this file, or in internal/actionauth, can carry executable
 //     content. There is no Method, URL, Headers, Body, or Command field
 //     anywhere. What an action or recovery procedure actually DOES exists only
 //     in a future compile-time registry (the S10 analogue of S5's Validator
-//     registry).
+//     registry), which is IMMUTABLE for the lifetime of a process in v1 — no
+//     hot reload, a deliberate scope decision (see actionauth.BoundAction's
+//     doc): a half-implemented revision concept that ValidFor doesn't actually
+//     check would look like protection that isn't enforced, which is worse
+//     than no such field at all.
 //  2. An AI-supplied (or candidate-supplied) ActionID is NEVER itself an
 //     execution credential — the same "AI is not authority" bypass as S9's
 //     ExpectationSource, moved from judgment to execution. ActionSuggestion
@@ -60,12 +65,34 @@ import (
 //     construction; internally consistent means it could never be BORN wrong
 //     in the first place. All fields are unexported (immutability, mirroring
 //     Candidate/Evidence's Provenance privacy elsewhere in this package), AND
-//     NewStateFingerprint computes BOTH RawStateArtifactHash and
+//     newStateFingerprint computes BOTH RawStateArtifactHash and
 //     StateFingerprintHash itself, from the actual rawArtifact bytes and facts
 //     given — a caller can never supply a hash directly, so a StateFingerprint
 //     can never be constructed with Facts describing one thing while its hash
 //     was computed over another.
-//  7. Recovery is registry-backed (boundary 3/4, via actionauth.BoundRecovery)
+//  7. Internally consistent is STILL not the same guarantee as AUTHORITATIVE —
+//     a StateFingerprint could be self-consistent and still describe FABRICATED
+//     facts, if whatever called the constructor was free to invent the facts
+//     map, and a fabricated fingerprint feeding a future ActionPolicy's
+//     AllowedActions(scope, state) decision would let whoever fabricated it
+//     indirectly control action authorization — the same class of bypass as
+//     boundaries 2 and 4, moved one step further upstream (to defining the
+//     STATE itself, not just the action or the judgment). Closed by
+//     StateProjector (below): the ONLY authoritative source of Facts is a
+//     registered, deterministic StateProjector; newStateFingerprint is
+//     unexported and called from nowhere yet, and no StateProjector
+//     implementation exists yet either, so no code anywhere can currently
+//     obtain a StateFingerprint claiming to describe real collected state. (The
+//     honest caveat: unexported only fully stops OTHER packages; a future file
+//     added to research itself could still call newStateFingerprint directly
+//     instead of going through a registered StateProjector — the same residual
+//     caveat boundary 3 closed for BoundAction via a package split, which
+//     StateProjector does not get, because unlike a pure authorization
+//     credential a projector inherently needs target/protocol-specific
+//     collection logic that belongs in research. This is reviewed here, the
+//     same way S9's ExpectationSource authority is a whitelist check rather
+//     than a package boundary.)
+//  8. Recovery is registry-backed (boundary 3/4, via actionauth.BoundRecovery)
 //     AND RecoveryOutcome is FACTS ONLY — no Verified/conclusion field. It
 //     holds the full Baseline/Result StateFingerprint (not bare hash strings),
 //     and the separate, deterministic Recovered() function checks BOTH that
@@ -74,15 +101,15 @@ import (
 //     state", not merely "two strings happened to be equal" (which two
 //     fingerprints from different scopes could satisfy by coincidence,
 //     especially after crossing disk/replay/worker boundaries).
-//  8. StateTransition carries FACTS ONLY — no Unexpected/Vulnerable/Severity/
+//  9. StateTransition carries FACTS ONLY — no Unexpected/Vulnerable/Severity/
 //     State field. Action is an actionauth.BoundAction: a transition can only
 //     ever reference something that WAS actually authorized and executed.
-//  9. ExplorationBudget has NO "0 = unlimited" escape hatch. Every bound must
+//  10. ExplorationBudget has NO "0 = unlimited" escape hatch. Every bound must
 //     be strictly positive or the budget is INVALID.
-//  10. S10 invents no second "who may define correct behavior" system —
+//  11. S10 invents no second "who may define correct behavior" system —
 //     whatever future producer judges a StateTransition worth a hypothesis
 //     reuses S9's ExpectationSource unchanged.
-//  11. Also recorded here (no corresponding type; it constrains execution
+//  12. Also recorded here (no corresponding type; it constrains execution
 //     behavior, not data shape): within one ExplorationScope, v1 exploration
 //     is SINGLE SESSION and SERIAL — at most one in-flight action at a time.
 
@@ -102,17 +129,21 @@ func (s ExplorationScope) Hash() string {
 }
 
 // StateFingerprint separates raw collected evidence from denoised identity
-// (boundary 4) and is itself immutable AND internally consistent (boundary 5):
-// every field is unexported, and — critically — NewStateFingerprint computes
-// BOTH hashes itself; a caller can never supply a hash directly. Immutable is
-// not the same guarantee as internally consistent: a constructor that accepted
-// a caller-supplied StateFingerprintHash alongside a separate Facts argument
+// (boundary 5) and is itself immutable AND internally consistent (boundary 6):
+// every field is unexported, and newStateFingerprint computes BOTH hashes
+// itself; a caller can never supply a hash directly. Immutable is not the same
+// guarantee as internally consistent: a constructor that accepted a
+// caller-supplied StateFingerprintHash alongside a separate Facts argument
 // could still be handed a hash that was computed over different facts than the
 // ones stored — "born inconsistent" — even though nothing could edit either one
 // afterward. Computing both hashes from the actual inputs, inside the
-// constructor, closes that: the same discipline as S6/S8/S9's "artifact bytes →
-// a deterministic canonicalizing function → a hash", never "caller asserts this
-// is the hash".
+// constructor, closes that.
+//
+// But internally consistent is STILL not the same guarantee as authoritative
+// (boundary 7): a StateFingerprint can be self-consistent and still describe
+// FABRICATED facts, if whatever called the constructor was free to invent the
+// facts map. That is why the constructor below is unexported — see
+// StateProjector's doc for the authority story.
 type StateFingerprint struct {
 	scopeHash            string
 	rawStateArtifactHash string
@@ -120,17 +151,30 @@ type StateFingerprint struct {
 	facts                map[string]string
 }
 
-// NewStateFingerprint constructs an immutable, internally-consistent
+// newStateFingerprint constructs an immutable, internally-consistent
 // StateFingerprint. rawArtifact is the actual raw state artifact bytes (hashed
 // here, never accepted as a pre-computed hash string); facts is the canonical
 // projection of that artifact used for state-equality (also copied, then hashed
 // here via a deterministic, map-order-independent canonicalization — see
-// canonicalFactsHash). If a future producer's canonical projection is not
-// simply this key→value shape, it must canonicalize into this shape (or a
-// documented successor) before calling this constructor — the invariant that
-// must never be broken is that ONLY this constructor computes
-// StateFingerprintHash, from the SAME facts stored alongside it.
-func NewStateFingerprint(scopeHash string, rawArtifact []byte, facts map[string]string) StateFingerprint {
+// canonicalFactsHash).
+//
+// This function is UNEXPORTED and is the ONLY place a StateFingerprint is ever
+// built. Today, nothing outside this file calls it, and no StateProjector
+// implementation exists yet (boundary 7) — so no code anywhere, in any package,
+// can currently obtain a StateFingerprint whose Facts claim to describe real
+// collected state. The one honest caveat, same as noted for the capability
+// boundary before StateProjector existed: an unexported function only fully
+// stops OTHER packages from calling it; a future file added to THIS package
+// (research) could still call newStateFingerprint directly instead of going
+// through a registered StateProjector. The intended contract, once
+// StateProjector implementations exist, is that only they call this — that
+// remains a discipline enforced by review (this audit) for callers inside
+// research, exactly as ExpectationSource's authority (S9) is a whitelist check,
+// not a package boundary; StateProjector's authority is the S10 analogue of
+// that, not of BoundAction's stronger package-boundary treatment (a
+// StateProjector inherently needs target/protocol-specific collection logic
+// that belongs in research, unlike a pure authorization credential).
+func newStateFingerprint(scopeHash string, rawArtifact []byte, facts map[string]string) StateFingerprint {
 	copied := make(map[string]string, len(facts))
 	for k, v := range facts {
 		copied[k] = v
@@ -141,6 +185,44 @@ func NewStateFingerprint(scopeHash string, rawArtifact []byte, facts map[string]
 		stateFingerprintHash: canonicalFactsHash(copied),
 		facts:                copied,
 	}
+}
+
+// ProjectorID identifies a registered StateProjector.
+type ProjectorID string
+
+// StateArtifact is the raw, scope-tagged state observation a StateProjector
+// consumes. It is RAW material, before any canonicalization — not itself a
+// StateFingerprint.
+type StateArtifact struct {
+	ScopeHash string
+	Raw       []byte
+}
+
+// StateProjector is the ONLY authoritative source of a StateFingerprint's
+// Facts (boundary 7) — the S10 analogue of S9's ExpectationSource authority:
+// raw evidence (StateArtifact) becomes AUTHORITATIVE facts only by passing
+// through a REGISTERED, deterministic StateProjector, never by a caller
+// directly asserting "these are the facts". "Internally consistent" (boundary
+// 6) is not the same guarantee as "authoritative": any code that could call
+// newStateFingerprint directly with a fabricated facts map would get back a
+// self-consistent but FABRICATED fingerprint — and if that fingerprint then
+// fed a future ActionPolicy's AllowedActions(scope, state) decision, whoever
+// fabricated it would have gained indirect control over action authorization
+// without ever touching a BoundAction, the same class of bypass S9's
+// ExpectationSource and S10's BoundAction close for judgment and execution
+// respectively.
+//
+// No concrete StateProjector implementation exists yet — this is a
+// contract-only interface. A registry of them (the S10 analogue of
+// ActionPolicy's action registry) is future work, alongside the ActionPolicy
+// that will consume the fingerprints a StateProjector produces.
+type StateProjector interface {
+	ID() ProjectorID
+	// Project deterministically derives a StateFingerprint from a's raw bytes.
+	// Two calls with byte-identical a.Raw must yield fingerprints whose
+	// StateFingerprintHash is identical — determinism is the whole point: the
+	// same underlying state must always project to the same fingerprint.
+	Project(a StateArtifact) (StateFingerprint, error)
 }
 
 // canonicalFactsHash deterministically hashes a facts map: keys sorted (Go maps

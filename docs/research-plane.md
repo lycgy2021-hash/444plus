@@ -269,7 +269,7 @@ the guarantees hold under test:
 - **S10 (state-machine explorer): DESIGN CONTRACT ONLY, still under audit**
   (`research/state_machine.go` + `internal/actionauth/capability.go`) — no
   explorer, no registry, no `ActionPolicy`, no execution logic, no `Origin` kind
-  yet. Eleven boundaries are locked into the TYPE SHAPES themselves — and, for
+  yet. Twelve boundaries are locked into the TYPE SHAPES themselves — and, for
   the most important ones, into a PACKAGE boundary and constructor-only
   hashing — not left to comments alone, because a boundary a later change can
   route around by adding one field, or one file to the same package, or one
@@ -277,7 +277,15 @@ the guarantees hold under test:
   1. **No executable content anywhere.** `ActionID{RegistryKey, VariantID}` and
      `RecoveryPlanRef{RegistryKey}` are opaque lookups — there is no Method, URL,
      Headers, Body, or Command field in either file. `RegisteredAction.Reversible`
-     is registry metadata, declared once by the registering code.
+     is registry metadata, declared once by the registering code. The v1
+     registry (once implemented) is also IMMUTABLE for the lifetime of a
+     process — no hot reload — a deliberate scope decision: `BoundAction`
+     briefly carried a `registryRevision` field for a hot-reload future, but
+     `ValidFor` (boundary 4) never checked it, and an unchecked field is worse
+     than no field — it looks like enforced protection that isn't actually
+     enforced. Removed rather than wired up; if the registry ever needs to
+     support revisions, `ValidFor`'s signature must grow a revision parameter
+     AT THAT TIME, not before.
   2. **An AI-supplied `ActionID` is never itself an execution credential** — the
      same "AI is not authority" bypass as S9's `ExpectationSource`, moved from
      judgment to execution. `research.ActionSuggestion{ActionID, Rationale}` is
@@ -312,12 +320,12 @@ the guarantees hold under test:
      guarantees.** Immutable only means nothing can edit it after construction;
      internally consistent means it could never be *born* wrong. All fields are
      unexported (immutability, mirroring `Candidate`/`Evidence`'s `Provenance`
-     privacy elsewhere in this package) — but the earlier round's
+     privacy elsewhere in this package) — but an earlier round's
      `NewStateFingerprint(scopeHash, rawHash, fingerprintHash, facts)` still let
      a caller hand it a `StateFingerprintHash` that didn't actually correspond to
      the `facts` given, i.e. "born inconsistent" despite being immutable
-     afterward. Fixed: `NewStateFingerprint(scopeHash string, rawArtifact []byte,
-     facts map[string]string)` now computes BOTH `RawStateArtifactHash` (from the
+     afterward. Fixed: the constructor (`scopeHash string, rawArtifact []byte,
+     facts map[string]string)`) now computes BOTH `RawStateArtifactHash` (from the
      actual raw bytes) and `StateFingerprintHash` (via `canonicalFactsHash` —
      sorted keys, deterministic) itself; there is no parameter through which a
      caller could supply either hash directly. The same "artifact bytes → a
@@ -325,7 +333,33 @@ the guarantees hold under test:
      never "caller asserts this is the hash". `StateTransition.ScopeConsistent()`
      recomputes (never stores) whether a transition's own `ScopeHash` agrees with
      both fingerprints it references.
-  7. **Recovery is registry-backed (boundary 3/4) and `RecoveryOutcome` is FACTS
+  7. **Internally consistent is STILL not AUTHORITATIVE.** A `StateFingerprint`
+     could be self-consistent (boundary 6) and still describe FABRICATED facts,
+     if whatever called the constructor were free to invent the facts map — and
+     a fabricated fingerprint feeding a future `ActionPolicy`'s
+     `AllowedActions(scope, state)` decision would let whoever fabricated it
+     indirectly control action authorization, the same class of bypass as
+     boundaries 2 and 4, moved one step further upstream (to defining the STATE
+     itself, not just the action or the judgment). Closed by `StateProjector`:
+     `type ProjectorID string`; `type StateArtifact struct { ScopeHash string;
+     Raw []byte }` (raw material, before any canonicalization — never itself a
+     fingerprint); `type StateProjector interface { ID() ProjectorID; Project(a
+     StateArtifact) (StateFingerprint, error) }`. The direct constructor
+     (formerly exported `NewStateFingerprint`) is now unexported
+     (`newStateFingerprint`) and called from nowhere yet, and no `StateProjector`
+     implementation exists yet either — so no code anywhere can currently obtain
+     a `StateFingerprint` claiming to describe real collected state. Honest
+     caveat: unexported only fully stops OTHER packages; a future file added to
+     `research` itself could still call `newStateFingerprint` directly instead of
+     going through a registered `StateProjector` — the same residual caveat
+     boundary 3 closed for `BoundAction` via a package split, which
+     `StateProjector` does not get, because unlike a pure authorization
+     credential a projector inherently needs target/protocol-specific collection
+     logic that legitimately belongs in `research`. This is a review-enforced
+     discipline, not a compiler-enforced one — the S10 analogue of S9's
+     `ExpectationSource` whitelist-check authority, not of `BoundAction`'s
+     stronger package-boundary treatment.
+  8. **Recovery is registry-backed (boundary 3/4) and `RecoveryOutcome` is FACTS
      ONLY** — no `Verified`/conclusion field. It holds the FULL `Baseline`/
      `Result` `StateFingerprint`, and `Recovered(o)` checks BOTH that baseline
      and result actually belong to the outcome's own declared `ScopeHash` AND
@@ -336,21 +370,21 @@ the guarantees hold under test:
      comparison alone would wrongly call that recovered). `Recovered==false`
      means exploration STOPS, never continues on the assumption a rollback
      worked.
-  8. **`StateTransition` carries facts only** — no `Unexpected`/`Vulnerable`/
+  9. **`StateTransition` carries facts only** — no `Unexpected`/`Vulnerable`/
      `Severity`/`State` field. `Action` is a `BoundAction` (boundary 2–4) — a
      transition can only ever reference something that WAS actually authorized
      and executed. Whether a transition is worth a hypothesis is a future
      producer's judgment against an authoritative `ExpectationSource`
-     (boundary 10). `TransitionArtifactHash` is the lossless record hash (the S9
+     (boundary 11). `TransitionArtifactHash` is the lossless record hash (the S9
      `caseArtifactHash` analogue) — never the denoised `StateFingerprintHash`.
-  9. **No "0 = unlimited" in `ExplorationBudget`.** Every one of
+  10. **No "0 = unlimited" in `ExplorationBudget`.** Every one of
      `MaxStates/MaxTransitions/MaxDepth/MaxRequests/MaxVisitsPerState/
      MaxBranching/MaxWallTime` must be strictly positive or `Valid()` reports the
      whole budget invalid.
-  10. **No second authority system.** Whatever future producer judges a
+  11. **No second authority system.** Whatever future producer judges a
      `StateTransition` worth a hypothesis reuses S9's `ExpectationSource`
      unchanged.
-  11. **Single-session, serial v1** — no corresponding type, since it
+  12. **Single-session, serial v1** — no corresponding type, since it
      constrains execution behavior rather than data shape: within one
      `ExplorationScope`, at most one in-flight action at a time, so "which
      action produced this `AfterFingerprint`" is never ambiguous. Recorded here
