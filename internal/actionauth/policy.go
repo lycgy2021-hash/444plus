@@ -149,14 +149,35 @@ func (r *Registry) applicable(fp stateauth.Fingerprint) []string {
 	return keys
 }
 
+// ActionPolicySemanticsVersion identifies the MATCHING/SELECTION/SAFETY
+// SEMANTICS this file implements — as opposed to the registry's own DATA,
+// which canonicalHash already covers. Byte-identical registry content
+// (same Key/SpecID/Safety/Requirements for every action) is NOT enough to
+// claim "the same policy": if a future change to matches (the
+// StateRequirements comparison), Select's own selection/sort order, or the
+// fail-closed behavior on an unset ProjectorID ever alters what a given
+// registry actually AUTHORIZES, a PolicyID computed from data alone would
+// stay identical across that change — silently claiming an old binding and
+// a new one share "the same action-authority" when the authority itself
+// has changed underneath them. Prepending this version string to the
+// hashed input means any such change is a deliberate, visible act:
+// whoever changes matching/selection/fail-closed semantics MUST also bump
+// this to "action-policy-v2" (and so on), which changes every PolicyID
+// derived from it — so a Candidate replayed across a restart or a code
+// upgrade can never mistake "byte-identical registry, different
+// semantics" for "the same policy".
+const ActionPolicySemanticsVersion = "action-policy-v1"
+
 // canonicalHash is a pure, deterministic identity for r's own immutable
-// content — every registered action's Key, its Safety, and its
-// Requirements (ProjectorID plus every Facts key/value, sorted), in a
-// fixed canonical order. Two Registry values built from identically-shaped
-// registration lists always hash the same; any change to what is
-// registered, its safety class, or its requirements changes it. This is
-// what ActionPolicy.PolicyID exposes — see that method's own doc for why
-// it exists.
+// content — every registered action's Key, its executable SpecID, its
+// Safety, and its Requirements (ProjectorID plus every Facts key/value,
+// sorted), prefixed by ActionPolicySemanticsVersion, in a fixed canonical
+// order. Two Registry values built from identically-shaped registration
+// lists, under the same semantics version, always hash the same; any
+// change to what is registered, its executable spec, its safety class, its
+// requirements, or the semantics version itself changes it. This is what
+// ActionPolicy.PolicyID exposes — see that method's own doc for why it
+// exists.
 func (r *Registry) canonicalHash() string {
 	if r == nil {
 		return ""
@@ -167,9 +188,11 @@ func (r *Registry) canonicalHash() string {
 	}
 	sort.Strings(keys)
 	var b strings.Builder
+	b.WriteString("semantics=" + ActionPolicySemanticsVersion + "\n")
 	for _, k := range keys {
 		reg := r.entries[k]
 		b.WriteString("action=" + k + "\n")
+		b.WriteString("spec=" + reg.Action.SpecID + "\n")
 		b.WriteString("safety=" + string(reg.Action.Safety) + "\n")
 		b.WriteString("projector=" + string(reg.Requirements.ProjectorID) + "\n")
 		factKeys := make([]string, 0, len(reg.Requirements.Facts))
@@ -246,17 +269,23 @@ func NewActionPolicy(registry *Registry, recoveryRegistry *RecoveryRegistry) *Ac
 }
 
 // PolicyID returns a deterministic identity for THIS policy's own action
-// registry content (every registered action's Key/Safety/StateRequirements
-// — never the recovery registry, which is orthogonal to "what may execute
+// registry content (every registered action's Key/SpecID/Safety/
+// StateRequirements, under this file's own ActionPolicySemanticsVersion —
+// never the recovery registry, which is orthogonal to "what may execute
 // and how safely"). It exists so a caller holding a BoundAction produced by
 // SOME ActionPolicy can prove it came from a policy with the SAME
-// authorized content as another — e.g. S10/E7's replay validator proving
-// its own configured ActionPolicy is the same one (by canonical content,
-// not merely "someone wired the same pointer through") that authorized a
-// Candidate's original action, rather than trusting "same ActionID" alone,
-// which two DIFFERENT policies (one permissive, one strict) could still
-// agree on by coincidence. Computed once, at construction; two policies
-// built from identically-shaped registries always share a PolicyID.
+// authorized content AND executable semantics as another — e.g. S10/E7's
+// replay validator proving its own configured ActionPolicy is the same one
+// (by canonical content and semantics version, not merely "someone wired
+// the same pointer through", and not merely "the same declarative Key/
+// Safety/Requirements while a different Executor executes something else
+// for that Key") that authorized a Candidate's original action, rather than
+// trusting "same ActionID" alone, which two DIFFERENT policies (one
+// permissive, one strict; or one wired to an Executor that does something
+// different for the same Key) could still agree on by coincidence.
+// Computed once, at construction; two policies built from
+// identically-shaped registries under the same semantics version always
+// share a PolicyID.
 func (p *ActionPolicy) PolicyID() string {
 	if p == nil {
 		return ""
@@ -267,9 +296,10 @@ func (p *ActionPolicy) PolicyID() string {
 // Select deterministically picks exactly one registered action whose
 // StateRequirements match fp AND whose key is not already in exclude, and
 // returns it bound to scopeHash and fp's own StateFingerprintHash — stamped
-// with that action's own registered Safety and this policy's own PolicyID,
-// read directly from the matched Registration/Registry, never supplied by
-// the caller. ok is false if no such action exists — either nothing in the
+// with that action's own registered Safety, its own registered SpecID, and
+// this policy's own PolicyID, read directly from the matched
+// Registration/Registry, never supplied by the caller. ok is false if no
+// such action exists — either nothing in the
 // registry matches this state, or everything that does has already been
 // excluded (e.g. already tried from this exact state). The returned
 // ActionID always carries an empty VariantID — v1 selects among registered
@@ -289,6 +319,7 @@ func (p *ActionPolicy) Select(scopeHash string, fp stateauth.Fingerprint, exclud
 			scopeHash:           scopeHash,
 			authorizedStateHash: stateFingerprintHash,
 			safety:              reg.Action.Safety,
+			specID:              reg.Action.SpecID,
 			policyID:            p.policyID,
 		}, true
 	}

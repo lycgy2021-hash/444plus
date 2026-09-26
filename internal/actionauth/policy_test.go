@@ -311,7 +311,54 @@ func TestSelectStampsSafetyAndPolicyIDFromMatchedRegistration(t *testing.T) {
 
 func TestZeroValueBoundActionHasEmptySafetyAndPolicyID(t *testing.T) {
 	var zero BoundAction
-	if zero.Safety() != "" || zero.PolicyID() != "" {
-		t.Fatalf("zero-value BoundAction: Safety()=%q PolicyID()=%q, want both empty", zero.Safety(), zero.PolicyID())
+	if zero.Safety() != "" || zero.PolicyID() != "" || zero.SpecID() != "" {
+		t.Fatalf("zero-value BoundAction: Safety()=%q PolicyID()=%q SpecID()=%q, want all empty", zero.Safety(), zero.PolicyID(), zero.SpecID())
+	}
+}
+
+// --- SpecID / ActionPolicySemanticsVersion: S10/E7's final two freeze
+// blockers — PolicyID must also cover "what actually executes" (SpecID) and
+// must be forced to change if the matching/selection SEMANTICS this file
+// implements ever change, even with byte-identical registry data — see
+// RegisteredAction.SpecID and ActionPolicySemanticsVersion's own doc.
+
+func TestSelectStampsSpecIDFromMatchedRegistration(t *testing.T) {
+	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "http-probe", Safety: ActionStrictReadOnly, SpecID: "spec-abc"}, Requirements: rawLenReq()})
+	policy := NewActionPolicy(reg, NewRecoveryRegistry())
+	state := fp(t, "scope-1", []byte("A"))
+
+	bound, ok := policy.Select("scope-1", state, nil)
+	if !ok {
+		t.Fatal("Select must find the applicable action")
+	}
+	if bound.SpecID() != "spec-abc" {
+		t.Fatalf("BoundAction.SpecID() = %q, want %q (read from the matched Registration, not supplied by the caller)", bound.SpecID(), "spec-abc")
+	}
+}
+
+func TestActionPolicyIDChangesWhenSpecIDChanges(t *testing.T) {
+	base := NewActionPolicy(
+		NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly, SpecID: "spec-v1"}, Requirements: rawLenReq()}),
+		NewRecoveryRegistry("reset"),
+	)
+	changed := NewActionPolicy(
+		NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly, SpecID: "spec-v2"}, Requirements: rawLenReq()}),
+		NewRecoveryRegistry("reset"),
+	)
+	if base.PolicyID() == changed.PolicyID() {
+		t.Fatalf("PolicyID must change when SpecID changes — a different executable spec is a different action-authority semantics, got the same %q for both", base.PolicyID())
+	}
+}
+
+func TestActionPolicySemanticsVersionIsFoldedIntoPolicyID(t *testing.T) {
+	// This test documents, rather than exercises a second version (there is
+	// only one today), that ActionPolicySemanticsVersion is a real,
+	// non-empty component of the hashed input — proven indirectly: changing
+	// canonicalHash's semantics-version line would change every PolicyID,
+	// which is exactly why the constant exists. We assert its current,
+	// frozen value here so a future accidental edit to it is caught as a
+	// test failure, not a silent behavior change.
+	if ActionPolicySemanticsVersion != "action-policy-v1" {
+		t.Fatalf("ActionPolicySemanticsVersion = %q, want the frozen v1 value %q — bump only via a deliberate, reviewed v2", ActionPolicySemanticsVersion, "action-policy-v1")
 	}
 }

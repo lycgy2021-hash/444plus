@@ -207,6 +207,17 @@ type Collector interface {
 // ValidFor check below is defense-in-depth, never a substitute for the
 // Executor's own. Like Collector, it MUST call RequestMeter.Acquire for each
 // real request it actually issues.
+//
+// A real Executor implementation MUST ALSO independently re-verify
+// action.SpecID() against its own internally-computed canonical spec for
+// the action it is about to run, and refuse on any mismatch — see
+// HTTPExecutor.Execute and HTTPActionSpecID for the reference
+// implementation. Neither Explorer nor S10/E7's replay validator performs
+// this check itself: only the concrete Executor knows what its own
+// "correct" SpecID actually is, so pre-checking it anywhere else would
+// just be re-trusting the registry side without truly verifying the
+// Executor's own wiring — exactly the gap SpecID exists to close (see
+// actionauth.RegisteredAction.SpecID's own doc).
 type Executor interface {
 	Execute(ctx context.Context, action actionauth.BoundAction) error
 	ExecuteRecovery(ctx context.Context, recovery actionauth.BoundRecovery) error

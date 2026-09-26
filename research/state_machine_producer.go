@@ -152,6 +152,16 @@ type StateMachineBinding struct {
 	// semantics authorized it" — two DIFFERENT policies (one permissive,
 	// one strict) could otherwise agree on an ActionID by coincidence.
 	policyID string
+	// specID is the actionauth.BoundAction.SpecID() the ORIGINAL action was
+	// bound with — see BoundAction.SpecID's own doc. Carried here purely
+	// for evidence traceability (Refs["action_spec_id"] and the replay
+	// summary observation both record it): S10/E7's replay validator does
+	// not need to cross-check this field directly, since it is already
+	// folded into policyID above (PolicyID's own hash now covers SpecID) —
+	// a policyID mismatch already implies a SpecID mismatch. Recording it
+	// separately just means an auditor never has to re-derive "was the
+	// executable spec the same" from the opaque policyID hash alone.
+	specID string
 }
 
 func (b StateMachineBinding) RuleID() string                     { return b.ruleID }
@@ -160,6 +170,7 @@ func (b StateMachineBinding) ProjectorID() stateauth.ProjectorID { return b.proj
 func (b StateMachineBinding) ReplayTargetHash() string           { return b.replayTargetHash }
 func (b StateMachineBinding) CaseArtifactHash() string           { return b.caseArtifactHash }
 func (b StateMachineBinding) PolicyID() string                   { return b.policyID }
+func (b StateMachineBinding) SpecID() string                     { return b.specID }
 
 // ReplayTarget identifies WHAT is being explored/replayed against: the same
 // target/build/protocol/harness dimensions as ExplorationScope, but
@@ -634,6 +645,7 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 	prov := newProvenance(string(OriginStateMachine), rc.Transition.ScopeHash, "state_machine", artifactHash)
 	action := rc.Transition.Action.ID()
 	policyID := rc.Transition.Action.PolicyID()
+	specID := rc.Transition.Action.SpecID()
 
 	var candidates []*Candidate
 	for _, a := range anomalies {
@@ -658,6 +670,7 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 			replayTargetHash: replayTargetOf(rc.Scope).Hash(),
 			caseArtifactHash: artifactHash,
 			policyID:         policyID,
+			specID:           specID,
 		}
 		cand.Refs = map[string]string{
 			"transition_artifact_hash": rc.Transition.TransitionArtifactHash,
@@ -677,6 +690,7 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 			"projector_id":       string(rc.Rule.ProjectorID),
 			"replay_target_hash": replayTargetOf(rc.Scope).Hash(),
 			"policy_id":          policyID,
+			"action_spec_id":     specID,
 		}
 		candidates = append(candidates, cand)
 	}
@@ -714,6 +728,7 @@ func transitionCaseArtifactHash(rc resolvedTransitionCase) string {
 	b.WriteString("action_registry_key=" + t.Action.ID().RegistryKey + "\n")
 	b.WriteString("action_variant_id=" + t.Action.ID().VariantID + "\n")
 	b.WriteString("action_policy_id=" + t.Action.PolicyID() + "\n")
+	b.WriteString("action_spec_id=" + t.Action.SpecID() + "\n")
 	b.WriteString("action_safety=" + string(t.Action.Safety()) + "\n")
 	b.WriteString("after=" + canonicalTransitionFingerprint(t.AfterFingerprint) + "\n")
 	b.WriteString("evidence_refs=" + strings.Join(t.EvidenceRefs, ",") + "\n")

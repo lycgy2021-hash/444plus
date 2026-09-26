@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,8 +88,8 @@ func TestS10E5RealHTTPExplorationEndToEnd(t *testing.T) {
 	httpReq := actionauth.StateRequirements{ProjectorID: stateauth.HTTPStateProjector{}.ID()}
 	policy := actionauth.NewActionPolicy(
 		actionauth.NewRegistry(
-			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly}, Requirements: httpReq},
-			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-health", Safety: actionauth.ActionStrictReadOnly}, Requirements: httpReq},
+			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/")}, Requirements: httpReq},
+			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-health", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/health")}, Requirements: httpReq},
 		),
 		actionauth.NewRecoveryRegistry("reset"),
 	)
@@ -241,6 +242,49 @@ func TestHTTPExecutorRefusesUnregisteredAction(t *testing.T) {
 		t.Fatal("Execute must refuse a BoundAction naming a key this executor was never configured with")
 	}
 	_ = executor
+}
+
+// TestHTTPExecutorRefusesSpecIDMismatch is the direct regression test for
+// S10/E7's "executable semantics binding" freeze blocker: a BoundAction
+// whose registered SpecID does NOT match HTTPActionSpecID(path) for the
+// path this Executor's own fixed map actually resolves for that
+// RegistryKey must be refused BEFORE any request reaches the network —
+// proving Execute independently re-verifies SpecID rather than trusting
+// whatever the registry/policy side declared.
+func TestHTTPExecutorRefusesSpecIDMismatch(t *testing.T) {
+	var hits int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	executor, err := NewHTTPExecutor(ts.URL, map[string]string{"get-root": "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := actionauth.NewActionPolicy(
+		actionauth.NewRegistry(actionauth.Registration{
+			Action:       actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly, SpecID: "a-spec-id-that-does-not-match-this-executors-own-path"},
+			Requirements: actionauth.StateRequirements{ProjectorID: "http-v1"},
+		}),
+		actionauth.NewRecoveryRegistry(),
+	)
+	fp, err := stateauth.HTTPFixtureRegistry().Project(stateauth.StateArtifact{ScopeHash: "s", Raw: mustMarshalHTTPArtifact(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, ok := policy.Select("s", fp, nil)
+	if !ok || bound.ID().RegistryKey != "get-root" {
+		t.Fatalf("setup: expected Select to bind get-root, got %+v ok=%v", bound.ID(), ok)
+	}
+
+	if err := executor.Execute(context.Background(), bound); err == nil {
+		t.Fatal("Execute must refuse a BoundAction whose SpecID does not match this executor's own canonical spec for the resolved path")
+	}
+	if hits != 0 {
+		t.Fatalf("server received %d requests, want 0 — a SpecID mismatch must be refused before any request reaches the network", hits)
+	}
 }
 
 func mustMarshalHTTPArtifact(t *testing.T) []byte {

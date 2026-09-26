@@ -94,6 +94,26 @@ import (
 // under) BEFORE Replay ever calls Select — a pure, no-I/O check, exactly
 // like the other identity checks below (ErrReplayPolicyMismatch).
 //
+// PolicyID ITSELF NOW COVERS EXECUTABLE SEMANTICS AND IS VERSIONED. An
+// earlier version of PolicyID hashed only Key/Safety/StateRequirements —
+// declarative registry data that says nothing about what a concrete
+// Executor actually DOES for a given RegistryKey. Two Executor
+// implementations/versions could agree on Key/Safety/Requirements (and
+// therefore on PolicyID, under that narrower hash) while executing
+// genuinely different operations (e.g. GET /health vs GET /admin/status),
+// which would have made "PolicyID matches" a false proof of "same
+// action-authority semantics". actionauth.RegisteredAction.SpecID closes
+// this: a stable identity for the actual executable spec, folded into
+// PolicyID's own hash, and independently re-verified by the concrete
+// Executor (never by Replay itself, which cannot know what's "correct" for
+// an Executor it didn't write) immediately before executing — see
+// HTTPActionSpecID and HTTPExecutor.Execute. Separately,
+// actionauth.ActionPolicySemanticsVersion is prepended to that same hash,
+// so a future change to StateRequirements.matches/Select's own
+// selection-or-fail-closed semantics — even with byte-identical registry
+// data — is forced to change PolicyID too, rather than silently keeping an
+// old PolicyID's claim of "same policy" valid across a semantics change.
+//
 // NO STATE PREPARATION. If ExpectFactTransition's own precondition
 // (before.Facts[Fact] == BeforeValue) does not hold against the FRESH
 // baseline, Replay stops immediately with OutcomeNoSignal — it never runs
@@ -401,6 +421,7 @@ func replaySummaryObservation(v *StateMachineReplayValidator, scope ExplorationS
 		{Kind: "action_registry_key", Ref: action.ID().RegistryKey},
 		{Kind: "action_variant_id", Ref: action.ID().VariantID},
 		{Kind: "policy_id", Ref: action.PolicyID()},
+		{Kind: "action_spec_id", Ref: action.SpecID()},
 		{Kind: "action_safety", Ref: string(action.Safety())},
 		{Kind: "assessment", Ref: string(TransitionViolated)},
 		{Kind: "request_count", Ref: strconv.Itoa(meter.Used())},

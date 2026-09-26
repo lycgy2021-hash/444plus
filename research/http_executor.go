@@ -48,16 +48,46 @@ func NewHTTPExecutor(baseURL string, actions map[string]string) (*HTTPExecutor, 
 	return &HTTPExecutor{baseURL: u, actions: copied, client: newBudgetedHTTPClient()}, nil
 }
 
+// HTTPActionSpecID is the canonical, stable identity for "a read-only GET
+// to path, with redirects refused and no body" — the ONLY executable shape
+// HTTPExecutor.Execute ever performs (see this file's own top-of-file doc).
+// Whoever registers an actionauth.RegisteredAction for a RegistryKey this
+// Executor serves MUST set RegisteredAction.SpecID to HTTPActionSpecID(path)
+// for that SAME path — Execute (below) independently recomputes this value
+// from its own fixed map and refuses to run if the BoundAction it was
+// handed carries anything else. This is what makes "PolicyID matches" also
+// mean "the same real HTTP operation executes", never merely "the same
+// declarative Key/Safety/Requirements happened to be registered against
+// whatever this Executor does today" — see actionauth.RegisteredAction.
+// SpecID's own doc for the gap this closes.
+func HTTPActionSpecID(path string) string {
+	return RawInputHash([]byte("http_action_v1\nmethod=GET\npath=" + path + "\nredirect=disabled\nbody=none"))
+}
+
 // Execute looks up action.ID().RegistryKey in this Executor's own fixed
 // action map and issues exactly that GET — nothing else. A response status
 // outside 2xx/3xx is treated as a failed action (the target refused or
 // errored on a request this Executor knows to be one of its own registered
 // read-only probes); a redirect (3xx) is observed as itself, never followed
 // — refuseRedirects applies here exactly as it does for HTTPCollector.
+//
+// BEFORE issuing any request, Execute independently re-verifies
+// action.SpecID() against HTTPActionSpecID(path) for the path THIS
+// Executor's own fixed map resolves for that RegistryKey — never trusting
+// the registry/policy side's SpecID as sufficient on its own. This is the
+// SAME defense-in-depth discipline as ValidFor: a BoundAction's own
+// registered SpecID and this Executor's actual wiring could otherwise each
+// be individually "valid" while wired to each other incorrectly (e.g. a
+// policy and an Executor upgraded independently, out of step) — see
+// actionauth.RegisteredAction.SpecID's own doc.
 func (e *HTTPExecutor) Execute(ctx context.Context, action actionauth.BoundAction) error {
 	path, ok := e.actions[action.ID().RegistryKey]
 	if !ok {
 		return fmt.Errorf("research: HTTPExecutor: %q is not one of this executor's fixed registered actions", action.ID().RegistryKey)
+	}
+	if wantSpecID := HTTPActionSpecID(path); action.SpecID() != wantSpecID {
+		return fmt.Errorf("research: HTTPExecutor: action %q carries SpecID %q, but this executor's own registered spec for that key is %q — refusing to execute a possibly mis-wired action",
+			action.ID().RegistryKey, action.SpecID(), wantSpecID)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.baseURL.String()+path, nil)
 	if err != nil {

@@ -1231,6 +1231,65 @@ the guarantees hold under test:
     `status=="403"`), so the SAME `PolicyID` genuinely selects a different
     (or no) action purely because the FRESH baseline's own facts differ
     from the original's — never because the policy itself changed.
+  - **Sixth regression, found on a FOURTH audit round: `PolicyID` (Key +
+    `Safety` + `StateRequirements` only) proved "same ActionID selected AND
+    same PolicyID" was still not sufficient — it says nothing about WHAT
+    ACTUALLY EXECUTES for a RegistryKey. Two Executor implementations/
+    versions could agree on Key/Safety/Requirements (and therefore on
+    `PolicyID`) while performing genuinely different real-world operations
+    (e.g. `GET /health` vs `GET /admin/status`), which would have made
+    "PolicyID matches" a false proof of "same action-authority semantics".**
+    Fixed: `actionauth.RegisteredAction` gained `SpecID string` — a stable
+    identity for the actual executable spec, declared by whoever registers
+    the action, alongside `BoundAction.specID`/`SpecID()`, stamped by
+    `Select` from the same matched registration and folded into
+    `Registry.canonicalHash()`'s per-action serialization (so `PolicyID`
+    now covers `ActionID + SpecID + Safety + StateRequirements`, exactly
+    the composition asked for). `HTTPActionSpecID(path string) string`
+    (`research/http_executor.go`) canonicalizes "a read-only GET to path,
+    redirects refused, no body" (`http_action_v1\nmethod=GET\npath=<path>\n
+    redirect=disabled\nbody=none`, SHA-256'd via the same `RawInputHash`
+    every other producer uses); `HTTPExecutor.Execute` independently
+    RE-VERIFIES `action.SpecID()` against `HTTPActionSpecID` for the path
+    its OWN fixed map resolves for that RegistryKey, BEFORE issuing any
+    request, and refuses on any mismatch — never trusting the registry/
+    policy side's declared `SpecID` as sufficient on its own, the same
+    defense-in-depth discipline as `ValidFor`. This check deliberately
+    lives ONLY in the concrete Executor (documented as a REQUIRED
+    independent re-verification on the `research.Executor` interface in
+    `explorer.go`) — neither `Explorer` nor `Replay` pre-check it
+    themselves, since only the concrete Executor knows what its own
+    "correct" SpecID actually is.
+    `TestHTTPExecutorRefusesSpecIDMismatch` (`research/http_e5_test.go`)
+    proves a real request never reaches the network on a mismatch, mirroring
+    `TestBudgetedRoundTripperFailsClosedWithoutMeter`'s style;
+    `TestSelectStampsSpecIDFromMatchedRegistration` and
+    `TestActionPolicyIDChangesWhenSpecIDChanges`
+    (`internal/actionauth/policy_test.go`) prove the primitive itself.
+    `StateMachineBinding` (E6) gained a `specID` field (recorded from
+    `rc.Transition.Action.SpecID()` at `Produce` time, purely for evidence
+    traceability — a `PolicyID` mismatch already implies a `SpecID`
+    mismatch, since `SpecID` is now folded into it), plus
+    `Refs["action_spec_id"]` and an `action_spec_id=` line in
+    `transitionCaseArtifactHash`; `replaySummaryObservation` gained an
+    `action_spec_id` artifact. Every `HTTPExecutor`-backed test registration
+    (`research/http_e5_test.go`'s `get-root`/`get-health`,
+    `research/state_machine_replay_test.go`'s `deny`/`aaa-other-action`) now
+    sets a matching `SpecID`, since `Execute` fails closed without one.
+  - **Seventh regression, same fourth audit round: even with byte-identical
+    registry data, a future change to `StateRequirements.matches`'s own
+    comparison, `Select`'s selection/sort order, or its fail-closed
+    behavior would change what a registry actually AUTHORIZES without
+    changing a pure data-hash `PolicyID` at all — silently letting an old
+    binding and a new one claim "the same policy" across a semantics
+    change.** Fixed: `actionauth.ActionPolicySemanticsVersion =
+    "action-policy-v1"` is now the FIRST line hashed by
+    `Registry.canonicalHash()`, so any future deliberate change to
+    matching/selection/fail-closed semantics is forced to bump it (to
+    `"action-policy-v2"`, and so on), which changes every `PolicyID`
+    derived from it. `TestActionPolicySemanticsVersionIsFoldedIntoPolicyID`
+    pins the current frozen value so an accidental edit is caught as a test
+    failure, not a silent behavior change.
   - **Fresh session, same target, never a substituted one.** `ReplayTarget`
     (`TargetID`/`BuildID`/`Protocol`/`HarnessID`, no `SessionID`) is fixed at
     a validator's construction; each `Replay` call takes a caller-supplied
@@ -1284,43 +1343,63 @@ the guarantees hold under test:
     that decision generically) is future work, not required to prove this
     stage's own contract.
   - **20-item freeze-gate battery** (`research/state_machine_replay_test.go`),
-    plus 5 focused unit tests on the `PolicyID`/`Safety` primitive itself in
-    `internal/actionauth/policy_test.go`: a non-`OriginStateMachine`
-    Candidate, a missing/malformed binding, a `rule_id` unregistered in
-    this validator's own registry, a diverged action/projector identity, a
-    mismatched target, a mismatched `PolicyID`, an action whose FRESH
-    `Safety` is not `ActionStrictReadOnly`, and an empty `sessionID` are all
-    rejected before any I/O; Refs corruption (now including `policy_id`) is
-    proven irrelevant to resolution; a SHARED, unchanged policy that
-    genuinely selects a different (or no) action for a different fresh
-    baseline never falls back to the rule's own `ActionID`; a real fresh
-    baseline that doesn't satisfy `fact_transition`'s precondition produces
-    `no_signal` without ever executing the action; a real fresh replay that
-    satisfies the rule produces `no_signal`; a real fresh replay that
-    violates the rule again produces `reproduced`, with Evidence proven to
-    carry fresh before/after fingerprints plus a `replay_summary` whose
-    `rule_id`/`projector_id`/`action_registry_key`/`policy_id`/
-    `action_safety`/`assessment`/`request_count` all match expectations,
-    a `replay_case_artifact_hash` provably distinct from the original
+    plus 8 focused unit tests on the `PolicyID`/`Safety`/`SpecID` primitive
+    itself in `internal/actionauth/policy_test.go`, plus a dedicated
+    `HTTPExecutor` SpecID-mismatch test in `research/http_e5_test.go`: a
+    non-`OriginStateMachine` Candidate, a missing/malformed binding, a
+    `rule_id` unregistered in this validator's own registry, a diverged
+    action/projector identity, a mismatched target, a mismatched
+    `PolicyID`, an action whose FRESH `Safety` is not
+    `ActionStrictReadOnly`, and an empty `sessionID` are all rejected before
+    any I/O; Refs corruption (now including `policy_id` and
+    `action_spec_id`) is proven irrelevant to resolution; a SHARED,
+    unchanged policy that genuinely selects a different (or no) action for
+    a different fresh baseline never falls back to the rule's own
+    `ActionID`; a real fresh baseline that doesn't satisfy
+    `fact_transition`'s precondition produces `no_signal` without ever
+    executing the action; a real fresh replay that satisfies the rule
+    produces `no_signal`; a real fresh replay that violates the rule again
+    produces `reproduced`, with Evidence proven to carry fresh before/after
+    fingerprints plus a `replay_summary` whose `rule_id`/`projector_id`/
+    `action_registry_key`/`policy_id`/`action_spec_id`/`action_safety`/
+    `assessment`/`request_count` all match expectations, a
+    `replay_case_artifact_hash` provably distinct from the original
     Candidate's own `CaseArtifactHash()`, and a Candidate left at exactly
-    `Hypothesis`; the pure outcome-mapping table is proven for all four
-    assessments plus an unrecognized one; a real request-budget exhaustion
-    and a real wall-time timeout both fail as errors; and construction
-    itself rejects a nil dependency or an invalid `ReplayBudget`. All pass,
-    every fixture built through the REAL E6 pipeline (a real
-    `StateMachineProducer.Produce` against a real transition observed over
-    real HTTP) rather than a hand-built Candidate.
+    `Hypothesis`; a real `HTTPExecutor` proven to refuse (before any request
+    reaches the network) a `BoundAction` whose `SpecID` doesn't match its
+    own registered spec for the resolved path; the pure outcome-mapping
+    table is proven for all four assessments plus an unrecognized one; a
+    real request-budget exhaustion and a real wall-time timeout both fail
+    as errors; and construction itself rejects a nil dependency or an
+    invalid `ReplayBudget`. All pass, every fixture built through the REAL
+    E6 pipeline (a real `StateMachineProducer.Produce` against a real
+    transition observed over real HTTP) rather than a hand-built Candidate.
   - **v1 explicitly does NOT do:** state preparation to satisfy a
     precondition, trusting `Candidate.Refs` for any authority decision,
     letting a rule's own `ActionID` (or any field a `TransitionRule`
     declares about itself) substitute for `actionauth`'s authority over
     what may execute or how safely, replaying an action whose FRESH
     `Safety` is not `ActionStrictReadOnly`, replaying under a differently-
-    identified `ActionPolicy` than the one that originally authorized the
-    action, replaying against the same recorded session, LLM judgment of
-    what counts as reproduction, any new exploration capability, or
-    Promoting a Candidate itself. None of these have any code path in
-    `research/state_machine_replay.go` today.
+    identified `ActionPolicy` (by content, executable spec, OR semantics
+    version) than the one that originally authorized the action, executing
+    an action whose `SpecID` the concrete Executor cannot independently
+    verify against its own wiring, replaying against the same recorded
+    session, LLM judgment of what counts as reproduction, any new
+    exploration capability, or Promoting a Candidate itself. None of these
+    have any code path in `research/state_machine_replay.go` today.
+  - **`S10-E7 = FROZEN`** after this fourth audit round. The final Evidence-
+    traceability set an `OutcomeReproduced` `ValidationResult` carries is
+    now: `rule_id`, `action_id` (`action_registry_key`/`action_variant_id`),
+    `action_spec_id`, `policy_id`, before fingerprint, after fingerprint,
+    replay scope/session (`replay_target_hash`/`replay_scope_hash`),
+    `assessment=violated`, and the replay's own `replay_case_artifact_hash`
+    — every one of them read from the FRESH `BoundAction`/`Fingerprint`s
+    this Replay attempt itself produced, never from the original
+    Candidate's own recorded copies. The next stage — wiring
+    `OutcomeReproduced` and its fresh Evidence into the Engine's existing
+    `shouldPromote`/`Promote` pipeline to complete `hypothesis → independent
+    replay → reproducible` — is deliberately NOT part of this pass; no
+    further expansion of Replay's own architecture is needed to get there.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
   Wiring S10-E7's `ValidationResult` into the Engine's existing promotion

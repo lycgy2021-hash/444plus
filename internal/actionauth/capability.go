@@ -58,9 +58,29 @@ const (
 // value for an unset field) reads as "no safety class declared" and is
 // never treated as safe by anything that checks it — the same fail-closed
 // discipline as an unset StateRequirements.ProjectorID matching nothing.
+//
+// SpecID is a separate declaration: a stable identity for WHAT THE ACTION
+// ACTUALLY EXECUTES (e.g. an HTTP method+path+redirect-policy+body, hashed
+// canonically by whatever concrete Executor owns that RegistryKey — see
+// research.HTTPActionSpecID). Key/Safety alone describe the registry's OWN
+// declarative view of an action; they say nothing about whether the
+// concrete Executor wired to that RegistryKey today executes the same
+// operation it executed yesterday, or the same operation a DIFFERENT
+// Executor implementation/version would execute for that same Key. Without
+// SpecID, two Registries (or two Executor versions behind the same
+// Registry) could agree on Key+Safety+Requirements — and therefore on
+// PolicyID — while silently executing different real-world operations.
+// SpecID closes that gap: it is folded into PolicyID (see
+// Registry.canonicalHash), and the concrete Executor is REQUIRED to
+// independently re-verify a BoundAction's SpecID against its own
+// internally-computed canonical spec immediately before executing — never
+// trusted from the registry alone, mirroring ValidFor's defense-in-depth
+// pattern above. The empty string reads as "no executable spec declared"
+// and never matches a non-empty Executor-computed SpecID.
 type RegisteredAction struct {
 	Key    string
 	Safety ActionSafety
+	SpecID string
 }
 
 // BoundAction is the ONLY value an Executor may run. Its identity is
@@ -102,11 +122,13 @@ type BoundAction struct {
 	// observed at the moment of binding.
 	scopeHash           string
 	authorizedStateHash string
-	// safety and policyID are stamped by ActionPolicy.Select FROM the
-	// matched Registration/Registry — never supplied by a caller of
+	// safety, specID and policyID are stamped by ActionPolicy.Select FROM
+	// the matched Registration/Registry — never supplied by a caller of
 	// Select, and never derived from anything a downstream S10/E6
-	// TransitionRule declares. See Safety's and PolicyID's own doc.
+	// TransitionRule declares. See Safety's, SpecID's and PolicyID's own
+	// doc.
 	safety   ActionSafety
+	specID   string
 	policyID string
 }
 
@@ -124,6 +146,16 @@ func (a BoundAction) ID() ActionID { return a.id }
 // with a different authority: "what to expect", not "what is safe to
 // run") declares about itself. The zero-value BoundAction returns "".
 func (a BoundAction) Safety() ActionSafety { return a.safety }
+
+// SpecID returns the executable-spec identity this BoundAction's own
+// matched Registration declared — see RegisteredAction.SpecID's own doc.
+// A concrete Executor MUST independently verify this against its own
+// computed canonical spec for the matched RegistryKey immediately before
+// executing, and refuse on any mismatch: this is the ONLY signal that
+// "the same ActionID/PolicyID" also means "the same real-world operation",
+// and it must never be trusted from the registry side alone. The
+// zero-value BoundAction returns "".
+func (a BoundAction) SpecID() string { return a.specID }
 
 // PolicyID returns a deterministic identity for the ActionPolicy that
 // produced this BoundAction — see ActionPolicy.PolicyID's own doc. Two

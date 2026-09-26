@@ -87,7 +87,7 @@ func e7ReplayTarget() ReplayTarget {
 // one Replay invents for itself.
 func e7DenyOnlyPolicy(projectorID stateauth.ProjectorID, safety actionauth.ActionSafety) *actionauth.ActionPolicy {
 	registry := actionauth.NewRegistry(actionauth.Registration{
-		Action:       actionauth.RegisteredAction{Key: "deny", Safety: safety},
+		Action:       actionauth.RegisteredAction{Key: "deny", Safety: safety, SpecID: HTTPActionSpecID("/deny")},
 		Requirements: actionauth.StateRequirements{ProjectorID: projectorID},
 	})
 	return actionauth.NewActionPolicy(registry, actionauth.NewRecoveryRegistry())
@@ -176,11 +176,11 @@ func e7BuildOriginalCandidate(t *testing.T, f *e7Fixture, sessionID string) (*Ca
 func e7StatusKeyedPolicy(projectorID stateauth.ProjectorID) *actionauth.ActionPolicy {
 	registry := actionauth.NewRegistry(
 		actionauth.Registration{
-			Action:       actionauth.RegisteredAction{Key: "deny", Safety: actionauth.ActionStrictReadOnly},
+			Action:       actionauth.RegisteredAction{Key: "deny", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/deny")},
 			Requirements: actionauth.StateRequirements{ProjectorID: projectorID, Facts: map[string]string{"status": "200"}},
 		},
 		actionauth.Registration{
-			Action:       actionauth.RegisteredAction{Key: "aaa-other-action", Safety: actionauth.ActionStrictReadOnly},
+			Action:       actionauth.RegisteredAction{Key: "aaa-other-action", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/deny")},
 			Requirements: actionauth.StateRequirements{ProjectorID: projectorID, Facts: map[string]string{"status": "403"}},
 		},
 	)
@@ -450,6 +450,7 @@ func TestE7RefsMutationDoesNotAffectReplayResolution(t *testing.T) {
 	c.Refs["replay_target_hash"] = "not-the-real-target-hash"
 	c.Refs["case_artifact_hash"] = "not-the-real-case-hash"
 	c.Refs["policy_id"] = "not-the-real-policy-id"
+	c.Refs["action_spec_id"] = "not-the-real-spec-id"
 
 	f.reset() // genuinely fresh baseline
 	v := e7NewValidator(t, f, registry, policy, e7ReplayTarget(), e7DefaultBudget())
@@ -610,11 +611,15 @@ func TestE7ViolatedProducesReproducedWithIndependentEvidence(t *testing.T) {
 		t.Fatal("ValidationResult.Evidence has no replay_summary observation")
 	}
 	binding, _ := c.StateMachineBinding()
+	if binding.SpecID() == "" {
+		t.Fatal("StateMachineBinding.SpecID() must be non-empty for a real HTTPExecutor-backed action")
+	}
 	for _, check := range []struct{ kind, want string }{
 		{"rule_id", rule.RuleID},
 		{"projector_id", string(rule.ProjectorID)},
 		{"action_registry_key", rule.ActionID.RegistryKey},
 		{"policy_id", binding.PolicyID()},
+		{"action_spec_id", binding.SpecID()},
 		{"action_safety", string(actionauth.ActionStrictReadOnly)},
 		{"assessment", string(TransitionViolated)},
 	} {
