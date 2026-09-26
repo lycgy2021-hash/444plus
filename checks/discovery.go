@@ -75,6 +75,12 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 	if hasHeader("X-Jenkins") || hasHeader("X-Hudson") {
 		add("jenkins")
 	}
+	// GitLab emits X-Gitlab-Meta on every response (including the root redirect
+	// and 404s); the checkers re-verify with the ≥2-signal rule, so a single
+	// header or a body mention is only a routing hint. Over-inclusive is fine.
+	if hasHeader("X-Gitlab-Meta") || containsAnyLower(body, []string{"tanuki-shape", "tanuki-logo", "/-/manifest.json", "gitlab community edition", "gitlab enterprise edition", `data-qa-selector="login_page"`}) {
+		add("gitlab")
+	}
 	if hasHeader("MicrosoftSharePointTeamServices") || hasHeader("X-SharePointHealthScore") || strings.Contains(body, "/_layouts/15/") {
 		add("sharepoint")
 	}

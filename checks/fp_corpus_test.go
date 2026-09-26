@@ -182,6 +182,30 @@ func TestFalsePositiveCorpusHTTP(t *testing.T) {
 		{"uniform_200_proxy", "", func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(`<!doctype html><html><body>Welcome</body></html>`))
 		}},
+		// Adversarial (GitLab): a single forged X-Gitlab-Meta header with no
+		// GitLab-specific body markers must not identify the product (≥2 signals),
+		// so no GitLab checker may elevate — even though the body carries an
+		// affected-looking version fragment.
+		{"forged_gitlab_meta_only", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Gitlab-Meta", `{"correlation_id":"01ABC","version":"1"}`)
+			w.Write([]byte(`<html>not really gitlab &quot;gitlab_version&quot;:{&quot;major&quot;:16,&quot;minor&quot;:6,&quot;patch&quot;:0}</html>`))
+		}},
+		// Adversarial (GitLab): an ordinary page that merely mentions GitLab.
+		{"mentions_gitlab", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html>We host our code on GitLab Community Edition internally.</html>`))
+		}},
+		// Adversarial (GitLab): a generic Rails app carries the csrf-param meta but
+		// no GitLab-specific marker — the Rails signal alone must not identify GitLab.
+		{"generic_rails_csrf", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html><meta name="csrf-param" content="authenticity_token" /><body>My Rails App</body></html>`))
+		}},
+		// Adversarial (GitLab): a header-only case plus a GitLab body marker WITHOUT
+		// the Rails csrf pair — still only one real body signal short of the lock,
+		// and the manifest tiebreaker (same non-manifest body) does not qualify.
+		{"gitlab_marker_no_csrf", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Gitlab-Meta", `{"correlation_id":"01ABC","version":"1"}`)
+			w.Write([]byte(`<html><h1>GitLab Community Edition</h1></html>`))
+		}},
 	}
 	for _, tc := range corpus {
 		t.Run(tc.name, func(t *testing.T) {
@@ -238,6 +262,22 @@ func TestVerdictElevationGuards(t *testing.T) {
 				return
 			}
 			w.Write([]byte(`<html>jenkins, no version marker</html>`))
+		}},
+		{"gitlab_reset_exposed_no_version", "CVE-2023-7028", func(w http.ResponseWriter, r *http.Request) {
+			// GitLab identified (X-Gitlab-Meta + sign-in body markers) and the
+			// forgotten-password flow is reachable, but /help exposes no version:
+			// affected status is unknown, so the CVE must not elevate.
+			w.Header().Set("X-Gitlab-Meta", `{"correlation_id":"01ABC","version":"1"}`)
+			switch r.URL.Path {
+			case "/users/sign_in":
+				w.Write([]byte(`<meta content="GitLab" property="og:site_name"><meta name="csrf-param" content="authenticity_token" /><body data-qa-selector="login_page"></body>`))
+			case "/users/password/new":
+				w.Write([]byte(`<form action="/users/password" accept-charset="UTF-8" method="post"><input type="email" name="user[email]" /></form>`))
+			case "/help":
+				http.Redirect(w, r, "/users/sign_in", 302)
+			default:
+				w.Write([]byte(`<html>GitLab</html>`))
+			}
 		}},
 	}
 	for _, tc := range cases {
