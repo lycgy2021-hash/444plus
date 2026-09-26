@@ -80,9 +80,23 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 	if hasHeader("X-Gitlab-Meta") {
 		add("gitlab")
 	}
+	// Fallback: when X-Gitlab-Meta is stripped by proxy, probe for GitLab's sign-in page.
+	// This catches cases where the checker can still verify via body + manifest.
+	if !hasHeader("X-Gitlab-Meta") && (strings.Contains(body, "/users/sign_in") || strings.Contains(body, "new_user") || strings.Contains(body, "gitlab")) {
+		signInResp, err := client.Get(ctx, target, "/users/sign_in")
+		if err == nil && signInResp.StatusCode >= 200 && signInResp.StatusCode < 300 && strings.Contains(strings.ToLower(string(signInResp.Body)), "gitlab") {
+			d.HTTPRequests++
+			add("gitlab")
+		}
+	}
 	// JBoss/WildFly Management Interface signals. /management probe happens in the
 	// checker itself; this is purely a routing hint based on product name/structure.
 	if strings.Contains(body, "jboss") || strings.Contains(body, "wildfly") || strings.Contains(body, "hibernate validator") {
+		add("jbosswildfly")
+	}
+	// Management interface typically on 9990 (http) or 9993 (https), even if main app
+	// has no JBoss markers. This routes checkers to explore independent management endpoint.
+	if target.Port == 9990 || target.Port == 9993 {
 		add("jbosswildfly")
 	}
 	if hasHeader("MicrosoftSharePointTeamServices") || hasHeader("X-SharePointHealthScore") || strings.Contains(body, "/_layouts/15/") {
