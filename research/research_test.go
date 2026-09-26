@@ -9,7 +9,7 @@ import (
 )
 
 func TestCandidateStateLadder(t *testing.T) {
-	c := NewHypothesis("RC-2026-000001", "path_normalization", "double-encoded traversal", "http://t", "why", Origin{Kind: OriginAI, ID: "openai-compat:qwen"}, []string{"baseline_response"})
+	c := NewHypothesis("RC-2026-000001", "path_normalization", "double-encoded traversal", "http://t", "why", Origin{Kind: OriginAI, ID: "openai-compat:qwen"}, []string{"baseline_response"}, Provenance{ProducerKind: "human"})
 	if c.State != Hypothesis {
 		t.Fatalf("born at %s, want hypothesis", c.State)
 	}
@@ -133,8 +133,8 @@ func TestAnalyzerDeduplicateFiltersUnknownIDs(t *testing.T) {
 		{"RC-9999-000000"},                   // all invented -> dropped
 	}}}
 	cands := []*Candidate{
-		NewHypothesis("RC-2026-000001", "t", "a", "", "", Origin{Kind: OriginAI, ID: "stub"}, nil),
-		NewHypothesis("RC-2026-000002", "t", "b", "", "", Origin{Kind: OriginAI, ID: "stub"}, nil),
+		NewHypothesis("RC-2026-000001", "t", "a", "", "", Origin{Kind: OriginAI, ID: "stub"}, nil, Provenance{ProducerKind: "human"}),
+		NewHypothesis("RC-2026-000002", "t", "b", "", "", Origin{Kind: OriginAI, ID: "stub"}, nil, Provenance{ProducerKind: "human"}),
 	}
 	groups, err := NewAnalyzer(prov).Deduplicate(context.Background(), cands)
 	if err != nil {

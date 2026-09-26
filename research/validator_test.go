@@ -28,7 +28,7 @@ func (m mockValidator) Validate(context.Context, model.Target, *Candidate) (Vali
 }
 
 func hypo(required ...string) *Candidate {
-	return NewHypothesis("RC-2026-000001", "http_differential", "t", "http://t", "h", Origin{Kind: OriginAI, ID: "stub"}, required)
+	return NewHypothesis("RC-2026-000001", "http_differential", "t", "http://t", "h", Origin{Kind: OriginAI, ID: "stub"}, required, Provenance{ProducerKind: "human"})
 }
 
 func repro(evidenceKinds ...string) ValidationResult {
@@ -180,7 +180,7 @@ func TestHTTPDifferentialValidatorRealServer(t *testing.T) {
 
 	// The candidate's free text names a bogus URL; the validator must ignore it and
 	// probe only its OWN fixed paths (AI text is never executed).
-	c := NewHypothesis("RC-2026-000001", "path_normalization", "please fetch http://evil.example/secret", target.BaseURL, "h", Origin{Kind: OriginAI, ID: "stub"}, []string{"baseline_response", "normalized_response"})
+	c := NewHypothesis("RC-2026-000001", "path_normalization", "please fetch http://evil.example/secret", target.BaseURL, "h", Origin{Kind: OriginAI, ID: "stub"}, []string{"baseline_response", "normalized_response"}, Provenance{ProducerKind: "human"})
 
 	results, err := e.Validate(context.Background(), target, c)
 	if err != nil {

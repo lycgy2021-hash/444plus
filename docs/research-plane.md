@@ -89,6 +89,26 @@ actions" entry point — a validator owns and bounds its own probes), `Outcome`
 `HTTPDifferentialValidator` is the first real validator: read-only GETs of its own
 fixed baseline/normalized paths, never anything from the candidate text.
 
+**Provenance (lineage, locked before S6/S8)** — `research/evidence.go` defines an
+immutable `Provenance{ProducerKind, ProducerID, Tool, Timestamp, InputHash}` set
+once at birth on both `Evidence` and `Candidate`. `InputHash` (SHA-256 of the
+exact input — the evidence bundle, the diff blob, the crash) ties a candidate to
+what produced it; combined with the append-only `History` (each `Promote` records
+its validator + evidence refs + time) and content-addressed evidence, the full
+lineage `diff → AI → validator → reproduced` is answerable and tamper-evident:
+where it came from, which input, which validator, and whether evidence was later
+swapped.
+
+**S6 v1 — `research/diff.go`** — the first non-AI producer: a deterministic
+`DiffProducer` reads a unified git diff and classifies security-relevant ADDED
+changes (`added_bounds_check`, `added_auth_check`, `added_canonicalization`,
+`added_type_validation`, `added_length_validation`, `dangerous_api_replaced`,
+`added_reject_path`) into hypothesis candidates tagged `Origin{Kind: "diff"}`.
+They flow into the **same** Registry → Validator → Engine spine; with no diff
+validator registered yet they correctly stay `hypothesis` (no second pipeline, no
+auto-promotion). An AI diff pass can later enrich these candidates, never replace
+the deterministic classification.
+
 Nothing here touches the 28 checkers or the engine; `go build/vet/test ./...`
 (and `-race`) stays green.
 
@@ -110,11 +130,19 @@ the guarantees hold under test:
 | repeated validation | idempotent (one transition) |
 | concurrent `Promote` | one wins; never skips a rung |
 
-## Roadmap (frozen until this base is proven, then)
+## Status / roadmap
 
-`S6` Diff Analyzer · `S8` Fuzz/crash pipeline (prioritized next — patch diffs and
-crashes are far higher signal-to-noise for a model than a whole repo) · `S7`
-Source-audit ingestion · `S9` Differential engine · `S10` State-machine explorer.
-Each is a new **Research Source** (a new `Origin.Kind`) feeding the same
-`Candidate → Validator → Evidence → Promote` spine — the LLM stays one producer,
-not the engine.
+- **S1–S5: foundation frozen.**
+- **Provenance: locked.**
+- **S6 (patch/diff intelligence): v1 landed** (deterministic `DiffProducer`; an AI
+  diff pass can enrich later).
+- **S8 (fuzz/crash intelligence): next** — v1 stays small: fuzzer output → crash
+  normalization → stack hash → dedup → security-interesting classification →
+  `Candidate{Origin{Kind:"fuzz"}}`. The fuzz engine discovers; the LLM only
+  understands/classifies — no LLM-generated fuzz inputs yet.
+- **Deferred:** `S7` large-scale source audit, `S9` differential engine, `S10`
+  state-machine explorer — not until S6/S8 are stable.
+
+Every source is a new `Origin.Kind` feeding the one spine
+`Producer → Candidate → Registered Validator → ValidationResult → Engine → state`.
+The LLM stays one producer, never the engine.

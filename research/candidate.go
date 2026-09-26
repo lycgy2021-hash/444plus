@@ -91,7 +91,11 @@ type Candidate struct {
 	RequiredEvidence []string      `json:"required_evidence,omitempty"`
 	Evidence         []Observation `json:"evidence,omitempty"`
 	CreatedAt        time.Time     `json:"created_at"`
-	History          []Transition  `json:"history,omitempty"`
+	// Provenance is the immutable origin record set at birth: which producer, which
+	// exact input (InputHash). Combined with History (append-only, each step naming
+	// its validator + evidence), it gives the full lineage of any conclusion.
+	Provenance Provenance   `json:"provenance"`
+	History    []Transition `json:"history,omitempty"`
 
 	// mu guards the read-modify-write in Promote so concurrent promotions cannot
 	// skip a rung (one wins hypothesis→reproducible; the rest see the advanced
@@ -102,7 +106,7 @@ type Candidate struct {
 // NewHypothesis constructs a candidate at Hypothesis — the only entry point for
 // AI-derived or analysis-derived leads. Whatever a model claimed, what enters the
 // system is a hypothesis.
-func NewHypothesis(id, candidateType, title, target, rationale string, origin Origin, required []string) *Candidate {
+func NewHypothesis(id, candidateType, title, target, rationale string, origin Origin, required []string, prov Provenance) *Candidate {
 	return &Candidate{
 		ID:               id,
 		Type:             candidateType,
@@ -113,6 +117,7 @@ func NewHypothesis(id, candidateType, title, target, rationale string, origin Or
 		Origin:           origin,
 		RequiredEvidence: required,
 		CreatedAt:        time.Now().UTC(),
+		Provenance:       prov,
 	}
 }
 
