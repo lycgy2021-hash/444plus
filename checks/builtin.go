@@ -37,7 +37,7 @@ func Builtin(client httpx.Probe, mode model.Mode, canary model.CanaryConfig) (*r
 		jbosswildfly.NewUnauthenticatedManagement(client),
 		jenkins.NewAnonScriptConsole(client), jenkins.NewCVE202423897(client),
 	} {
-		if err := r.Register(c); err != nil {
+		if err := r.Register(withValidation(c)); err != nil {
 			return nil, err
 		}
 	}

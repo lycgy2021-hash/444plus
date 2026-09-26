@@ -66,13 +66,63 @@ func (c Capability) Names() []string {
 }
 
 type Metadata struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Product      string   `json:"product"`
-	Severity     string   `json:"severity"`
-	Family       string   `json:"family,omitempty"` // groups related CVEs, e.g. "ToolShell"
-	References   []string `json:"references"`
-	Capabilities []string `json:"capabilities"`
+	ID           string      `json:"id"`
+	Name         string      `json:"name"`
+	Product      string      `json:"product"`
+	Severity     string      `json:"severity"`
+	Family       string      `json:"family,omitempty"` // groups related CVEs, e.g. "ToolShell"
+	References   []string    `json:"references"`
+	Capabilities []string    `json:"capabilities"`
+	Validation   *Validation `json:"validation,omitempty"`
+}
+
+// ValidationTier records how a checker's correctness has actually been
+// checked — as opposed to what a comment or a Markdown doc claims. This
+// project has already hit the gap twice: real-machine "acceptance" testing
+// that didn't isolate the one path a later change broke, and a doc that kept
+// saying "not validated" after a sibling branch validated it. A machine-
+// readable record is the fix; see docs/regression-baseline.md for the prose
+// version this is meant to stop drifting from.
+type ValidationTier string
+
+const (
+	// ValidationResearch: built from advisory/documentation research only, no
+	// checker code exists yet to test (see a "*-attack-surface.md" research
+	// doc). Nothing currently registered should carry this — once a checker
+	// exists with any test at all, it has moved to at least ValidationFixture.
+	ValidationResearch ValidationTier = "research"
+	// ValidationFixture: exercised by unit tests and/or synthetic HTTP
+	// fixtures (httptest, hand-built mocks) only — no real vulnerable or
+	// patched instance of the product was ever run.
+	ValidationFixture ValidationTier = "fixture"
+	// ValidationLive: run against a real instance of the product (ideally
+	// both a real vulnerable state and a real patched/secure one).
+	ValidationLive ValidationTier = "live"
+)
+
+// Validation is a checker's validation record. It travels with Metadata so a
+// report can show it next to a verdict, and so a later pass can compare
+// LastValidatedCommit against the checker's own file history to tell a still-
+// accurate `live` record from a stale one (VALID vs STALE; not computed here
+// — the field only needs to exist for now).
+type Validation struct {
+	Tier ValidationTier `json:"tier"`
+	// TestedVersions are the product versions an actual instance ran, e.g.
+	// "41.0.1.Final". Empty for ValidationResearch/ValidationFixture.
+	TestedVersions []string `json:"tested_versions,omitempty"`
+	// TestedStates names the distinct conditions actually exercised, e.g.
+	// "secure_default", "anonymous_script_console", "app_port_404_then_9990".
+	// A `live` tier with a short or empty TestedStates is a signal to look
+	// closer, not a guarantee the whole verdict ladder was covered — this is
+	// exactly the gap that let two real jbosswildfly bugs survive one
+	// session's "four-state acceptance" untouched.
+	TestedStates []string `json:"tested_states,omitempty"`
+	// EvidenceRefs point at the write-up, e.g.
+	// "docs/regression-baseline.md#jenkins-two-lines-four-state-real-validated".
+	EvidenceRefs []string `json:"evidence_refs,omitempty"`
+	// LastValidatedCommit is the commit hash the rest of this record was true
+	// as of. Left blank where no single commit cleanly represents it.
+	LastValidatedCommit string `json:"last_validated_commit,omitempty"`
 }
 
 // Observation contains bounded, selected evidence. Response bodies and cookies

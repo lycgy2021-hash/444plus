@@ -55,13 +55,20 @@ low-false-positive, evidence-graded vulnerability assessment engine.
   evidence chain; `--json`/`-o` emits machine JSON. Bare IP/host accepted.
 
 ### Coverage
-25 checkers across 10 product lines: Apache httpd, nginx, nginx-ui,
+28 checkers across 12 product lines: Apache httpd, nginx, nginx-ui,
 ingress-nginx (IngressNightmare), Fortinet (FG-IR-24-535 / FG-IR-25-254),
 SharePoint (ToolShell family), Tomcat (CVE-2025-24813), WebLogic
 (CVE-2023-21839 + Oracle CPU 2026-07 batch), Oracle HTTP Server / WebLogic proxy
-plug-in, Citrix NetScaler (CVE-2025-7775 / CVE-2025-6543).
+plug-in, Citrix NetScaler (CVE-2025-7775 / CVE-2025-6543), JBoss/WildFly
+(unauthenticated management interface misconfiguration), Jenkins
+(unauthenticated Script Console misconfiguration + CVE-2024-23897).
 
 Real-target validated: Apache (vulhub 2.4.49/2.4.50), ingress-nginx (k3d
-v1.11.2), Tomcat (writable/readonly/fixed 3-state), WebLogic (T3 12.2.1.3). The
-device/mock lines (Fortinet, SharePoint, Oracle proxy, NetScaler) are
-unit/corpus validated; their fingerprints are heuristic pending real appliances.
+v1.11.2), Tomcat (writable/readonly/fixed 3-state), WebLogic (T3 12.2.1.3),
+JBoss/WildFly (38.0.0.Final / 41.0.1.Final, secure-default vs. unauthenticated-
+management), Jenkins (2.426.2 / 2.568.3, secure-default vs. anonymous Script
+Console + CVE-2024-23897). The device/mock lines (Fortinet, SharePoint, Oracle
+proxy, NetScaler) are unit/corpus validated; their fingerprints are heuristic
+pending real appliances. Every checker's validation tier (research/fixture/
+live) is now machine-readable in its Metadata — see `checks/validation.go` and
+`internal/model.Validation` — instead of living only in this prose.
