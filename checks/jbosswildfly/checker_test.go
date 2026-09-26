@@ -15,9 +15,12 @@ import (
 	"gopoc/internal/policy"
 )
 
-// mockProbe drives the checker's ladder without a live JBoss/WildFly. Get
-// answers managementPath with the configured management response and 404 for
-// anything else; Fingerprint answers with the configured app-port body.
+// mockProbe drives the checker's ladder without a live JBoss/WildFly. The
+// checker fingerprints via a plain Get("/") (client.Fingerprint's shared cache
+// always nils out Body, so a body-based signal must use a fresh Get instead —
+// see doAssess), so Get answers "/" with the configured app-port body,
+// managementPath with the configured management response, and anything else
+// with a bare 404.
 type mockProbe struct {
 	fpBody      string
 	fpHeaders   map[string]string
@@ -28,14 +31,17 @@ type mockProbe struct {
 }
 
 func (m mockProbe) Fingerprint(context.Context, model.Target) (httpx.Response, error) {
-	h := m.fpHeaders
-	if h == nil {
-		h = map[string]string{}
-	}
-	return httpx.Response{StatusCode: 200, Body: []byte(m.fpBody), Headers: h}, nil
+	return httpx.Response{Headers: map[string]string{}}, nil
 }
 
 func (m mockProbe) Get(_ context.Context, _ model.Target, path string) (httpx.Response, error) {
+	if path == "/" {
+		h := m.fpHeaders
+		if h == nil {
+			h = map[string]string{}
+		}
+		return httpx.Response{StatusCode: 200, Body: []byte(m.fpBody), Headers: h}, nil
+	}
 	if path != managementPath {
 		return httpx.Response{StatusCode: 404, Headers: map[string]string{}}, nil
 	}
@@ -201,6 +207,32 @@ func TestRealServerLadder(t *testing.T) {
 		}
 	})
 
+	// Regression: the checker used to fingerprint via client.Fingerprint(),
+	// whose shared cache always nils out the response Body — so a real client
+	// never actually saw the welcome page and this case wrongly came back
+	// not_found. Isolate the fingerprint-only path: the app port 404s on
+	// /management (no real management API there) and the conventional
+	// fallback ports are (almost certainly) closed in this test environment,
+	// so the welcome page's body is the ONLY route to isProduct=true.
+	t.Run("welcome_page_alone_is_read_by_a_real_client", func(t *testing.T) {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == managementPath {
+				w.WriteHeader(404)
+				return
+			}
+			w.Write([]byte("<html>Welcome to WildFly</html>"))
+		}))
+		defer s.Close()
+		target, _ := model.ParseTarget(s.URL)
+		f := NewUnauthenticatedManagement(client).Check(context.Background(), target)
+		if f.Reason == "product_not_jbosswildfly" {
+			t.Fatalf("fingerprint body was not read by the real client: got %s/%s", f.Verdict, f.Reason)
+		}
+		if f.Verdict != model.VerdictUnknown || f.Reason != "management_state_unclear" {
+			t.Errorf("got %s/%s, want unknown/management_state_unclear", f.Verdict, f.Reason)
+		}
+	})
+
 	t.Run("open_management_reaches_likely", func(t *testing.T) {
 		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == managementPath {
@@ -216,6 +248,53 @@ func TestRealServerLadder(t *testing.T) {
 			t.Fatalf("got %s/%s, want likely/unauthenticated_management_exposed", f.Verdict, f.Reason)
 		}
 	})
+}
+
+// portKeyedProbe answers /management differently depending on which candidate
+// port was asked, so it can prove probeManagement actually tries every
+// candidate rather than stopping at the first port that answers at all.
+type portKeyedProbe struct {
+	byPort map[int]httpx.Response
+}
+
+func (p portKeyedProbe) Get(_ context.Context, target model.Target, path string) (httpx.Response, error) {
+	if path != managementPath {
+		return httpx.Response{StatusCode: 404, Headers: map[string]string{}}, nil
+	}
+	if r, ok := p.byPort[target.Port]; ok {
+		return r, nil
+	}
+	return httpx.Response{StatusCode: 404, Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) Fingerprint(context.Context, model.Target) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) Post(context.Context, model.Target, string, string, []byte) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) Options(context.Context, model.Target, string) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) TCP(context.Context, model.Target, []byte, int) ([]byte, error) {
+	return nil, nil
+}
+
+// TestProbeManagementTriesEveryCandidate is a regression test for a real bug:
+// probeManagement used to return on the FIRST candidate that answered at
+// all, even an irrelevant 404 from the app's own port — so it never even
+// tried the real management port (9990) once the app port (here 8080)
+// answered anything. This pins the fix: the app port's own 404 must not
+// shadow a real signal on 9990.
+func TestProbeManagementTriesEveryCandidate(t *testing.T) {
+	target, _ := model.ParseTarget("http://127.0.0.1:8080")
+	probe := portKeyedProbe{byPort: map[int]httpx.Response{
+		8080: {StatusCode: 404, Headers: map[string]string{}}, // app port: no /management here
+		9990: {StatusCode: 401, Headers: canonicalHeaders(map[string]string{"WWW-Authenticate": `Digest realm="ManagementRealm"`})},
+	}}
+	mgmt, _ := probeManagement(context.Background(), probe, target)
+	if mgmt.err != nil || mgmt.target.Port != 9990 || !requiresAuth(mgmt.response) {
+		t.Fatalf("probeManagement did not reach the real management port: %+v", mgmt)
+	}
 }
 
 // remotingProbe answers the jboss-remoting HTTP-upgrade handshake sent over

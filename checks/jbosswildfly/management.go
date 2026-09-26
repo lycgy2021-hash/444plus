@@ -47,21 +47,38 @@ func candidateManagementTargets(target model.Target) []model.Target {
 }
 
 // probeManagement issues one GET managementPath against each candidate target
-// on the host and returns the first one that gets any HTTP response at all —
-// a connection failure on one port (management usually is not the scanned
-// port) must not shadow a real answer on another.
+// on the host. It keeps trying every candidate until one gives the definitive
+// signal (an auth challenge or unauthenticated management data) — a plain 200
+// or 404 from the app's OWN port (the common topology: app on 8080, real
+// management API on a separate 9990) is not that signal and must not shadow
+// the real management port. Confirmed on a live WildFly image scanned at its
+// app port only: stopping at the first port that answers AT ALL (even a
+// 404 from the app port itself) never even tried 9990, so a real, reachable
+// secure instance came back not_found instead of detected. Only once no
+// candidate answers definitively does this fall back to the best "reachable
+// but unclear" response or, failing that, the last connection error.
 func probeManagement(ctx context.Context, client httpx.Probe, target model.Target) (managementProbe, []model.Observation) {
 	var obs []model.Observation
-	var last managementProbe
+	var reached, last managementProbe
+	haveReached := false
 	for _, cand := range candidateManagementTargets(target) {
 		r, err := client.Get(ctx, cand, managementPath)
 		o := r.Observation("management_probe", err)
 		o.URL = cand.Origin() + managementPath
 		obs = append(obs, o)
 		last = managementProbe{target: cand, response: r, err: err}
-		if err == nil {
+		if err != nil {
+			continue
+		}
+		if requiresAuth(r) || unauthenticatedData(r) {
 			return last, obs
 		}
+		if !haveReached {
+			reached, haveReached = last, true
+		}
+	}
+	if haveReached {
+		return reached, obs
 	}
 	return last, obs
 }

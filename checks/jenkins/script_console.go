@@ -1,6 +1,10 @@
 package jenkins
 
-import "gopoc/internal/httpx"
+import (
+	"strings"
+
+	"gopoc/internal/httpx"
+)
 
 // scriptPath is the Groovy Script Console. Reachable anonymously it is a direct
 // unauthenticated RCE; the secure default requires the Administer permission and
@@ -24,10 +28,14 @@ func classifyScript(r httpx.Response, err error) scriptState {
 	if err != nil {
 		return scriptUnreachable
 	}
-	switch r.StatusCode {
-	case 401, 403:
+	switch {
+	case r.StatusCode == 401 || r.StatusCode == 403:
 		return scriptProtected
-	case 200:
+	case r.StatusCode >= 300 && r.StatusCode < 400 && strings.Contains(r.Location, "/login"):
+		// The other browser-facing form of the secure default: a redirect to
+		// the login page rather than a bare 403.
+		return scriptProtected
+	case r.StatusCode == 200:
 		if isScriptConsole(r.Body) {
 			return scriptExposed
 		}

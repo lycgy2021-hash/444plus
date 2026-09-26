@@ -17,14 +17,15 @@ import (
 // configured headers (the header combo is what identifies the product and the
 // version); Get routes by path to the configured per-endpoint responses.
 type mockProbe struct {
-	fpHeaders    map[string]string
-	scriptStatus int
-	scriptBody   string
-	scriptErr    error
-	cliJarStatus int
-	cliStatus    int
-	apiStatus    int
-	whoAmIBody   string
+	fpHeaders      map[string]string
+	scriptStatus   int
+	scriptBody     string
+	scriptLocation string
+	scriptErr      error
+	cliJarStatus   int
+	cliStatus      int
+	apiStatus      int
+	whoAmIBody     string
 }
 
 func (m mockProbe) Fingerprint(context.Context, model.Target) (httpx.Response, error) {
@@ -37,7 +38,7 @@ func (m mockProbe) Get(_ context.Context, _ model.Target, path string) (httpx.Re
 		if m.scriptErr != nil {
 			return httpx.Response{}, m.scriptErr
 		}
-		return httpx.Response{StatusCode: m.scriptStatus, Body: []byte(m.scriptBody), Headers: map[string]string{}}, nil
+		return httpx.Response{StatusCode: m.scriptStatus, Body: []byte(m.scriptBody), Location: m.scriptLocation, Headers: map[string]string{}}, nil
 	case cliJarPath:
 		return httpx.Response{StatusCode: m.cliJarStatus, Headers: map[string]string{}}, nil
 	case cliPath:
@@ -102,6 +103,14 @@ func TestAnonScriptConsoleLadder(t *testing.T) {
 			// Real secure default: /script 403. This must NEVER be likely.
 			name:   "script_protected",
 			probe:  mockProbe{fpHeaders: jenkinsHeaders("2.568.3"), scriptStatus: 403},
+			want:   model.VerdictDetected,
+			reason: "script_console_protected",
+		},
+		{
+			// The other browser-facing form of the secure default: a redirect
+			// to /login rather than a bare 403. Must also stay at detected.
+			name:   "script_protected_login_redirect",
+			probe:  mockProbe{fpHeaders: jenkinsHeaders("2.568.3"), scriptStatus: 302, scriptLocation: "/login?from=%2Fscript"},
 			want:   model.VerdictDetected,
 			reason: "script_console_protected",
 		},

@@ -36,7 +36,13 @@ func assess(ctx context.Context, client httpx.Probe, target model.Target) assess
 
 func doAssess(ctx context.Context, client httpx.Probe, target model.Target) assessment {
 	var a assessment
-	fp, fpErr := client.Fingerprint(ctx, target)
+	// A plain GET, not client.Fingerprint: Fingerprint's shared cache always
+	// nils out the response Body (by design, to keep a large target list
+	// cheap), so a body-based fingerprint check against it never matches
+	// anything — confirmed on a live WildFly image, where this silently made
+	// the welcome-page signal dead code end to end. checks/jenkins avoids this
+	// class of bug entirely by fingerprinting on headers only.
+	fp, fpErr := client.Get(ctx, target, "/")
 	fpObs := fp.Observation("fingerprint", fpErr)
 	if fpErr == nil {
 		a.isProduct = looksLikeProduct(fp)

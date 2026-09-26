@@ -60,6 +60,22 @@ docker restart gopoc-wildfly
 Note: real GET /management returns the DMR root **without** an `"outcome"` wrapper
 (that only wraps POST results) — the checker must match the bare-GET shape.
 
+**Reconciliation fix (found on a sibling branch, ported here):** two real bugs
+survived the acceptance above because it never isolated the paths that
+trigger them. (1) `doAssess` fingerprinted via `client.Fingerprint()`, whose
+shared cache always nils out `Body` — so the welcome-page signal was dead
+code the whole time; a target whose app port serves the welcome page but
+whose `/management` doesn't answer at all still needs that body to identify
+the product. Fixed to a plain `Get("/")`. (2) `probeManagement` returned on
+the first candidate port that answered AT ALL, even the app port's own
+irrelevant 404 — so scanning the app port alone (the realistic single-IP
+case: app on 8080, management on a separate 9990) never even tried 9990.
+Fixed to keep trying every candidate until one gives the definitive signal.
+Both are covered by dedicated regression tests
+(`TestProbeManagementTriesEveryCandidate`,
+`welcome_page_alone_is_read_by_a_real_client`) precisely because the
+four-state acceptance above didn't exercise either path.
+
 ## Jenkins two lines (four-state, real-validated)
 
 `scripts/lab/jenkins.sh` → two real containers. Probe from **inside** each
@@ -80,6 +96,12 @@ Arbitrary file read was NOT attempted". A confirmation that actually exercises t
 `@file` read exists only as a controlled lab test (a benign marker file), never on
 the default single-IP path. Version boundary (`go test ./checks/jenkins/ -run
 TestVersionBoundary`) pins weekly 2.441/2.442 and LTS 2.426.2/2.426.3.
+
+**Reconciliation fix:** `classifyScript` handled a bare `403`/`401` as the
+secure default but not the other browser-facing form, a redirect to
+`/login` — that response fell through to `scriptUnclear` (`detected` via a
+different, weaker reason) instead of `scriptProtected`. Fixed; see
+`script_protected_login_redirect` in `checker_test.go`.
 
 ## Standing gates (must stay green on every change)
 
