@@ -161,24 +161,51 @@ exploitability judgment).
 research source (runtime differences). It is a deterministic PRODUCER (not a
 prober): it consumes a `DifferentialCase` — the responses to the SAME semantic
 request under different encoding/normalization/boundary/protocol variants,
-collected elsewhere — compares them canonically, filters run-noise, and classifies
-disagreements into `status_differential`, `header_differential`,
-`body_shape_differential`, `accept_reject_differential`, `normalization_differential`,
-`boundary_differential`. Boundaries:
-- **Noise filtered.** Volatile headers (Date/Set-Cookie/X-Request-Id/ETag/
-  Content-Length/…) are dropped; header comparison is on the stable key set; body
-  is compared as a *shape* (normalized content-type + length bucket), so timestamp/
-  cookie/nonce churn and small size jitter never manufacture an anomaly.
-- **Semantics drive the type.** Encoding/protocol variants are expected equivalent
-  → a difference is reported per dimension; a normalization variant that differs
-  at all → `normalization_differential`; a boundary variant whose accept/reject or
-  status flips → `boundary_differential`.
-- **Consistent provenance.** `Provenance.RawInputHash` = the canonical serialized
-  case hash (over the stable, noise-filtered view) — the producer's raw input
-  artifact, order- and volatile-independent — same meaning as the diff/fuzz
-  producers. Structured `Refs` carry intent/anomaly_type/variants/case_hash.
-- **Narrow v1.** Only the six differences above; no attack-input generation, no
-  live probing in the producer.
+collected elsewhere — compares them against the case's OWN DECLARED CONTRACT,
+filters run-noise, and classifies disagreements into `status_differential`,
+`header_differential`, `body_shape_differential`, `accept_reject_differential`,
+`normalization_differential`, `boundary_differential`. Core principle: **a mere
+difference is never itself an anomaly — only a difference that violates what the
+case declared should hold is.**
+- **Judged only against a declared `Expectation`.** `ExpectEquivalent` (encoding/
+  protocol variants should match baseline; a difference is reported per
+  dimension), `ExpectNormalizeEqual` (normalization variants should match
+  baseline; any difference is one `normalization_differential`), or
+  `ExpectBoundaryMonotonic` (each boundary variant carries its own `Expected`
+  accept/reject outcome; only a variant whose *observed* outcome contradicts its
+  *own declared* `Expected` is an anomaly — correct fail-closed behavior at a
+  boundary, e.g. "1024B accepted, 1025B rejected" under a 1024-byte limit, is
+  never flagged, since it matches what was declared). A case with **no declared
+  `Expectation` produces zero candidates** — it is recorded, never judged
+  (zero-FP-first).
+- **Body compared structurally, not just by length bucket.** `BodyShape` adds a
+  JSON `StructuralHash` (key names + value *kinds*, never concrete values, sorted,
+  recursive) alongside media-type + length-bucket, so `{"admin":false}` vs
+  `{"admin":true}` share a shape (a value changed) while a login-failure JSON and
+  a profile-success JSON in the same length bucket do not (the keys differ).
+- **Security-relevant header VALUES compared, not just key presence.** A small
+  fixed whitelist (`WWW-Authenticate`, `Location` — scheme/host/path only, query
+  ignored —, `Allow`, `Content-Type`, the CORS `Access-Control-Allow-*` pair) is
+  value-compared, so `Basic`→`Bearer` or `/login`→`/admin` is caught even with an
+  identical header key-set. Every other header stays key-set-only or fully
+  excluded (volatile: Date/Set-Cookie/X-Request-Id/ETag/Content-Length/…) — this
+  is not a "diff all header values" escape hatch.
+- **Two hashes, never mixed (same discipline as S8).**
+  `caseArtifactHash` is the **lossless** canonical serialization — every variant
+  in its given order, every header including volatile ones, exact values; map
+  keys are sorted only because Go maps have no defined order (sorting drops no
+  information). This is what `Provenance.RawInputHash` points at, keeping
+  `RawInputHash`'s frozen, cross-producer meaning ("hash of the raw input the
+  producer ingested, before any denoising") consistent with the diff and fuzz
+  producers. `comparisonHash` is the **denoised**, order-independent identity
+  (volatile headers excluded, body-as-shape, variants sorted) used to recognize
+  "the same differential finding" — it lives only in `Refs.comparison_hash`,
+  never in `Provenance`. Changing a volatile header (e.g. `Date`) changes
+  `caseArtifactHash` but never `comparisonHash`.
+- **Narrow v1.** Only the six anomaly types above; no attack-input generation, no
+  live probing in the producer (collection is deliberately deferred to a future,
+  registered-template collector — never an LLM choosing arbitrary URLs/requests
+  for the collector to send, mirroring the S5 Validator principle).
 
 Differential candidates flow into the same spine and stay `hypothesis` until a
 validator reproduces the difference safely.
@@ -215,9 +242,11 @@ the guarantees hold under test:
   GroupArtifactHash` (raw producer artifact, not the derived identity),
   `MembersDigest` full-set commitment, structured refs, conservative classifier).
   No AI fuzz-input generation, no auto-exploitability. Contract frozen.
-- **S9 (differential engine): v1 landed** (deterministic `DifferentialProducer`;
-  status/header/body-shape/accept-reject/normalization/boundary anomalies, noise
-  filtered, canonical case-hash provenance). Next: S9 audit, then freeze.
+- **S9 (differential engine): v1 landed & audited** (deterministic
+  `DifferentialProducer`; judged only against a declared `Expectation`, JSON
+  structural body comparison, security-header value comparison,
+  `RawInputHash = caseArtifactHash` (lossless) distinct from `comparisonHash`
+  (denoised)). Contract frozen.
 - **Deferred:** `S10` state-machine explorer (after S9), then `S7` large-scale
   source audit — the local-model signal-to-noise on a whole repo is lower than the
   diff/fuzz/differential sources already built.
