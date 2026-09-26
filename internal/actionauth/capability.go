@@ -71,8 +71,8 @@ type RegisteredAction struct {
 type BoundAction struct {
 	id ActionID
 	// scopeHash and authorizedStateHash are the ExplorationScope.Hash() and
-	// StateFingerprint.StateFingerprintHash() the future ActionPolicy observed
-	// at the moment of binding.
+	// stateauth.Fingerprint.StateFingerprintHash() the future ActionPolicy
+	// observed at the moment of binding.
 	scopeHash           string
 	authorizedStateHash string
 }

@@ -267,18 +267,19 @@ the guarantees hold under test:
   `RawInputHash = caseArtifactHash` (lossless) distinct from `comparisonHash`
   (denoised); malformed-case guards.
 - **S10 (state-machine explorer): DESIGN CONTRACT ONLY, still under audit**
-  (`research/state_machine.go` + `internal/actionauth/capability.go`) — no
-  explorer, no registry, no `ActionPolicy`, no execution logic, no `Origin` kind
-  yet. Twelve boundaries are locked into the TYPE SHAPES themselves — and, for
-  the most important ones, into a PACKAGE boundary and constructor-only
-  hashing — not left to comments alone, because a boundary a later change can
-  route around by adding one field, or one file to the same package, or one
-  caller-supplied hash, is not a boundary:
+  (`research/state_machine.go` + `internal/actionauth/capability.go` +
+  `internal/stateauth/`) — no explorer, no registry, no `ActionPolicy`, no
+  concrete `StateProjector`, no execution logic, no `Origin` kind yet. Twelve
+  boundaries are locked into the TYPE SHAPES themselves — and, for the two
+  authority-bearing ones, into an actual PACKAGE boundary and constructor-only
+  hashing, at PARITY with each other — not left to comments alone, because a
+  boundary a later change can route around by adding one field, or one file to
+  the same package, or one caller-supplied hash, is not a boundary:
   1. **No executable content anywhere.** `ActionID{RegistryKey, VariantID}` and
      `RecoveryPlanRef{RegistryKey}` are opaque lookups — there is no Method, URL,
-     Headers, Body, or Command field in either file. `RegisteredAction.Reversible`
-     is registry metadata, declared once by the registering code. The v1
-     registry (once implemented) is also IMMUTABLE for the lifetime of a
+     Headers, Body, or Command field in any of the three files. `RegisteredAction.
+     Reversible` is registry metadata, declared once by the registering code. The
+     v1 registry (once implemented) is also IMMUTABLE for the lifetime of a
      process — no hot reload — a deliberate scope decision: `BoundAction`
      briefly carried a `registryRevision` field for a hot-reload future, but
      `ValidFor` (boundary 4) never checked it, and an unchecked field is worse
@@ -291,15 +292,24 @@ the guarantees hold under test:
      judgment to execution. `research.ActionSuggestion{ActionID, Rationale}` is
      the ADVISORY shape AI output may take — freely constructible, authorizes
      nothing. Only a `BoundAction` may ever be executed.
-  3. **The capability boundary is a PACKAGE boundary, not merely an unexported
-     field in one package.** `BoundAction`/`BoundRecovery` live in their own
-     package, `internal/actionauth` — separate from `research` — specifically so
-     Go's compiler stops any file `research` will ever contain (a future
-     Explorer, AI-glue code, a candidate producer) from constructing one with a
-     real identity. An unexported field inside `research` alone would not have
-     survived `research` itself growing an Explorer in a sibling file, since Go
-     visibility is package-scoped, not file-scoped. The future `ActionPolicy`,
-     implemented IN `actionauth`, is the sole place a constructor is ever added.
+  3. **BOTH authority boundaries this contract needs are PACKAGE boundaries, at
+     the SAME level — not merely an unexported field in one package.** Who may
+     authorize an ACTION (`actionauth.BoundAction`/`BoundRecovery`) and who may
+     declare an authoritative STATE (`stateauth.Fingerprint`) each live in their
+     own package — `internal/actionauth` and `internal/stateauth` respectively —
+     separate from `research`, specifically so Go's compiler, not convention,
+     stops any file `research` will ever contain (a future Explorer, AI-glue
+     code, a candidate producer) from constructing either one with a real
+     identity. An unexported field (or an unexported constructor) inside
+     `research` alone would not have survived `research` itself growing an
+     Explorer in a sibling file, since Go visibility is package-scoped, not
+     file-scoped — a separate package does. The future `ActionPolicy` (in
+     `actionauth`) and the future concrete `StateProjector` (in `stateauth`) are
+     the sole places their respective constructors are ever added, and — for the
+     identical reason — BOTH must be implemented inside their own authority
+     package rather than in `research`, even though their logic needs
+     scope/state/target-specific knowledge that might otherwise seem to belong
+     "closer to" `research`.
   4. **A `BoundAction`/`BoundRecovery` is bound to the SCOPE AND STATE it was
      authorized for, not just to an action identity** — closing a
      stale-capability / cross-state-replay gap: without this, a capability
@@ -313,70 +323,71 @@ the guarantees hold under test:
      for the *current* scope/state. On today's zero-value capability, `ValidFor`
      always returns false.
   5. **Raw evidence vs identity, never conflated** (the S8/S9 discipline again):
-     `StateFingerprint` splits `RawStateArtifactHash` from `StateFingerprintHash`
-     — and carries its own `ScopeHash`, so a fingerprint is self-describing
-     wherever it travels (disk, replay, a different worker).
-  6. **`StateFingerprint` is immutable AND internally consistent — two DIFFERENT
+     `stateauth.Fingerprint` splits `RawStateArtifactHash` from
+     `StateFingerprintHash` — and carries its own `ScopeHash`, so a fingerprint
+     is self-describing wherever it travels (disk, replay, a different worker).
+  6. **`Fingerprint` is immutable AND internally consistent — two DIFFERENT
      guarantees.** Immutable only means nothing can edit it after construction;
      internally consistent means it could never be *born* wrong. All fields are
-     unexported (immutability, mirroring `Candidate`/`Evidence`'s `Provenance`
-     privacy elsewhere in this package) — but an earlier round's
-     `NewStateFingerprint(scopeHash, rawHash, fingerprintHash, facts)` still let
-     a caller hand it a `StateFingerprintHash` that didn't actually correspond to
-     the `facts` given, i.e. "born inconsistent" despite being immutable
-     afterward. Fixed: the constructor (`scopeHash string, rawArtifact []byte,
-     facts map[string]string)`) now computes BOTH `RawStateArtifactHash` (from the
-     actual raw bytes) and `StateFingerprintHash` (via `canonicalFactsHash` —
-     sorted keys, deterministic) itself; there is no parameter through which a
-     caller could supply either hash directly. The same "artifact bytes → a
-     deterministic canonicalizing function → a hash" discipline as S6/S8/S9,
-     never "caller asserts this is the hash". `StateTransition.ScopeConsistent()`
-     recomputes (never stores) whether a transition's own `ScopeHash` agrees with
-     both fingerprints it references.
-  7. **Internally consistent is STILL not AUTHORITATIVE.** A `StateFingerprint`
-     could be self-consistent (boundary 6) and still describe FABRICATED facts,
-     if whatever called the constructor were free to invent the facts map — and
-     a fabricated fingerprint feeding a future `ActionPolicy`'s
+     unexported — and `stateauth`'s `newFingerprint` computes BOTH
+     `RawStateArtifactHash` (from the actual raw bytes) and `StateFingerprintHash`
+     (via `canonicalFactsHash` — sorted keys, deterministic) itself; there is no
+     parameter through which a caller could supply either hash directly. The
+     same "artifact bytes → a deterministic canonicalizing function → a hash"
+     discipline as S6/S8/S9, never "caller asserts this is the hash".
+     `StateTransition.ScopeConsistent()` recomputes (never stores) whether a
+     transition's own `ScopeHash` agrees with both fingerprints it references.
+  7. **Internally consistent is STILL not AUTHORITATIVE — and this is now closed
+     COMPLETELY, not merely by review discipline.** A `Fingerprint` could be
+     self-consistent (boundary 6) and still describe FABRICATED facts, if
+     whatever called the constructor were free to invent the facts map — and a
+     fabricated fingerprint feeding a future `ActionPolicy`'s
      `AllowedActions(scope, state)` decision would let whoever fabricated it
      indirectly control action authorization, the same class of bypass as
      boundaries 2 and 4, moved one step further upstream (to defining the STATE
-     itself, not just the action or the judgment). Closed by `StateProjector`:
-     `type ProjectorID string`; `type StateArtifact struct { ScopeHash string;
-     Raw []byte }` (raw material, before any canonicalization — never itself a
-     fingerprint); `type StateProjector interface { ID() ProjectorID; Project(a
-     StateArtifact) (StateFingerprint, error) }`. The direct constructor
-     (formerly exported `NewStateFingerprint`) is now unexported
-     (`newStateFingerprint`) and called from nowhere yet, and no `StateProjector`
-     implementation exists yet either — so no code anywhere can currently obtain
-     a `StateFingerprint` claiming to describe real collected state. Honest
-     caveat: unexported only fully stops OTHER packages; a future file added to
-     `research` itself could still call `newStateFingerprint` directly instead of
-     going through a registered `StateProjector` — the same residual caveat
-     boundary 3 closed for `BoundAction` via a package split, which
-     `StateProjector` does not get, because unlike a pure authorization
-     credential a projector inherently needs target/protocol-specific collection
-     logic that legitimately belongs in `research`. This is a review-enforced
-     discipline, not a compiler-enforced one — the S10 analogue of S9's
-     `ExpectationSource` whitelist-check authority, not of `BoundAction`'s
-     stronger package-boundary treatment.
-  8. **Recovery is registry-backed (boundary 3/4) and `RecoveryOutcome` is FACTS
-     ONLY** — no `Verified`/conclusion field. It holds the FULL `Baseline`/
-     `Result` `StateFingerprint`, and `Recovered(o)` checks BOTH that baseline
-     and result actually belong to the outcome's own declared `ScopeHash` AND
-     that their `StateFingerprintHash` values match — proving "same scope AND
-     same state", not merely "two strings happened to be equal" (which two
-     fingerprints from genuinely different scopes could satisfy by coincidence,
-     especially after crossing a disk/replay/worker boundary — a bare string
-     comparison alone would wrongly call that recovered). `Recovered==false`
+     itself, not just the action or the judgment). An earlier round closed this
+     with a `StateProjector` interface living IN `research` itself, alongside an
+     unexported `newStateFingerprint`, and had to document an honest residual
+     caveat: unexported only fully stops OTHER packages, so a future file added
+     to `research` itself could still call it directly. That caveat is now
+     eliminated, not merely narrowed: `Fingerprint`, `StateArtifact`,
+     `ProjectorID`, `StateProjector`, and the constructor all moved into
+     `internal/stateauth` (boundary 3). Nothing in `research` — today or in any
+     file it will ever contain — can call `stateauth`'s unexported constructor or
+     write a `Fingerprint` struct literal, because neither identifier is visible
+     outside `internal/stateauth`. A `StateProjector` implementation, once
+     written, must itself live inside `stateauth` for the same reason a future
+     `ActionPolicy` must live inside `actionauth`: its `Project` method has to
+     call the unexported constructor, so an implementation written anywhere else
+     could satisfy the interface's shape but could only ever return the
+     zero-value `Fingerprint` from its own `Project` method. This is now the SAME
+     compiler-enforced guarantee as boundary 3's `BoundAction` treatment, not the
+     weaker whitelist-check style of S9's `ExpectationSource` — the two authority
+     boundaries are at parity.
+  8. **Recovery is registry-backed (boundary 3/4) and `stateauth.RecoveryOutcome`
+     is FACTS ONLY** — no `Verified`/conclusion field. It holds the FULL
+     `Baseline`/`Result` `Fingerprint`, and `stateauth.Recovered(o)` checks BOTH
+     that baseline and result actually belong to the outcome's own declared
+     `ScopeHash` AND that their `StateFingerprintHash` values match — proving
+     "same scope AND same state", not merely "two strings happened to be equal"
+     (which two fingerprints from genuinely different scopes could satisfy by
+     coincidence, especially after crossing a disk/replay/worker boundary — a
+     bare string comparison alone would wrongly call that recovered).
+     `RecoveryOutcome`/`Recovered` live in `internal/stateauth`, not in
+     `research`, because recovery verification is fundamentally a state-authority
+     question — it never touches an `actionauth.BoundAction`. `Recovered==false`
      means exploration STOPS, never continues on the assumption a rollback
      worked.
   9. **`StateTransition` carries facts only** — no `Unexpected`/`Vulnerable`/
      `Severity`/`State` field. `Action` is a `BoundAction` (boundary 2–4) — a
      transition can only ever reference something that WAS actually authorized
-     and executed. Whether a transition is worth a hypothesis is a future
-     producer's judgment against an authoritative `ExpectationSource`
-     (boundary 11). `TransitionArtifactHash` is the lossless record hash (the S9
-     `caseArtifactHash` analogue) — never the denoised `StateFingerprintHash`.
+     and executed. `StateTransition` is the one type that legitimately spans both
+     authority packages (`stateauth.Fingerprint` + `actionauth.BoundAction`) — a
+     pure coordination record, not itself an authority. Whether a transition is
+     worth a hypothesis is a future producer's judgment against an authoritative
+     `ExpectationSource` (boundary 11). `TransitionArtifactHash` is the lossless
+     record hash (the S9 `caseArtifactHash` analogue) — never the denoised
+     `StateFingerprintHash`.
   10. **No "0 = unlimited" in `ExplorationBudget`.** Every one of
      `MaxStates/MaxTransitions/MaxDepth/MaxRequests/MaxVisitsPerState/
      MaxBranching/MaxWallTime` must be strictly positive or `Valid()` reports the
@@ -389,6 +400,14 @@ the guarantees hold under test:
      `ExplorationScope`, at most one in-flight action at a time, so "which
      action produced this `AfterFingerprint`" is never ambiguous. Recorded here
      for the eventual Explorer to honor.
+  - **Test-suite proof of the boundary, not just documentation of it:**
+     `research`'s own test file can no longer construct a non-zero
+     `stateauth.Fingerprint` at all (`TestFingerprintIsOpaqueFromResearch`) —
+     the same way it has never been able to construct a non-zero
+     `actionauth.BoundAction`. The richer hash-derivation/immutability/
+     determinism tests, and `Recovered`'s own test matrix, now live inside
+     `internal/stateauth`'s own test file, the only place `newFingerprint` can
+     be called.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
 
