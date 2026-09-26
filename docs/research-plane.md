@@ -758,6 +758,54 @@ the guarantees hold under test:
     state = vulnerability", automatic exploitability judgment, or unlimited
     depth/budget. None of these have any code path in `research/explorer.go`
     today.
+- **S10-E5 (`research/http_collector.go`, `research/http_executor.go`,
+  `internal/stateauth/http_projector.go`): the first REAL, non-mock target.**
+  Everything through S10-E4 was proven against fakes; this is the same
+  authority/scope/budget/recovery machinery run against a real local
+  `httptest.Server` over real HTTP I/O for the first time.
+  - **`HTTPStateProjector`** (`stateauth.HTTPFixtureRegistry()`) projects
+    Facts `{status, content_type, body_sha256}` from a marshaled
+    `HTTPArtifact{Status, ContentType, Body}` — meaningfully stronger than
+    `RawLenProjector` (a body hash tells apart two same-length bodies with
+    different content, e.g. `{"authenticated":false}` vs
+    `{"authenticated":true}`, which length alone cannot) while still being
+    named and documented as fixture-grade, not a claim to model a real
+    protocol's full state (cookies, TLS, headers beyond content-type are all
+    future work).
+  - **`HTTPCollector`** always GETs ONE FIXED base URL + path, given at
+    construction in Go code — never a parameter at call time. **`HTTPExecutor`**
+    runs ONLY the FIXED `RegistryKey -> path` map it was constructed with (the
+    fixture registers exactly two: `get-root` → `/`, `get-health` → `/health`)
+    — `Execute` looks up `action.ID().RegistryKey` in that map and refuses
+    anything else, proven by `TestHTTPExecutorRefusesUnregisteredAction`. No
+    URL, method, header, or body ever comes from an AI proposal, a candidate,
+    or even this Executor's own caller at call time — everything is fixed
+    Go-code configuration. `ExecuteRecovery` is a documented no-op: every
+    action this fixture can run is a read-only GET, so nothing ever mutates
+    target state and there is nothing to reverse — a future Executor whose
+    actions DO mutate state must not copy this.
+  - **Both `HTTPCollector` and `HTTPExecutor` build their own internal
+    `*http.Client`** (`newBudgetedHTTPClient`, `http_collector.go`) — callers
+    cannot substitute one, so neither can accidentally end up missing the two
+    things this profile requires: `BudgetedRoundTripper` as `Transport` (real
+    request metering, S10-E4h) and a `CheckRedirect` that REFUSES every
+    redirect via `http.ErrUseLastResponse` — a 3xx response is observed AS
+    ITSELF (its own status code becomes a Fact), never followed. This closes
+    the audit's explicit redirect concern: a fixed `GET /state` target that
+    started returning `302 → http://some-other-host/...` could otherwise have
+    walked a probe straight out of its own `ExplorationScope`.
+    `TestHTTPCollectorNeverFollowsRedirects` drives a fixture endpoint that
+    redirects to `http://example.invalid/...` and checks the observed
+    Fingerprint's `status` Fact is `302`, never anything from a followed
+    request.
+  - **`TestS10E5RealHTTPExplorationEndToEnd`** wires all of the above into a
+    real `Explorer` against a real `httptest.Server` and runs
+    `Baseline` → `Step` (twice, exercising both real registered actions) →
+    (`ErrNoApplicableAction` once both are tried from the unchanging state) →
+    `Recover`, asserting real, scope-consistent transitions and a
+    real-network-verified recovery — the first time this session's audit has
+    verified these boundaries hold under actual network I/O rather than only
+    against fakes built to cooperate.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
 

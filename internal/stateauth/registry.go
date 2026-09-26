@@ -92,3 +92,16 @@ func (b *BoundRegistry) Project(a StateArtifact) (Fingerprint, error) {
 func FixtureRegistry() *BoundRegistry {
 	return &BoundRegistry{registry: newRegistry(RawLenProjector{}), id: RawLenProjector{}.ID()}
 }
+
+// HTTPFixtureRegistry returns a BoundRegistry using HTTPStateProjector — the
+// S10-E5 profile for a real (if still minimal, read-only) HTTP target. It is
+// named "Fixture" for the same honesty FixtureRegistry's name carries: this
+// is the first real-network profile, but its projector's Facts (status,
+// content-type, a body hash) are still a fixture-grade state model, not a
+// claim to model every real protocol's full state (cookies, redirects
+// followed, TLS details, etc. are all future work). A future richer HTTP
+// profile gets its own equally explicit constructor here, built the same
+// way.
+func HTTPFixtureRegistry() *BoundRegistry {
+	return &BoundRegistry{registry: newRegistry(HTTPStateProjector{}), id: HTTPStateProjector{}.ID()}
+}
