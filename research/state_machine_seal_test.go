@@ -6,6 +6,7 @@ import (
 
 	"gopoc/internal/actionauth"
 	"gopoc/internal/model"
+	"gopoc/internal/stateauth"
 )
 
 // This file is S10-E8, the Integration Seal: proof that a real,
@@ -156,5 +157,109 @@ func TestS10E8ValidatorSupportsOnlyStateMachineOrigin(t *testing.T) {
 	}
 	if v.Supports(nil) {
 		t.Fatal("Supports must be false for a nil Candidate")
+	}
+}
+
+// --- "same-target physical binding": NewHTTPStateMachineReplayValidator ---
+
+// TestNewHTTPStateMachineReplayValidatorRejectsOriginMismatch is the direct
+// proof for the first S10/E8 hardening item: a ReplayTarget whose OriginID
+// does NOT match the real network origin an HTTPProfile's Collector/
+// Executor were actually built from must be refused at CONSTRUCTION time —
+// before any Replay attempt, and therefore before any I/O.
+func TestNewHTTPStateMachineReplayValidatorRejectsOriginMismatch(t *testing.T) {
+	f := newE7Fixture(t)
+	profile, err := NewHTTPProfile(ExplorationScope{}, f.ts.URL, "/state", map[string]string{"deny": "/deny"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := e6MustRegistry(t) // empty but valid; construction fails on OriginID before this even matters
+	policy := actionauth.NewActionPolicy(mustActionRegistry(t), actionauth.NewRecoveryRegistry())
+
+	target := e7ReplayTarget()
+	target.OriginID = "http://this-is-not-the-real-fixture-origin.invalid"
+	if _, err := NewHTTPStateMachineReplayValidator(target, registry, policy, profile, stateauth.HTTPFixtureRegistry(), e7DefaultBudget()); err == nil {
+		t.Fatal("construction must fail when target.OriginID does not match the profile's own OriginID")
+	}
+
+	emptyOrigin := e7ReplayTarget() // OriginID left at its zero value
+	if _, err := NewHTTPStateMachineReplayValidator(emptyOrigin, registry, policy, profile, stateauth.HTTPFixtureRegistry(), e7DefaultBudget()); err == nil {
+		t.Fatal("construction must fail when target.OriginID is empty")
+	}
+
+	if _, err := NewHTTPStateMachineReplayValidator(e7ReplayTarget(), registry, policy, nil, stateauth.HTTPFixtureRegistry(), e7DefaultBudget()); err == nil {
+		t.Fatal("construction must fail when profile is nil")
+	}
+}
+
+// TestNewHTTPStateMachineReplayValidatorAcceptsMatchingOriginAndReplays
+// proves the positive case end-to-end: a ReplayTarget whose OriginID
+// correctly names the SAME real origin an HTTPProfile was built from
+// constructs successfully, and a real replay through it still reaches
+// OutcomeReproduced — this construction path changes nothing about
+// Replay's own behavior, only what is checked before it ever runs.
+func TestNewHTTPStateMachineReplayValidatorAcceptsMatchingOriginAndReplays(t *testing.T) {
+	f := newE7Fixture(t)
+	c, registry, policy, _ := e7BuildOriginalCandidate(t, f, "original-session")
+	f.reset()
+
+	profile, err := NewHTTPProfile(ExplorationScope{}, f.ts.URL, "/state", map[string]string{"deny": "/deny"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := e7ReplayTarget()
+	target.OriginID = profile.OriginID()
+
+	v, err := NewHTTPStateMachineReplayValidator(target, registry, policy, profile, stateauth.HTTPFixtureRegistry(), e7DefaultBudget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := v.Replay(context.Background(), c, "replay-session-via-http-profile")
+	if err != nil {
+		t.Fatalf("Replay through NewHTTPStateMachineReplayValidator returned an error: %v", err)
+	}
+	if res.Outcome != OutcomeReproduced {
+		t.Fatalf("Outcome = %q, want %q", res.Outcome, OutcomeReproduced)
+	}
+}
+
+// --- "fresh-session inequality proof": OriginalScopeHash -------------------
+
+// TestReplayRejectsSessionIDEqualToTheOriginalOne is the direct, structural
+// proof for the second S10/E8 hardening item: replaying under the EXACT
+// SAME sessionID the original candidate's own transition used must be
+// refused BEFORE any I/O, because the freshly built scope hashes IDENTICAL
+// to binding.OriginalScopeHash() — proving "fresh session" is checked, not
+// merely produced by a generator that happens to avoid collisions.
+func TestReplayRejectsSessionIDEqualToTheOriginalOne(t *testing.T) {
+	const originalSessionID = "original-session"
+	f := newE7Fixture(t)
+	c, registry, policy, _ := e7BuildOriginalCandidate(t, f, originalSessionID)
+	f.reset()
+
+	v := e7NewValidator(t, f, registry, policy, e7ReplayTarget(), e7DefaultBudget())
+	if _, err := v.Replay(context.Background(), c, originalSessionID); err != ErrReplaySessionNotFresh {
+		t.Fatalf("Replay reusing the ORIGINAL sessionID: err = %v, want %v", err, ErrReplaySessionNotFresh)
+	}
+	if got := f.denyHitCount(); got != 1 {
+		t.Fatalf("denyHitCount after a non-fresh-session rejection = %d, want 1 (only the original run) — this check must happen before any I/O", got)
+	}
+}
+
+// TestStateMachineBindingCarriesOriginalScopeHash proves E6's Produce
+// actually records the field the freshness check above depends on.
+func TestStateMachineBindingCarriesOriginalScopeHash(t *testing.T) {
+	f := newE7Fixture(t)
+	c, _, _, _ := e7BuildOriginalCandidate(t, f, "original-session")
+	binding, ok := c.StateMachineBinding()
+	if !ok {
+		t.Fatal("candidate must carry a StateMachineBinding")
+	}
+	if binding.OriginalScopeHash() == "" {
+		t.Fatal("StateMachineBinding.OriginalScopeHash() must be non-empty for a real E6-produced candidate")
+	}
+	wantScope := e7ReplayTarget().Scope("original-session")
+	if binding.OriginalScopeHash() != wantScope.Hash() {
+		t.Fatalf("OriginalScopeHash() = %q, want %q (the original transition's own scope hash)", binding.OriginalScopeHash(), wantScope.Hash())
 	}
 }

@@ -1460,9 +1460,70 @@ the guarantees hold under test:
   half (a satisfied replay, and an authority rejection, both leave the
   Candidate at exactly `Hypothesis`); `TestS10E8ValidatorSupportsOnlyStateMachineOrigin`
   proves `Supports`'s own Origin check. All four pass, on the real E6→E7
-  pipeline, no mocks. **`S10-E8 = SEALED`**: `hypothesis → independent replay
-  → reproducible` is now a real, tested, end-to-end path through production
-  code, not merely a documented intent.
+  pipeline, no mocks.
+  - **First hardening item, found on a real code-level audit of `5afa14f`
+    (functionally correct, but not yet sealed): `NewStateMachineReplayValidator`
+    accepts `target`, `collector`, and `executor` as three INDEPENDENTLY
+    supplied values — nothing stopped a caller from constructing a
+    `ReplayTarget` that CLAIMS one real network location while the
+    `HTTPCollector`/`HTTPExecutor` passed alongside it actually point at a
+    completely DIFFERENT one. None of Replay's own checks
+    (`ReplayTargetHash`, `PolicyID`, `SpecID`) could ever catch this, since
+    none of them are computed from a real network address — a replay could
+    run against the wrong origin entirely while every piece of Evidence
+    still cited the target the caller SAID it was testing.** Fixed:
+    `HTTPProfile` gained `OriginID() string` — a pure function of its own
+    `baseURL` (canonical `scheme://host`, computed once at construction,
+    never a caller assertion) — and `ReplayTarget` gained a matching
+    `OriginID` field, DELIBERATELY EXCLUDED from `Hash()` (folding it in
+    would make every E6-produced candidate's own recorded
+    `replay_target_hash` — computed from an `ExplorationScope` that has no
+    network-address field at all — permanently fail to match any properly
+    HTTP-constructed validator, breaking replay entirely; see
+    `ReplayTarget.OriginID`'s own doc). `NewHTTPStateMachineReplayValidator`
+    is the new, HTTP-specific constructor: it requires `target.OriginID ==
+    profile.OriginID()` and refuses to build anything otherwise — a
+    construction-time self-consistency check between a caller's target and
+    their profile, never a check against the original candidate's own
+    binding. `TestNewHTTPStateMachineReplayValidatorRejectsOriginMismatch`
+    and `TestNewHTTPStateMachineReplayValidatorAcceptsMatchingOriginAndReplays`
+    prove the rejection and the still-working positive path;
+    `TestHTTPProfileOriginIDIsPureFunctionOfBaseURL` proves the primitive
+    itself (stable across scope/observationPath/actions, distinct across
+    two real fixture servers). `OriginID` is also recorded on the replay
+    summary Evidence (`replay_target_origin_id`) for auditability.
+  - **Second hardening item, same audit: `freshReplaySessionID`'s
+    uniqueness (a process-wide atomic counter) proves sessions minted by
+    `Validate` never collide WITH EACH OTHER, but nothing structurally
+    proved a fresh replay session actually DIFFERED from the ORIGINAL
+    candidate's own session — `StateMachineBinding` recorded no trace of
+    the original scope at all, so Replay had nothing to compare against;
+    "fresh" rested on convention (a test or caller never happening to reuse
+    the original sessionID), not a checked fact.** Fixed:
+    `StateMachineBinding` gained `originalScopeHash` (recorded from
+    `rc.Transition.ScopeHash` at `Produce` time, also added to
+    `Refs["original_scope_hash"]` for human audit) and a matching
+    `OriginalScopeHash()` getter. `Replay` now checks, immediately after
+    building the fresh scope and BEFORE any I/O, that
+    `scope.Hash() != binding.OriginalScopeHash()` — `ErrReplaySessionNotFresh`
+    otherwise. This makes "independent session" a structural proof (the new
+    scope really does hash differently) rather than an assumption resting on
+    a generator's own uniqueness guarantee.
+    `TestReplayRejectsSessionIDEqualToTheOriginalOne` proves the rejection
+    (replaying under the literal original sessionID is refused before any
+    request, with the fixture's own hit-counter staying at exactly 1);
+    `TestStateMachineBindingCarriesOriginalScopeHash` proves E6's `Produce`
+    actually records the field this check depends on. Every existing E7/E8
+    test continues to pass unmodified — `freshReplaySessionID` and every
+    test's own hand-chosen sessionID already produced a genuinely different
+    scope hash from the original; this check only makes that fact provable
+    rather than assumed.
+
+  **`S10-E8 = SEALED`**: `hypothesis → independent replay → reproducible` is
+  now a real, tested, end-to-end path through production code, with the
+  Engine's authority untouched, the replay validator's own target/network
+  binding structurally self-consistent, and session freshness a checked
+  fact rather than a documented intent.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
   Any future state-preparation capability remains deferred — it needs its

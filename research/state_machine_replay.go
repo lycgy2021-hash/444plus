@@ -181,6 +181,57 @@ func NewStateMachineReplayValidator(
 	return &StateMachineReplayValidator{target: target, rules: rules, policy: policy, collector: collector, projector: projector, executor: executor, budget: budget}, nil
 }
 
+// NewHTTPStateMachineReplayValidator builds a StateMachineReplayValidator
+// exactly like NewStateMachineReplayValidator, EXCEPT it takes an
+// *HTTPProfile in place of separately-supplied collector/executor values,
+// and requires target.OriginID to equal profile.OriginID() before ever
+// constructing anything.
+//
+// THE GAP THIS CLOSES: NewStateMachineReplayValidator accepts target,
+// collector, and executor as three INDEPENDENTLY supplied values — nothing
+// there stops a caller from constructing a target that CLAIMS one real
+// network location (say, TargetID naming "server-A") while the
+// collector/executor it passes alongside actually point at a completely
+// different one (an HTTPCollector/HTTPExecutor built against
+// "http://server-B"). None of Replay's own checks would catch this:
+// ReplayTargetHash, PolicyID, and SpecID are all computed from data the
+// ORIGINAL candidate carries, never from a real network address, so a
+// caller-assembled mismatch between "what target claims" and "what
+// collector/executor actually talk to" would replay against the wrong
+// origin while every piece of Evidence still cites the target the caller
+// SAID it was testing.
+//
+// profile.OriginID() is a pure function of the profile's own baseURL —
+// never a caller assertion, and structurally guaranteed (by HTTPProfile
+// itself) to be the SAME origin its Collector and Executor were both built
+// from. Comparing it against target.OriginID (which the caller must
+// independently set to describe the SAME real target their TargetID/
+// BuildID/Protocol/HarnessID are meant to name) proves those two
+// independently-supplied things actually agree, rather than assuming it by
+// convention. A mismatch is refused at CONSTRUCTION time, before any
+// Replay attempt — it means "these inputs disagree with each other", never
+// "this candidate failed to reproduce".
+func NewHTTPStateMachineReplayValidator(
+	target ReplayTarget,
+	rules *TransitionRuleRegistry,
+	policy *actionauth.ActionPolicy,
+	profile *HTTPProfile,
+	projector *stateauth.BoundRegistry,
+	budget ReplayBudget,
+) (*StateMachineReplayValidator, error) {
+	if profile == nil {
+		return nil, errors.New("research: NewHTTPStateMachineReplayValidator requires a non-nil HTTPProfile")
+	}
+	if target.OriginID == "" {
+		return nil, errors.New("research: NewHTTPStateMachineReplayValidator requires a non-empty ReplayTarget.OriginID")
+	}
+	if target.OriginID != profile.OriginID() {
+		return nil, fmt.Errorf("research: ReplayTarget.OriginID %q does not match this HTTPProfile's own origin %q — the collector/executor would replay against a different real target than ReplayTarget claims",
+			target.OriginID, profile.OriginID())
+	}
+	return NewStateMachineReplayValidator(target, rules, policy, profile.Collector(), projector, profile.Executor(), budget)
+}
+
 // Name identifies this validator in ValidationResult.Validator and in
 // Candidate.History after a future Engine promotion.
 func (v *StateMachineReplayValidator) Name() string { return "state_machine_replay_v1" }
@@ -206,7 +257,13 @@ var replaySessionSeq int64
 // a timestamp for human readability. This is the ONLY thing Validate
 // (below) ever needs to invent — Replay's own contract already requires
 // nothing else about the session beyond "freshly chosen, never the
-// original".
+// original". Uniqueness here is a practical safeguard, not the actual
+// proof of freshness: Replay itself independently checks the resulting
+// scope's own hash against binding.OriginalScopeHash() before any I/O (see
+// the ErrReplaySessionNotFresh check inside Replay) — so even if this
+// function's own uniqueness guarantee were ever violated, a genuine
+// collision with the original session would still be caught structurally,
+// never merely assumed away.
 func freshReplaySessionID() string {
 	seq := atomic.AddInt64(&replaySessionSeq, 1)
 	return fmt.Sprintf("replay-%d-%d", time.Now().UTC().UnixNano(), seq)
@@ -259,6 +316,7 @@ var (
 	ErrReplayPolicyMismatch    = errors.New("research: this validator's ActionPolicy has a different PolicyID than the one the candidate's action was originally bound under")
 	ErrReplayActionNotReadOnly = errors.New("research: the freshly selected action's own registered Safety is not actionauth.ActionStrictReadOnly — v1 replays only strict read-only actions")
 	ErrReplaySessionIDRequired = errors.New("research: replay requires a non-empty, freshly chosen sessionID")
+	ErrReplaySessionNotFresh   = errors.New("research: this replay's own scope hash equals the ORIGINAL candidate's own scope hash — sessionID was not actually fresh")
 )
 
 // Replay independently re-tests c against a FRESH session (sessionID) under
@@ -324,6 +382,20 @@ func (v *StateMachineReplayValidator) Replay(ctx context.Context, c *Candidate, 
 	}
 
 	scope := v.target.Scope(sessionID)
+	// FRESH SESSION AS A STRUCTURAL PROOF, NOT AN ASSUMPTION: the caller-
+	// supplied sessionID (in production, freshReplaySessionID's own
+	// process-wide counter) is trusted to be "freshly chosen" only by
+	// convention up to this point. This is the one place Replay actually
+	// PROVES it: the new scope's own hash must differ from
+	// binding.OriginalScopeHash() (the ORIGINAL transition's own
+	// ExplorationScope hash, recorded at Produce time) — checked BEFORE
+	// any I/O, exactly like every other authority check above. Without
+	// this, "fresh session" would rest entirely on a caller (or a test)
+	// never accidentally reusing the original sessionID, which is a
+	// convention, not a guarantee.
+	if scope.Hash() == binding.OriginalScopeHash() {
+		return ValidationResult{}, ErrReplaySessionNotFresh
+	}
 	meter := newBoundedRequestMeter(v.budget.MaxRequests)
 	deadlineCtx, cancel := context.WithDeadline(ctx, time.Now().Add(v.budget.MaxWallTime))
 	defer cancel()
@@ -475,6 +547,7 @@ func replayFingerprintObservation(kind string, fp stateauth.Fingerprint) Observa
 func replaySummaryObservation(v *StateMachineReplayValidator, scope ExplorationScope, rule TransitionRule, action actionauth.BoundAction, anomalies []TransitionAnomaly, meter RequestMeter, replayArtifactHash string) Observation {
 	artifacts := []Artifact{
 		{Kind: "replay_target_hash", Ref: v.target.Hash()},
+		{Kind: "replay_target_origin_id", Ref: v.target.OriginID},
 		{Kind: "replay_scope_hash", Ref: scope.Hash()},
 		{Kind: "rule_id", Ref: rule.RuleID},
 		{Kind: "projector_id", Ref: string(rule.ProjectorID)},

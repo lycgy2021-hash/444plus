@@ -162,6 +162,17 @@ type StateMachineBinding struct {
 	// separately just means an auditor never has to re-derive "was the
 	// executable spec the same" from the opaque policyID hash alone.
 	specID string
+	// originalScopeHash is the ORIGINAL transition's own ExplorationScope
+	// hash (rc.Transition.ScopeHash at Produce time) — the ONE thing
+	// ReplayTargetHash (session-independent by design) cannot express:
+	// WHICH session, specifically, the original candidate came from.
+	// S10/E7's replay validator checks its OWN freshly-built scope hash
+	// against this BEFORE any I/O, so "a fresh session" is a structural
+	// proof (the new scope really does hash differently from the
+	// original one) rather than an assumption resting on
+	// freshReplaySessionID never coincidentally repeating a caller's own
+	// past sessionID.
+	originalScopeHash string
 }
 
 func (b StateMachineBinding) RuleID() string                     { return b.ruleID }
@@ -171,6 +182,7 @@ func (b StateMachineBinding) ReplayTargetHash() string           { return b.repl
 func (b StateMachineBinding) CaseArtifactHash() string           { return b.caseArtifactHash }
 func (b StateMachineBinding) PolicyID() string                   { return b.policyID }
 func (b StateMachineBinding) SpecID() string                     { return b.specID }
+func (b StateMachineBinding) OriginalScopeHash() string          { return b.originalScopeHash }
 
 // ReplayTarget identifies WHAT is being explored/replayed against: the same
 // target/build/protocol/harness dimensions as ExplorationScope, but
@@ -183,6 +195,26 @@ type ReplayTarget struct {
 	BuildID   string
 	Protocol  string
 	HarnessID string
+	// OriginID is an OPTIONAL, protocol-specific field: for HTTP-backed
+	// replay, the real network origin (scheme://host) a caller declares
+	// TargetID/BuildID/Protocol/HarnessID to actually mean —
+	// NewHTTPStateMachineReplayValidator (state_machine_replay.go)
+	// requires it to equal HTTPProfile.OriginID(), a value computed
+	// purely from the profile's own baseURL, never a caller assertion.
+	//
+	// OriginID is DELIBERATELY EXCLUDED from Hash() (below): Hash() is
+	// the value S10/E6's Produce records as the ORIGINAL candidate's
+	// replay_target_hash, computed from an ExplorationScope that itself
+	// has no OriginID field (S10's frozen contract never gave
+	// ExplorationScope a network address) — including OriginID in Hash()
+	// would make every legitimately-produced Candidate's own recorded
+	// replay_target_hash permanently fail to match ANY properly-
+	// constructed HTTP validator's v.target.Hash(), breaking replay
+	// entirely. OriginID instead exists SOLELY for
+	// NewHTTPStateMachineReplayValidator's own construction-time
+	// self-consistency check between a caller's target and their profile
+	// — never compared against a Candidate's own binding.
+	OriginID string
 }
 
 // Hash is a pure, deterministic, SESSION-INDEPENDENT identity for the
@@ -190,7 +222,7 @@ type ReplayTarget struct {
 // (see transitionCaseArtifactHash and Produce below), and the value a
 // replay validator recomputes for its OWN configured target to confirm it
 // is replaying against the SAME target/build/protocol/harness the original
-// candidate came from.
+// candidate came from. OriginID plays no part in this — see its own doc.
 func (rt ReplayTarget) Hash() string {
 	return RawInputHash([]byte(rt.TargetID + "|" + rt.BuildID + "|" + rt.Protocol + "|" + rt.HarnessID))
 }
@@ -664,13 +696,14 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 		// resolves against — see Candidate.stateMachineBinding's own doc for
 		// why Refs (below) is never trusted for that.
 		cand.stateMachineBinding = &StateMachineBinding{
-			ruleID:           rc.Rule.RuleID,
-			actionID:         action,
-			projectorID:      rc.Rule.ProjectorID,
-			replayTargetHash: replayTargetOf(rc.Scope).Hash(),
-			caseArtifactHash: artifactHash,
-			policyID:         policyID,
-			specID:           specID,
+			ruleID:            rc.Rule.RuleID,
+			actionID:          action,
+			projectorID:       rc.Rule.ProjectorID,
+			replayTargetHash:  replayTargetOf(rc.Scope).Hash(),
+			caseArtifactHash:  artifactHash,
+			policyID:          policyID,
+			specID:            specID,
+			originalScopeHash: rc.Transition.ScopeHash,
 		}
 		cand.Refs = map[string]string{
 			"transition_artifact_hash": rc.Transition.TransitionArtifactHash,
@@ -687,10 +720,11 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 			// resolve — never trusting these Candidate-carried copies (or
 			// the ones on Refs at all) as authoritative on their own. The
 			// AUTHORITATIVE copies live on StateMachineBinding, above.
-			"projector_id":       string(rc.Rule.ProjectorID),
-			"replay_target_hash": replayTargetOf(rc.Scope).Hash(),
-			"policy_id":          policyID,
-			"action_spec_id":     specID,
+			"projector_id":        string(rc.Rule.ProjectorID),
+			"replay_target_hash":  replayTargetOf(rc.Scope).Hash(),
+			"policy_id":           policyID,
+			"action_spec_id":      specID,
+			"original_scope_hash": rc.Transition.ScopeHash,
 		}
 		candidates = append(candidates, cand)
 	}
