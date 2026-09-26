@@ -13,6 +13,7 @@ import (
 	"gopoc/checks/nginx"
 	"gopoc/checks/nginxui"
 	"gopoc/checks/oracleproxy"
+	"gopoc/checks/papercut"
 	"gopoc/checks/sharepoint"
 	"gopoc/checks/tomcat"
 	"gopoc/checks/weblogic"
@@ -38,6 +39,7 @@ func Builtin(client httpx.Probe, mode model.Mode, canary model.CanaryConfig) (*r
 		jbosswildfly.NewUnauthenticatedManagement(client),
 		jenkins.NewAnonScriptConsole(client), jenkins.NewCVE202423897(client),
 		gitlab.NewCVE20237028(client), gitlab.NewCVE20232825(client),
+		papercut.NewCVE20232735(client),
 	} {
 		if err := r.Register(c); err != nil {
 			return nil, err

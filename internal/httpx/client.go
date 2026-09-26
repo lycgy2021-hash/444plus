@@ -282,8 +282,13 @@ func (c *Client) do(ctx context.Context, target model.Target, method, rawPath, c
 	if err := c.policy.CheckCapabilities(requiredCap); err != nil {
 		return Response{}, err
 	}
-	if !strings.HasPrefix(rawPath, "/") || strings.HasPrefix(rawPath, "//") || strings.ContainsAny(rawPath, "\\?#") {
-		return Response{}, errors.New("request path must be an origin-relative path without query or fragment")
+	// The path may carry a query string ("/app?service=page/SetupCompleted") for
+	// products whose routing is query-based; it flows through URL.Opaque into the
+	// request line verbatim (see below). A fragment or backslash is still refused,
+	// and the ASCII check below rejects spaces/control bytes, so a query must be
+	// percent-encoded.
+	if !strings.HasPrefix(rawPath, "/") || strings.HasPrefix(rawPath, "//") || strings.ContainsAny(rawPath, "\\#") {
+		return Response{}, errors.New("request path must be an origin-relative path (query allowed, no fragment)")
 	}
 	for _, b := range []byte(rawPath) {
 		if b <= 32 || b >= 127 {

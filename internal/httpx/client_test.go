@@ -117,13 +117,33 @@ func TestRawPathAndRejectOriginEscape(t *testing.T) {
 	if _, err := c.Get(context.Background(), target, path); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"//another-host/file", "http://host/", "/file\r\nX: value", "/a?query", "/a#fragment", "/\\host/file", "/space here"} {
+	for _, path := range []string{"//another-host/file", "http://host/", "/file\r\nX: value", "/a#fragment", "/\\host/file", "/space here"} {
 		if _, err := c.Get(context.Background(), target, path); err == nil {
 			t.Errorf("accepted unsafe path %q", path)
 		}
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("unexpected outbound requests: %d", hits.Load())
+	}
+}
+
+// A query string is allowed and must reach the wire verbatim (products like
+// PaperCut route via /app?service=page/...).
+func TestQueryPathPreserved(t *testing.T) {
+	const path = "/app?service=page/SetupCompleted"
+	var got string
+	s := testutil.NewRawServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.RequestURI
+	}))
+	defer s.Close()
+	opts := Defaults()
+	opts.Rate = 0
+	c := testClient(t, opts)
+	if _, err := c.Get(context.Background(), testTarget(t, s.URL), path); err != nil {
+		t.Fatalf("query path rejected: %v", err)
+	}
+	if got != path {
+		t.Errorf("RequestURI = %q, want %q", got, path)
 	}
 }
 

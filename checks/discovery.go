@@ -81,6 +81,16 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 	if hasHeader("X-Gitlab-Meta") || containsAnyLower(body, []string{"tanuki-shape", "tanuki-logo", "/-/manifest.json", "gitlab community edition", "gitlab enterprise edition", `data-qa-selector="login_page"`}) {
 		add("gitlab")
 	}
+	// PaperCut MF/NG. High-recall routing hint: its app-server default ports, its
+	// versioned asset param / framework markers, or its Tapestry `service=page/…`
+	// redirect target. The checker re-verifies with the >=2-signal rule, so an
+	// unrelated service on 9191 only triggers a self-negating extra check.
+	location := strings.ToLower(root.Location + " " + notFound.Location)
+	if target.Port == 9191 || target.Port == 9192 ||
+		containsAnyLower(body, []string{"papercut-mf", "papercut-ng", "application: app-server", "papercut software pty"}) ||
+		strings.Contains(location, "service=page") {
+		add("papercut")
+	}
 	if hasHeader("MicrosoftSharePointTeamServices") || hasHeader("X-SharePointHealthScore") || strings.Contains(body, "/_layouts/15/") {
 		add("sharepoint")
 	}

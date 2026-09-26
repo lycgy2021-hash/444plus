@@ -206,6 +206,26 @@ func TestFalsePositiveCorpusHTTP(t *testing.T) {
 			w.Header().Set("X-Gitlab-Meta", `{"correlation_id":"01ABC","version":"1"}`)
 			w.Write([]byte(`<html><h1>GitLab Community Edition</h1></html>`))
 		}},
+		// Adversarial (PaperCut): a bare product title is a single weak signal — the
+		// >=2-signal rule must reject it.
+		{"papercut_bare_title", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html><title>PaperCut Login</title></html>`))
+		}},
+		// Adversarial (PaperCut): a page that merely mentions PaperCut, no structure.
+		{"papercut_text_only", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html>We use PaperCut for print management.</html>`))
+		}},
+		// Adversarial (PaperCut): a generic Java web app issuing a JSESSIONID — a
+		// servlet cookie is not a PaperCut signal.
+		{"papercut_generic_jsessionid", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Set-Cookie", "JSESSIONID=abc123; Path=/")
+			w.Write([]byte(`<html><body>Some Java app</body></html>`))
+		}},
+		// Adversarial (PaperCut): a 200 on the SetupCompleted path that is NOT a
+		// PaperCut page — identity must fail, so no elevation.
+		{"papercut_setup_path_not_papercut", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html><body>setup complete, thanks!</body></html>`))
+		}},
 	}
 	for _, tc := range corpus {
 		t.Run(tc.name, func(t *testing.T) {
@@ -262,6 +282,19 @@ func TestVerdictElevationGuards(t *testing.T) {
 				return
 			}
 			w.Write([]byte(`<html>jenkins, no version marker</html>`))
+		}},
+		{"papercut_surface_no_version", "CVE-2023-27350", func(w http.ResponseWriter, r *http.Request) {
+			// PaperCut identified (>=2 signals: title + versioned asset param) and
+			// SetupCompleted returns 200, but with no version span and not the real
+			// setup page: affected status is unknown, so the CVE must not elevate.
+			switch r.RequestURI {
+			case "/app?service=page/Login":
+				w.Write([]byte(`<title>PaperCut Login</title><link href="/css/style.css?64927papercut-mf" />`))
+			case "/app?service=page/SetupCompleted":
+				w.Write([]byte(`<!-- Application: app-server --> maintenance page, no version`))
+			default:
+				w.Write([]byte(`<html>PaperCut</html>`))
+			}
 		}},
 		{"gitlab_reset_exposed_no_version", "CVE-2023-7028", func(w http.ResponseWriter, r *http.Request) {
 			// GitLab identified (X-Gitlab-Meta + sign-in body markers) and the

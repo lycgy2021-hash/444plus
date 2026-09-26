@@ -81,6 +81,51 @@ Arbitrary file read was NOT attempted". A confirmation that actually exercises t
 the default single-IP path. Version boundary (`go test ./checks/jenkins/ -run
 TestVersionBoundary`) pins weekly 2.441/2.442 and LTS 2.426.2/2.426.3.
 
+## PaperCut MF/NG CVE-2023-27350 (two-state, real-validated)
+
+Two real PaperCut binaries (containerized genuine installer,
+`tomcat2111/papercut-mf`), probed **unauthenticated, read-only (GET only)** on
+`:9191`. The official installer is egress-blocked in cloud, so these images are
+the lab; re-confirm on an operator instance before relying on it. Product ID
+requires **≥2 independent signals** (the `?<build>papercut-mf` asset param plus an
+app-server/login/product marker), so a bare "PaperCut" title never elevates.
+
+| Target | Version | Checker | Expected verdict |
+| --- | --- | --- | --- |
+| `tomcat2111/papercut-mf:22.0.7` (affected) | 22.0.7 (Build 64927) | `CVE-2023-27350` | `likely` / `setup_completed_bypass_exposed` |
+| `tomcat2111/papercut-mf:22.1.1` (fixed, configured) | 22.1.1 (Build 66714) | `CVE-2023-27350` | `not_found` / `patched_setup_access_control` |
+
+The affected server renders `GET /app?service=page/SetupCompleted` (HTTP 200 + the
+real setup page + `<span>x.y.z</span>`) — the access-control bypass, observed
+read-only; the fixed server redirects that GET (302 → `page/Home`). The CVE caps
+at `likely`: the message reads "Exploit / RCE / admin session was NOT attempted
+(read-only GET; no POST, no wizard step)". No POST is ever sent to `/app`.
+Version boundary (`go test ./checks/papercut/ -run TestVersionBoundary`) pins
+20.1.6/20.1.7, 21.2.10/21.2.11, 22.0.8/22.0.9.
+
+Validation coverage (tier: **live**; tested 22.0.7, 22.1.1):
+
+```yaml
+tier: live
+tested_versions: [22.0.7, 22.1.1]
+coverage:
+  product_identity: true
+  positive_path:    true   # affected -> likely (SetupCompleted rendered)
+  fixed_path:       true   # patched  -> not_found (SetupCompleted redirect)
+  negative_path:    false  # no "affected but surface safely disabled" state exists:
+                           # the bypass is version-bound with no disabling config
+```
+
+`negative_path=false` is expected and honest: CVE-2023-27350 has no config toggle
+that leaves an affected version present but the surface closed, so there is no
+"affected + safe" third state to validate (unlike Tomcat's writable-vs-readonly).
+
+Note (cloud lab caveat): a **fresh, not-yet-configured** fixed container serves no
+login/setup body, so it reports `not_found` via `product_not_papercut` rather than
+`patched_setup_access_control`; the configured-fixed → `patched_setup_access_control`
+path is pinned deterministically by `go test ./checks/papercut/ -run
+TestRealServerTwoState`.
+
 ## Standing gates (must stay green on every change)
 
 - `go build ./... && go vet ./... && go test ./...`
