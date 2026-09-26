@@ -599,16 +599,68 @@ the guarantees hold under test:
     with the executor never invoked at all, distinct from
     `TestExplorerPostActionScopeDriftFailsStop`, which drives the OTHER
     collection point (no drift before the action — it legitimately runs —
-    drift is only observed on the collection immediately after). Each `Step`
-    now costs three collector-facing "requests" (fresh-before, execute,
-    after) instead of two, reflected in `preflightBudgetLocked`'s cost
-    argument. v1 has no revision/ETag/session-nonce freshness primitive, so
-    this is the deliberately blunt v1 answer — no asynchronous network system
-    eliminates a TOCTOU window entirely, but authorizing off a fresh
-    observation instead of a historical cache closes the part of it this
-    Explorer itself controls; binding a real protocol's own freshness
-    primitive into `BoundAction`/`StateArtifact` is future work, not required
-    to close v1's own responsibility here.
+    drift is only observed on the collection immediately after). v1 has no
+    revision/ETag/session-nonce freshness primitive, so this is the
+    deliberately blunt v1 answer — no asynchronous network system eliminates
+    a TOCTOU window entirely, but authorizing off a fresh observation instead
+    of a historical cache closes the part of it this Explorer itself
+    controls; binding a real protocol's own freshness primitive into
+    `BoundAction`/`StateArtifact` is future work, not required to close v1's
+    own responsibility here.
+  - **Seventh regression, closing a subtler bypass OF THE FIX ABOVE:
+    fresh-state authorization only works if the Fingerprint Step re-collects
+    is actually fresh — and Explorer held a bare `stateauth.StateProjector`
+    interface value.** Any package can write a type satisfying that
+    interface; it can never forge a NEW `Fingerprint` (the constructor is
+    unexported to `stateauth`), but nothing stopped it from CAPTURING a
+    `Fingerprint` from one genuinely earlier `Project` call and REPLAYING it
+    on every later call, ignoring the `StateArtifact` it was actually asked
+    to project. Fresh-state authorization's own drift check would see a
+    perfectly self-consistent `Fingerprint` and never suspect it was minted
+    for different bytes — the state-authority analogue of exactly the TOCTOU
+    fresh-state authorization closes for actions. Fixed the same way
+    `actionauth` closes action selection: `internal/stateauth/registry.go`
+    adds a `Registry` whose constructor is UNEXPORTED — the only exported way
+    to obtain one is `stateauth.DefaultRegistry()`, which builds it from
+    stateauth's OWN concrete projectors (`RawLenProjector`) directly in Go
+    code; there is no exported constructor an external package could hand a
+    fake or replaying projector to. `Explorer` now holds a `*stateauth.Registry`
+    and a `ProjectorID`, never a `StateProjector` value — `collectAndProjectLocked`
+    calls `e.projectorRegistry.Project(e.projectorID, artifact)`. This is a
+    compile-time guarantee (nothing to runtime-test from outside `stateauth`
+    beyond what `internal/stateauth/registry_test.go` already pins: unknown
+    IDs and nil/zero registries both fail safely, never panic).
+  - **Eighth regression: `ExplorationBudget.MaxRequests` was enforced by
+    Explorer GUESSING a fixed number of "requests" per `Step`/`Recover` call
+    (3 and 2) — an assumption that breaks the moment a real `Collector`'s
+    single `Collect()` call issues several actual requests internally (a
+    status check, a session check, a metadata fetch), or an `Executor`
+    retries once.** Fixed: `research/meter.go` adds `RequestMeter`
+    (`Acquire() error`, `Used() int`) plus `ContextWithRequestMeter`/
+    `RequestMeterFromContext`. Explorer attaches a bounded meter to `ctx`
+    before every `Collector`/`Executor` call and no longer counts anything
+    itself — a real implementation MUST call `Acquire` once for EACH actual
+    request it issues, and `MaxRequests` is enforced the instant `Acquire`
+    is called past the bound, not by Explorer's own arithmetic.
+    `TestExplorerRequestMeterCountsRealAcquireCallsNotGuessedCost` drives a
+    fake `Collector` that acquires 3 units per `Collect()` call against
+    `MaxRequests=5` and checks the SECOND call fails on the real count (3+3 >
+    5), not on any per-call guess. Recovery gets its OWN separate, bounded
+    "emergency allowance" (`recoveryRequestAllowance`, a new required
+    `NewExplorer` parameter — not a change to the frozen `ExplorationBudget`
+    type) — deliberately never blocked by the main exploration meter being
+    exhausted (`TestExplorerRecoveryUsesSeparateAllowanceNotBlockedByExhaustedExplorationBudget`),
+    but still a real, enforced bound of its own, never unlimited
+    (`TestExplorerRecoveryAllowanceIsBoundedNotUnlimited`).
+  - **Small hardening pass, not a regression:** `History()` was already
+    proven, not just documented, to return a copy
+    (`TestHistoryReturnsIndependentCopy` mutates the returned slice and
+    checks Explorer's own record is unaffected) — the same discipline
+    `Fingerprint.Facts()` and `stateauth`'s own getters already followed.
+    `e.tried` (the exclude set `Select` receives) is built ENTIRELY from
+    Explorer's own private bookkeeping and is never exposed by any getter or
+    accepted as a parameter from any caller, so there is no path for a caller
+    to influence action selection by tampering with history.
   - **`RawLenProjector`** is the first concrete `StateProjector` — deliberately
     minimal (one fact, the raw byte length), proving the contract end-to-end
     without claiming to model any real protocol's state. It is a fixture/test
@@ -616,15 +668,19 @@ the guarantees hold under test:
     responses of identical length can differ completely, e.g. an
     `admin=false`/`admin=true` flip) — a real protocol-specific projector
     (status, content-type, stable headers, auth state, body structural shape)
-    is future work and must live inside `internal/stateauth` for the same
-    reason `RawLenProjector` does.
+    is future work and must live inside `internal/stateauth`, registered
+    through `stateauth.DefaultRegistry`, for the same reason `RawLenProjector`
+    does.
   - **v1 explicitly does NOT do:** concurrent actions, multiple sessions, AI
     action selection (now closed at the API level, not just by convention —
     `Step` has no parameter to carry one), AI-generated network requests,
-    dynamic registry / hot reload, irreversible actions, exploration without a
-    recovery check, "different state = vulnerability", automatic
-    exploitability judgment, or unlimited depth/budget. None of these have any
-    code path in `research/explorer.go` today.
+    dynamic registry / hot reload, arbitrary `StateProjector` injection (closed
+    at the API level — `Explorer` cannot accept one), a guessed/estimated
+    request cost (closed — `MaxRequests` is enforced by real `Acquire` calls),
+    irreversible actions, exploration without a recovery check, "different
+    state = vulnerability", automatic exploitability judgment, or unlimited
+    depth/budget. None of these have any code path in `research/explorer.go`
+    today.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
 

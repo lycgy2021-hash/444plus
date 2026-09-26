@@ -18,16 +18,33 @@ import (
 // about what the raw bytes mean. scopeSeq, if set, overrides the SCOPE the
 // collector responds with, per call index (0-based; the last entry repeats
 // once exhausted) — used to simulate a scope drifting mid-exploration.
+// acquiresPerCollect, if > 0, is how many times THIS ONE Collect call
+// acquires from the RequestMeter — a cooperative real-I/O implementation
+// might issue several actual requests per Collect call; the default (0,
+// meaning 1) simulates the simplest case.
 type fakeCollector struct {
-	mu       sync.Mutex
-	seq      [][]byte
-	idx      int
-	scope    ExplorationScope   // if non-zero, override every call with this scope
-	scopeSeq []ExplorationScope // if non-empty, override per call index instead
-	calls    int
+	mu                 sync.Mutex
+	seq                [][]byte
+	idx                int
+	scope              ExplorationScope   // if non-zero, override every call with this scope
+	scopeSeq           []ExplorationScope // if non-empty, override per call index instead
+	calls              int
+	acquiresPerCollect int
 }
 
 func (c *fakeCollector) Collect(ctx context.Context, scope ExplorationScope) (stateauth.StateArtifact, error) {
+	n := c.acquiresPerCollect
+	if n <= 0 {
+		n = 1
+	}
+	if meter := RequestMeterFromContext(ctx); meter != nil {
+		for i := 0; i < n; i++ {
+			if err := meter.Acquire(); err != nil {
+				return stateauth.StateArtifact{}, err
+			}
+		}
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	respondScope := scope
@@ -58,6 +75,8 @@ func (c *fakeCollector) Collect(ctx context.Context, scope ExplorationScope) (st
 // recoveryDelay, if set, makes ExecuteRecovery wait that long UNLESS ctx is
 // cancelled first (e.g. by Explorer's recoveryTimeout), in which case it
 // returns ctx.Err() — a cooperative test double for the recovery-timeout test.
+// Like fakeCollector, it acquires once from the RequestMeter per call — a
+// cooperative real-I/O implementation's simplest case.
 type fakeExecutor struct {
 	mu            sync.Mutex
 	executed      []actionauth.ActionID
@@ -70,6 +89,11 @@ type fakeExecutor struct {
 }
 
 func (e *fakeExecutor) Execute(ctx context.Context, action actionauth.BoundAction) error {
+	if meter := RequestMeterFromContext(ctx); meter != nil {
+		if err := meter.Acquire(); err != nil {
+			return err
+		}
+	}
 	if atomic.AddInt32(&e.inFlight, 1) > 1 {
 		e.sawConcurrent = true
 	}
@@ -84,6 +108,11 @@ func (e *fakeExecutor) Execute(ctx context.Context, action actionauth.BoundActio
 }
 
 func (e *fakeExecutor) ExecuteRecovery(ctx context.Context, recovery actionauth.BoundRecovery) error {
+	if meter := RequestMeterFromContext(ctx); meter != nil {
+		if err := meter.Acquire(); err != nil {
+			return err
+		}
+	}
 	if atomic.AddInt32(&e.inFlight, 1) > 1 {
 		e.sawConcurrent = true
 	}
@@ -112,11 +141,13 @@ func testScope() ExplorationScope {
 	return ExplorationScope{TargetID: "t", BuildID: "b", SessionID: "s", Protocol: "http", HarnessID: "h"}
 }
 
+func rawLenProjectorID() stateauth.ProjectorID { return stateauth.RawLenProjector{}.ID() }
+
 // rawLenReq matches any Fingerprint produced by stateauth.RawLenProjector,
 // regardless of its raw_len value — the declarative "always applies"
 // requirement used throughout these tests.
 func rawLenReq() actionauth.StateRequirements {
-	return actionauth.StateRequirements{ProjectorID: stateauth.RawLenProjector{}.ID()}
+	return actionauth.StateRequirements{ProjectorID: rawLenProjectorID()}
 }
 
 // testPolicy returns a policy with one always-applicable action ("probe")
@@ -145,9 +176,14 @@ func testPolicyTwoActions() *actionauth.ActionPolicy {
 
 func resetRef() actionauth.RecoveryPlanRef { return actionauth.RecoveryPlanRef{RegistryKey: "reset"} }
 
+// newTestExplorer builds an Explorer wired to stateauth.DefaultRegistry() —
+// the ONLY exported way to obtain a *stateauth.Registry (see PROJECTOR
+// AUTHORITY in explorer.go) — with a generous recovery request allowance,
+// for tests that aren't specifically exercising registry/meter construction
+// failures.
 func newTestExplorer(t *testing.T, scope ExplorationScope, collector Collector, policy *actionauth.ActionPolicy, executor Executor, budget ExplorationBudget) *Explorer {
 	t.Helper()
-	exp, err := NewExplorer(scope, collector, stateauth.RawLenProjector{}, policy, executor, budget, resetRef(), time.Second)
+	exp, err := NewExplorer(scope, collector, stateauth.DefaultRegistry(), rawLenProjectorID(), policy, executor, budget, resetRef(), time.Second, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,6 +233,31 @@ func TestExplorerBaselineThenStepRecordsTransition(t *testing.T) {
 	}
 	if stopped, _ := exp.Stopped(); stopped {
 		t.Fatal("explorer must not be stopped after one ordinary step")
+	}
+}
+
+// TestHistoryReturnsIndependentCopy proves History() never hands back a
+// reference to Explorer's own internal slice — mutating what it returns
+// must never affect Explorer's own record, or (transitively) the tried/
+// visits bookkeeping that record could otherwise be used to corrupt.
+func TestHistoryReturnsIndependentCopy(t *testing.T) {
+	collector := &fakeCollector{seq: [][]byte{[]byte("AAAA"), []byte("AAAA"), []byte("BB")}}
+	executor := &fakeExecutor{}
+	exp := newTestExplorer(t, testScope(), collector, testPolicy(), executor, generousBudget())
+	if _, err := exp.Baseline(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exp.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := exp.History()
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one transition, got %d", len(got))
+	}
+	got[0].ScopeHash = "tampered"
+	again := exp.History()
+	if again[0].ScopeHash == "tampered" {
+		t.Fatal("mutating a slice returned by History() must not affect Explorer's own internal record")
 	}
 }
 
@@ -289,6 +350,84 @@ func TestExplorerBudgetStopsFurtherSteps(t *testing.T) {
 	}
 	if _, err := exp.Step(context.Background()); !errors.Is(err, ErrExplorerStopped) {
 		t.Fatalf("a step after stopping = %v, want ErrExplorerStopped", err)
+	}
+}
+
+// TestExplorerRequestMeterCountsRealAcquireCallsNotGuessedCost is the direct
+// regression test for the S10-E4f fix: MaxRequests must bound REAL Acquire
+// calls, never a fixed per-Step/Recover guess. Here the fakeCollector
+// simulates a Collect() that internally issues 3 real requests; with
+// MaxRequests=5, Baseline alone (3) leaves only 2 — nowhere near enough for
+// Step's fresh-before collect (3 more) — so Step must fail on the real
+// count, not on some Explorer-side arithmetic that never actually looked at
+// how many requests Collect made.
+func TestExplorerRequestMeterCountsRealAcquireCallsNotGuessedCost(t *testing.T) {
+	collector := &fakeCollector{seq: [][]byte{[]byte("AAAA"), []byte("AAAA"), []byte("BB")}, acquiresPerCollect: 3}
+	executor := &fakeExecutor{}
+	budget := generousBudget()
+	budget.MaxRequests = 5
+	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, budget, resetRef(), time.Second, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exp.Baseline(context.Background()); err != nil {
+		t.Fatalf("baseline (3 of 5 real requests) must succeed: %v", err)
+	}
+	if _, err := exp.Step(context.Background()); !errors.Is(err, ErrBudgetExceeded) {
+		t.Fatalf("Step's fresh-before collect needs 3 more real requests but only 2 of MaxRequests=5 remain = %v, want ErrBudgetExceeded", err)
+	}
+	if stopped, _ := exp.Stopped(); !stopped {
+		t.Fatal("exhausting the real request meter must stop the explorer")
+	}
+}
+
+// TestExplorerRecoveryUsesSeparateAllowanceNotBlockedByExhaustedExplorationBudget
+// proves recovery's request allowance is genuinely SEPARATE from the main
+// exploration budget: even after MaxRequests is fully spent, a deliberate
+// Recover call must still be able to run.
+func TestExplorerRecoveryUsesSeparateAllowanceNotBlockedByExhaustedExplorationBudget(t *testing.T) {
+	collector := &fakeCollector{seq: [][]byte{[]byte("BASELINE")}} // repeats forever -> trivially recoverable
+	executor := &fakeExecutor{}
+	budget := generousBudget()
+	budget.MaxRequests = 1 // exhausted entirely by Baseline's one real Collect
+	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, budget, resetRef(), time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exp.Baseline(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := exp.Recover(context.Background())
+	if err != nil {
+		t.Fatalf("Recover must not be blocked by an exhausted exploration MaxRequests budget: %v", err)
+	}
+	if !stateauth.Recovered(outcome) {
+		t.Fatal("expected a trivially successful recovery — the collector always returns the same bytes")
+	}
+}
+
+// TestExplorerRecoveryAllowanceIsBoundedNotUnlimited proves recovery's
+// separate allowance is still a REAL bound, not "recovery bypasses metering
+// entirely" — a recovery attempt that needs more real requests than
+// recoveryRequestAllowance permits must fail and stop the explorer, exactly
+// like any other exhausted budget.
+func TestExplorerRecoveryAllowanceIsBoundedNotUnlimited(t *testing.T) {
+	// ExecuteRecovery acquires 1; the re-collection alone needs 5 more — well
+	// past a recoveryRequestAllowance of 3.
+	collector := &fakeCollector{seq: [][]byte{[]byte("A")}, acquiresPerCollect: 5}
+	executor := &fakeExecutor{}
+	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, generousBudget(), resetRef(), time.Second, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exp.Baseline(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exp.Recover(context.Background()); !errors.Is(err, ErrBudgetExceeded) {
+		t.Fatalf("recovery's own request allowance must be enforced, got %v", err)
+	}
+	if stopped, _ := exp.Stopped(); !stopped {
+		t.Fatal("an exhausted recovery allowance must stop the explorer")
 	}
 }
 
@@ -402,7 +541,7 @@ func TestExplorerConstructionRejectsUnregisteredRecoveryRef(t *testing.T) {
 	// The policy's recovery registry only knows "reset" — configuring the
 	// explorer with a different ref must make every Recover call fail, never
 	// silently fall back to something else.
-	exp, err := NewExplorer(testScope(), collector, stateauth.RawLenProjector{}, testPolicy(), executor, generousBudget(), actionauth.RecoveryPlanRef{RegistryKey: "not-registered"}, time.Second)
+	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, generousBudget(), actionauth.RecoveryPlanRef{RegistryKey: "not-registered"}, time.Second, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +691,7 @@ func TestExplorerRecoveryScopeDriftFailsStop(t *testing.T) {
 func TestExplorerRecoveryTimeoutStopsAHungRecovery(t *testing.T) {
 	collector := &fakeCollector{seq: [][]byte{[]byte("A")}}
 	executor := &fakeExecutor{recoveryDelay: 200 * time.Millisecond}
-	exp, err := NewExplorer(testScope(), collector, stateauth.RawLenProjector{}, testPolicy(), executor, generousBudget(), resetRef(), 10*time.Millisecond)
+	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, generousBudget(), resetRef(), 10*time.Millisecond, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,32 +730,41 @@ func TestExplorerRequiresBaselineBeforeStepOrRecover(t *testing.T) {
 func TestNewExplorerRejectsInvalidBudgetOrNilOrEmptyDependencies(t *testing.T) {
 	collector := &fakeCollector{}
 	executor := &fakeExecutor{}
+	registry := stateauth.DefaultRegistry()
+	id := rawLenProjectorID()
+
 	var invalidBudget ExplorationBudget
-	if _, err := NewExplorer(testScope(), collector, stateauth.RawLenProjector{}, testPolicy(), executor, invalidBudget, resetRef(), time.Second); err == nil {
+	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, invalidBudget, resetRef(), time.Second, 100); err == nil {
 		t.Fatal("an invalid (zero-value) budget must be refused at construction")
 	}
 	nonBranchingBudget := generousBudget()
 	nonBranchingBudget.MaxBranching = 5
-	if _, err := NewExplorer(testScope(), collector, stateauth.RawLenProjector{}, testPolicy(), executor, nonBranchingBudget, resetRef(), time.Second); err == nil {
+	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, nonBranchingBudget, resetRef(), time.Second, 100); err == nil {
 		t.Fatal("a budget with MaxBranching != 1 must be refused — v1 never branches, so a larger value would misrepresent a capability that does not exist")
 	}
-	if _, err := NewExplorer(testScope(), nil, stateauth.RawLenProjector{}, testPolicy(), executor, generousBudget(), resetRef(), time.Second); err == nil {
+	if _, err := NewExplorer(testScope(), nil, registry, id, testPolicy(), executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
 		t.Fatal("a nil Collector must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, nil, testPolicy(), executor, generousBudget(), resetRef(), time.Second); err == nil {
-		t.Fatal("a nil StateProjector must be refused at construction")
+	if _, err := NewExplorer(testScope(), collector, nil, id, testPolicy(), executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
+		t.Fatal("a nil projectorRegistry must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, stateauth.RawLenProjector{}, nil, executor, generousBudget(), resetRef(), time.Second); err == nil {
+	if _, err := NewExplorer(testScope(), collector, registry, "", testPolicy(), executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
+		t.Fatal("an empty projectorID must be refused at construction")
+	}
+	if _, err := NewExplorer(testScope(), collector, registry, id, nil, executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
 		t.Fatal("a nil ActionPolicy must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, stateauth.RawLenProjector{}, testPolicy(), nil, generousBudget(), resetRef(), time.Second); err == nil {
+	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), nil, generousBudget(), resetRef(), time.Second, 100); err == nil {
 		t.Fatal("a nil Executor must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, stateauth.RawLenProjector{}, testPolicy(), executor, generousBudget(), actionauth.RecoveryPlanRef{}, time.Second); err == nil {
+	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, generousBudget(), actionauth.RecoveryPlanRef{}, time.Second, 100); err == nil {
 		t.Fatal("an empty recoveryRef must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, stateauth.RawLenProjector{}, testPolicy(), executor, generousBudget(), resetRef(), 0); err == nil {
+	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, generousBudget(), resetRef(), 0, 100); err == nil {
 		t.Fatal("a zero or negative recoveryTimeout must be refused at construction")
+	}
+	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, generousBudget(), resetRef(), time.Second, 0); err == nil {
+		t.Fatal("a zero or negative recoveryRequestAllowance must be refused at construction")
 	}
 }
 
