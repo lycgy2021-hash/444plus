@@ -18,19 +18,28 @@ import (
 // agreed as v1's scope, and nothing beyond it:
 //
 //	Baseline: Collector -> StateArtifact -> StateProjector -> Fingerprint
-//	Step:     policy.Bind(id, scope, current) -> BoundAction
+//	Step:     policy.Select(scope, current, tried) -> BoundAction
 //	          -> Executor.Execute -> Collector -> StateProjector -> Fingerprint
 //	          -> StateTransition{before, action, after}
-//	Recover:  policy.BindRecovery(ref, scope, baseline) -> BoundRecovery
+//	Recover:  policy.BindRecovery(fixed ref, scope, baseline) -> BoundRecovery
 //	          -> Executor.ExecuteRecovery -> Collector -> StateProjector
 //	          -> stateauth.Recovered(baseline, result) -> true/STOP
 //
 // Explorer is PURE ORCHESTRATION and holds no authority of its own:
 //   - it never decides what the state IS — that is stateauth.StateProjector's
 //     job, called through the injected interface;
-//   - it never decides what action MAY run — that is actionauth.ActionPolicy's
-//     job; an ActionID given to Step is advisory input exactly like
-//     ActionSuggestion (boundary 2), never itself a credential;
+//   - it never decides WHICH action MAY run — that is
+//     actionauth.ActionPolicy.Select's job, called with only facts (current
+//     scope, current Fingerprint, which action keys have already been tried
+//     from this exact state). An earlier version of this file took a
+//     caller-supplied actionauth.ActionID directly into Step and asked the
+//     policy "is this one registered?" — that reopened exactly the bypass
+//     S10 exists to close: whoever supplies the ActionID (a human, or
+//     indirectly an AI research.ActionSuggestion) would be choosing WHICH
+//     action runs, with the registry doing nothing but rubber-stamp
+//     membership. Step below takes NO action-identifying parameter at all;
+//     Select is the only place a choice is made, and it is entirely
+//     deterministic (registry + Supports predicates + exclude set);
 //   - it never decides whether a transition is WORTH a hypothesis — that is a
 //     future producer's job against an authoritative ExpectationSource
 //     (boundary 11), not implemented here;
@@ -39,22 +48,31 @@ import (
 //
 // v1 is deliberately narrow, per the locked scope: single ExplorationScope,
 // single session, strictly serial (mu serializes every Step/Recover call —
-// at most one in flight at a time, boundary 12), one caller-supplied action
-// per Step (no AI action selection, no branching — MaxBranching is validated
-// by ExplorationBudget.Valid() but has no corresponding runtime check here,
-// since v1 never branches at all), a fixed compile-time registry (no dynamic
-// registration, no hot reload), and a budget that must already be Valid()
-// (no unlimited exploration). There is no automatic exploitability judgment
-// anywhere in this file.
+// at most one in flight at a time, boundary 12), a fixed compile-time
+// registry (no dynamic registration, no hot reload), and a budget that must
+// already be Valid() (no unlimited exploration). There is no automatic
+// exploitability judgment anywhere in this file, and no branching (v1 always
+// selects at most one action per state per Step call — MaxBranching is
+// validated by ExplorationBudget.Valid() but has no corresponding runtime
+// check here, since there is nothing to branch yet).
+//
+// A budget violation discovered only AFTER a step (MaxStates/
+// MaxVisitsPerState — these depend on the state actually observed, so they
+// cannot be preflighted) is never treated as an ordinary stopping point that
+// leaves Explorer sitting in the over-budget state: it triggers MANDATORY
+// recovery back toward the baseline immediately, then a permanent stop —
+// never a continuation from a state that was already known to exceed the
+// budget the moment it was observed.
 type Explorer struct {
 	mu sync.Mutex
 
-	scope     ExplorationScope
-	collector Collector
-	projector stateauth.StateProjector
-	policy    *actionauth.ActionPolicy
-	executor  Executor
-	budget    ExplorationBudget
+	scope       ExplorationScope
+	collector   Collector
+	projector   stateauth.StateProjector
+	policy      *actionauth.ActionPolicy
+	executor    Executor
+	budget      ExplorationBudget
+	recoveryRef actionauth.RecoveryPlanRef
 
 	started   bool
 	stopped   bool
@@ -64,6 +82,7 @@ type Explorer struct {
 	transitions int
 	requests    int
 	visits      map[string]int
+	tried       map[string]map[string]bool
 
 	baseline   stateauth.Fingerprint
 	current    stateauth.Fingerprint
@@ -98,7 +117,8 @@ type Executor interface {
 var (
 	ErrExplorerStopped       = errors.New("research: explorer has stopped and refuses further steps")
 	ErrBudgetExceeded        = errors.New("research: exploration budget exceeded")
-	ErrActionNotAuthorized   = errors.New("research: action could not be bound (not registered, or scope/state mismatch)")
+	ErrNoApplicableAction    = errors.New("research: no registered action is both applicable to the current state and not already tried")
+	ErrActionNotAuthorized   = errors.New("research: selected action failed its own re-verification (should be unreachable)")
 	ErrRecoveryNotAuthorized = errors.New("research: recovery could not be bound (not registered, or scope mismatch)")
 )
 
@@ -106,28 +126,37 @@ var (
 // performs no I/O and takes no action itself — Baseline/Step/Recover do
 // that. budget MUST already be Valid(); an invalid budget can never drive
 // exploration (boundary 10), so NewExplorer refuses to construct one.
-func NewExplorer(scope ExplorationScope, collector Collector, projector stateauth.StateProjector, policy *actionauth.ActionPolicy, executor Executor, budget ExplorationBudget) (*Explorer, error) {
+// recoveryRef names the SINGLE registered recovery procedure this Explorer
+// will ever use — both for a deliberate Recover call and for the mandatory
+// recovery a post-action budget violation triggers — mirroring RecoveryPlan's
+// own shape (one Baseline, one Recovery ref, never a menu).
+func NewExplorer(scope ExplorationScope, collector Collector, projector stateauth.StateProjector, policy *actionauth.ActionPolicy, executor Executor, budget ExplorationBudget, recoveryRef actionauth.RecoveryPlanRef) (*Explorer, error) {
 	if !budget.Valid() {
 		return nil, errors.New("research: exploration budget is invalid (every bound must be strictly positive)")
 	}
 	if collector == nil || projector == nil || policy == nil || executor == nil {
 		return nil, errors.New("research: explorer requires a non-nil collector, projector, policy, and executor")
 	}
+	if recoveryRef.RegistryKey == "" {
+		return nil, errors.New("research: explorer requires a non-empty recovery ref")
+	}
 	return &Explorer{
-		scope:     scope,
-		collector: collector,
-		projector: projector,
-		policy:    policy,
-		executor:  executor,
-		budget:    budget,
-		visits:    make(map[string]int),
+		scope:       scope,
+		collector:   collector,
+		projector:   projector,
+		policy:      policy,
+		executor:    executor,
+		budget:      budget,
+		recoveryRef: recoveryRef,
+		visits:      make(map[string]int),
+		tried:       make(map[string]map[string]bool),
 	}, nil
 }
 
 // Baseline collects and projects the CURRENT state without taking any
-// action, and records it as both Explorer's current state and the baseline a
-// later Recover call restores toward. It must be called exactly once, before
-// the first Step or Recover.
+// action, and records it as both Explorer's current state and the baseline
+// a later Recover call (deliberate or mandatory) restores toward. It must be
+// called exactly once, before the first Step or Recover.
 func (e *Explorer) Baseline(ctx context.Context) (stateauth.Fingerprint, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -153,21 +182,25 @@ func (e *Explorer) Baseline(ctx context.Context) (stateauth.Fingerprint, error) 
 	return fp, nil
 }
 
-// Step authorizes and executes exactly ONE action, identified by id. id may
-// come from anywhere — a human researcher, a fixed pre-planned sequence, or
-// an AI research.ActionSuggestion — but per boundary 2 it is never itself a
-// credential: only e.policy.Bind, called here against the CURRENT scope and
-// state, can turn it into a BoundAction. Step holds mu for its entire
-// duration, so at most one action is ever in flight (boundary 12) — there is
-// no path in this file for two Step calls to interleave.
+// Step selects and executes exactly ONE action, chosen ENTIRELY by
+// e.policy.Select from the current scope/state and the set of action keys
+// already tried from this exact state — Step passes no action identity of
+// its own, and takes no such parameter from its caller. Step holds mu for
+// its entire duration, so at most one action is ever in flight (boundary
+// 12) — there is no path in this file for two Step calls to interleave.
 //
-// A bind failure (id not registered, or the observed state changed out from
-// under a stale caller) is refused with no side effect and does NOT stop the
-// explorer — the caller may retry with a different id, still within budget.
-// A budget preflight failure is also refused with no side effect, but DOES
-// stop the explorer permanently, since it means v1's fixed resource bounds
-// are exhausted for this session.
-func (e *Explorer) Step(ctx context.Context, id actionauth.ActionID) (StateTransition, error) {
+// ErrNoApplicableAction (no side effect, does NOT stop the explorer) means
+// exactly what it says: either nothing registered supports the current
+// state, or everything that does has already been tried from it. That is a
+// normal, expected terminal condition for a given state — not a fault — and
+// the caller may still call Recover.
+//
+// A budget preflight failure is refused with no side effect, and DOES stop
+// the explorer permanently (v1's fixed resource bounds are exhausted). A
+// budget violation discovered only AFTER this step (MaxStates/
+// MaxVisitsPerState) triggers MANDATORY recovery and a permanent stop before
+// Step returns — see the package doc.
+func (e *Explorer) Step(ctx context.Context) (StateTransition, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -184,20 +217,28 @@ func (e *Explorer) Step(ctx context.Context, id actionauth.ActionID) (StateTrans
 
 	before := e.current
 	beforeRaw := e.currentRaw
+	beforeHash := before.StateFingerprintHash()
 
-	action, ok := e.policy.Bind(id, e.scope.Hash(), before.StateFingerprintHash())
+	action, ok := e.policy.Select(e.scope.Hash(), before, e.tried[beforeHash])
 	if !ok {
-		return StateTransition{}, ErrActionNotAuthorized
+		return StateTransition{}, ErrNoApplicableAction
 	}
 	// Defense-in-depth: re-verify immediately before executing, exactly as
 	// boundary 4 requires of a future Executor — this check is IN ADDITION
-	// to, never a substitute for, the Executor's own.
-	if !action.ValidFor(e.scope.Hash(), before.StateFingerprintHash()) {
+	// to, never a substitute for, the Executor's own. Select just built
+	// action against these exact values, so this should be unreachable; it
+	// is kept as a real check, not a decorative one.
+	if !action.ValidFor(e.scope.Hash(), beforeHash) {
 		return StateTransition{}, ErrActionNotAuthorized
 	}
 
+	if e.tried[beforeHash] == nil {
+		e.tried[beforeHash] = make(map[string]bool)
+	}
+	e.tried[beforeHash][action.ID().RegistryKey] = true
+
 	if err := e.executor.Execute(ctx, action); err != nil {
-		return StateTransition{}, fmt.Errorf("research: executing action %s: %w", id.RegistryKey, err)
+		return StateTransition{}, fmt.Errorf("research: executing action %s: %w", action.ID().RegistryKey, err)
 	}
 	e.requests++
 
@@ -233,28 +274,30 @@ func (e *Explorer) Step(ctx context.Context, id actionauth.ActionID) (StateTrans
 	e.current = after
 	e.currentRaw = afterRaw
 
-	// Post-checks: this step already ran and is returned successfully: v1
-	// stops FUTURE steps once a bound is reached, it never undoes a step
-	// already taken.
-	if e.visits[after.StateFingerprintHash()] > e.budget.MaxVisitsPerState {
-		e.stopLocked(fmt.Errorf("%w: MaxVisitsPerState exceeded for the current state", ErrBudgetExceeded))
-		return transition, nil
-	}
-	if len(e.visits) > e.budget.MaxStates {
-		e.stopLocked(fmt.Errorf("%w: MaxStates exceeded", ErrBudgetExceeded))
-		return transition, nil
+	// Post-check: MaxStates/MaxVisitsPerState depend on the state actually
+	// observed, so they can only be checked here, after the side effect. This
+	// step's own transition already happened and is real evidence — it is
+	// still returned — but the state it landed in is NOT a valid point to
+	// continue from: force recovery now, then stop permanently, rather than
+	// leaving Explorer sitting in a state that was already over budget the
+	// moment it was observed.
+	if e.visits[after.StateFingerprintHash()] > e.budget.MaxVisitsPerState || len(e.visits) > e.budget.MaxStates {
+		budgetErr := fmt.Errorf("%w: post-action state budget exceeded (MaxVisitsPerState/MaxStates)", ErrBudgetExceeded)
+		e.forceRecoveryAndStopLocked(ctx, budgetErr)
+		return transition, e.stopErr
 	}
 
 	return transition, nil
 }
 
-// Recover executes a registered recovery procedure toward the baseline state
-// recorded by Baseline, then re-collects and re-projects to VERIFY it
-// actually worked via stateauth.Recovered — never assuming success. A false
-// result is a hard stop: per boundary 8's own doc, Explorer refuses every
-// subsequent Step or Recover call from that point on; exploration must never
-// continue on the assumption a rollback worked.
-func (e *Explorer) Recover(ctx context.Context, ref actionauth.RecoveryPlanRef) (stateauth.RecoveryOutcome, error) {
+// Recover deliberately executes this Explorer's single registered recovery
+// procedure toward the baseline state recorded by Baseline, then re-collects
+// and re-projects to VERIFY it actually worked via stateauth.Recovered —
+// never assuming success. A false result is a hard stop: per boundary 8's
+// own doc, Explorer refuses every subsequent Step or Recover call from that
+// point on; exploration must never continue on the assumption a rollback
+// worked.
+func (e *Explorer) Recover(ctx context.Context) (stateauth.RecoveryOutcome, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -269,16 +312,55 @@ func (e *Explorer) Recover(ctx context.Context, ref actionauth.RecoveryPlanRef) 
 		return stateauth.RecoveryOutcome{}, err
 	}
 
-	recovery, ok := e.policy.BindRecovery(ref, e.scope.Hash(), e.baseline.StateFingerprintHash())
+	outcome, err := e.executeRecoveryLocked(ctx)
+	if err != nil {
+		return stateauth.RecoveryOutcome{}, err
+	}
+	if !stateauth.Recovered(outcome) {
+		stopErr := fmt.Errorf("research: recovery %q did not restore the baseline state for scope %s — exploration STOPS", e.recoveryRef.RegistryKey, e.scope.Hash())
+		e.stopLocked(stopErr)
+		return outcome, stopErr
+	}
+	e.visits[outcome.Result.StateFingerprintHash()]++
+	return outcome, nil
+}
+
+// forceRecoveryAndStopLocked is called ONLY from Step, immediately after a
+// post-action budget violation. It never returns an error itself: it always
+// stops the explorer, but the message it stops with distinguishes whether
+// the mandatory recovery also succeeded, failed to verify, or could not even
+// run — a caller inspecting Stopped() can tell which happened. It
+// deliberately does NOT go through preflightBudgetLocked — an
+// already-exhausted budget must never be able to block the one safety
+// mechanism meant to run precisely when the budget is exhausted.
+func (e *Explorer) forceRecoveryAndStopLocked(ctx context.Context, cause error) {
+	outcome, err := e.executeRecoveryLocked(ctx)
+	switch {
+	case err != nil:
+		e.stopLocked(fmt.Errorf("%w (mandatory recovery could not run: %v)", cause, err))
+	case !stateauth.Recovered(outcome):
+		e.stopLocked(fmt.Errorf("%w (mandatory recovery did not restore baseline)", cause))
+	default:
+		e.stopLocked(fmt.Errorf("%w (mandatory recovery restored baseline; exploration stopped)", cause))
+	}
+}
+
+// executeRecoveryLocked is the shared mechanics behind both a deliberate
+// Recover call and forceRecoveryAndStopLocked's mandatory one: bind this
+// Explorer's single fixed recoveryRef, re-verify ValidFor, run it, and
+// re-collect/re-project. It never itself decides whether the outcome counts
+// as recovered (stateauth.Recovered is the only function that may) and never
+// itself stops the explorer — callers do that.
+func (e *Explorer) executeRecoveryLocked(ctx context.Context) (stateauth.RecoveryOutcome, error) {
+	recovery, ok := e.policy.BindRecovery(e.recoveryRef, e.scope.Hash(), e.baseline.StateFingerprintHash())
 	if !ok {
 		return stateauth.RecoveryOutcome{}, ErrRecoveryNotAuthorized
 	}
 	if !recovery.ValidFor(e.scope.Hash()) {
 		return stateauth.RecoveryOutcome{}, ErrRecoveryNotAuthorized
 	}
-
 	if err := e.executor.ExecuteRecovery(ctx, recovery); err != nil {
-		return stateauth.RecoveryOutcome{}, fmt.Errorf("research: executing recovery %s: %w", ref.RegistryKey, err)
+		return stateauth.RecoveryOutcome{}, fmt.Errorf("research: executing recovery %s: %w", e.recoveryRef.RegistryKey, err)
 	}
 	e.requests++
 
@@ -293,15 +375,10 @@ func (e *Explorer) Recover(ctx context.Context, ref actionauth.RecoveryPlanRef) 
 		Baseline:  e.baseline,
 		Result:    result,
 	}
-	if !stateauth.Recovered(outcome) {
-		stopErr := fmt.Errorf("research: recovery %q did not restore the baseline state for scope %s — exploration STOPS", ref.RegistryKey, e.scope.Hash())
-		e.stopLocked(stopErr)
-		return outcome, stopErr
+	if stateauth.Recovered(outcome) {
+		e.current = result
+		e.currentRaw = resultRaw
 	}
-
-	e.current = result
-	e.currentRaw = resultRaw
-	e.visits[result.StateFingerprintHash()]++
 	return outcome, nil
 }
 
@@ -339,8 +416,8 @@ func (e *Explorer) stopLocked(err error) {
 // transition (which costs the given number of requests) would exceed a
 // bound that is knowable in advance (MaxTransitions, MaxDepth, MaxRequests,
 // MaxWallTime). MaxStates and MaxVisitsPerState depend on the state actually
-// observed AFTER acting, so they are checked as post-checks in Step/Recover
-// instead — this function never checks them.
+// observed AFTER acting, so they are checked as post-checks in Step instead
+// — this function never checks them.
 func (e *Explorer) preflightBudgetLocked(requestCost int) error {
 	if e.transitions+1 > e.budget.MaxTransitions {
 		return fmt.Errorf("%w: MaxTransitions", ErrBudgetExceeded)

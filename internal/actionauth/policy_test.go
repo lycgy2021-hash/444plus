@@ -1,33 +1,113 @@
 package actionauth
 
-import "testing"
+import (
+	"testing"
 
-func TestBindRequiresRegisteredActionAndNonEmptyHashes(t *testing.T) {
-	reg := NewRegistry(RegisteredAction{Key: "http-probe", Reversible: true})
-	policy := NewActionPolicy(reg, NewRecoveryRegistry("reset-session"))
+	"gopoc/internal/stateauth"
+)
 
-	a, ok := policy.Bind(ActionID{RegistryKey: "http-probe"}, "scope-1", "state-1")
+// fp is a tiny helper for building a Fingerprint via the only path this
+// package can: stateauth.RawLenProjector, which is the real (if minimal)
+// production projector. actionauth cannot construct a stateauth.Fingerprint
+// directly — proving, from actionauth's own tests, that Select really is
+// state-dependent on something actionauth itself has no authority over.
+func fp(t *testing.T, scopeHash string, raw []byte) stateauth.Fingerprint {
+	t.Helper()
+	f, err := stateauth.RawLenProjector{}.Project(stateauth.StateArtifact{ScopeHash: scopeHash, Raw: raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func TestSelectPicksApplicableActionDeterministicallyBySortedKey(t *testing.T) {
+	reg := NewRegistry(
+		Registration{Action: RegisteredAction{Key: "zeta"}, Supports: func(stateauth.Fingerprint) bool { return true }},
+		Registration{Action: RegisteredAction{Key: "alpha"}, Supports: func(stateauth.Fingerprint) bool { return true }},
+	)
+	policy := NewActionPolicy(reg, NewRecoveryRegistry("reset"))
+	state := fp(t, "scope-1", []byte("AAAA"))
+
+	a, ok := policy.Select("scope-1", state, nil)
 	if !ok {
-		t.Fatal("binding a registered action with non-empty scope/state must succeed")
+		t.Fatal("Select must find an applicable action when at least one Supports the state")
 	}
-	if a.ID() != (ActionID{RegistryKey: "http-probe"}) {
-		t.Fatalf("ID() = %+v, want the bound ActionID", a.ID())
+	if a.ID().RegistryKey != "alpha" {
+		t.Fatalf("Select() picked %q, want the lexically-first applicable key \"alpha\" — selection must be deterministic, not map-iteration order", a.ID().RegistryKey)
 	}
-	if !a.ValidFor("scope-1", "state-1") {
-		t.Fatal("a freshly bound action must validate for the exact scope/state it was bound with")
+	if a.ID().VariantID != "" {
+		t.Fatalf("Select() must never populate VariantID in v1, got %q", a.ID().VariantID)
 	}
-	if a.ValidFor("scope-2", "state-1") || a.ValidFor("scope-1", "state-2") {
-		t.Fatal("a bound action must NOT validate for a different scope or state")
+	if !a.ValidFor("scope-1", state.StateFingerprintHash()) {
+		t.Fatal("a selected action must validate for exactly the scope/state Select was called with")
 	}
 
-	if _, ok := policy.Bind(ActionID{RegistryKey: "unregistered-action"}, "scope-1", "state-1"); ok {
-		t.Fatal("binding an unregistered action must fail")
+	// Calling Select again with the same inputs must select the SAME action —
+	// this is the whole point: (scope, state, registry, exclude) always
+	// determines the same outcome.
+	again, ok := policy.Select("scope-1", state, nil)
+	if !ok || again.ID().RegistryKey != "alpha" {
+		t.Fatal("Select must be deterministic across repeated calls with identical inputs")
 	}
-	if _, ok := policy.Bind(ActionID{RegistryKey: "http-probe"}, "", "state-1"); ok {
-		t.Fatal("binding with an empty scope hash must fail")
+}
+
+func TestSelectSkipsUnsupportedAndExcludedActions(t *testing.T) {
+	supportsNothing := func(stateauth.Fingerprint) bool { return false }
+	reg := NewRegistry(
+		Registration{Action: RegisteredAction{Key: "unsupported"}, Supports: supportsNothing},
+		Registration{Action: RegisteredAction{Key: "alpha"}, Supports: func(stateauth.Fingerprint) bool { return true }},
+		Registration{Action: RegisteredAction{Key: "beta"}, Supports: func(stateauth.Fingerprint) bool { return true }},
+	)
+	policy := NewActionPolicy(reg, NewRecoveryRegistry())
+	state := fp(t, "scope-1", []byte("AAAA"))
+
+	// "unsupported" never applies, regardless of exclude.
+	a, ok := policy.Select("scope-1", state, nil)
+	if !ok || a.ID().RegistryKey != "alpha" {
+		t.Fatalf("expected alpha (the first applicable, non-excluded key), got %+v ok=%v", a.ID(), ok)
 	}
-	if _, ok := policy.Bind(ActionID{RegistryKey: "http-probe"}, "scope-1", ""); ok {
-		t.Fatal("binding with an empty state hash must fail")
+
+	// Excluding "alpha" (e.g. already tried from this exact state) must fall
+	// through to the next applicable candidate, "beta".
+	b, ok := policy.Select("scope-1", state, map[string]bool{"alpha": true})
+	if !ok || b.ID().RegistryKey != "beta" {
+		t.Fatalf("expected beta once alpha is excluded, got %+v ok=%v", b.ID(), ok)
+	}
+
+	// Excluding everything applicable leaves nothing to select.
+	if _, ok := policy.Select("scope-1", state, map[string]bool{"alpha": true, "beta": true}); ok {
+		t.Fatal("Select must fail once every applicable action has been excluded")
+	}
+}
+
+func TestSelectRequiresNonEmptyScopeAndValidFingerprint(t *testing.T) {
+	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "alpha"}, Supports: func(stateauth.Fingerprint) bool { return true }})
+	policy := NewActionPolicy(reg, NewRecoveryRegistry())
+
+	if _, ok := policy.Select("", fp(t, "scope-1", []byte("A")), nil); ok {
+		t.Fatal("Select with an empty scope hash must fail")
+	}
+	// A zero-value Fingerprint has an empty StateFingerprintHash.
+	if _, ok := policy.Select("scope-1", stateauth.Fingerprint{}, nil); ok {
+		t.Fatal("Select with a zero-value (never-projected) Fingerprint must fail")
+	}
+}
+
+func TestSelectNeverConsultsAnAdvisorySuggestion(t *testing.T) {
+	// This test exists to document, not merely assert, v1's cleanest design
+	// choice: Select's signature has no parameter through which an
+	// AI-authored suggestion (or anything resembling one) could be passed at
+	// all — there is nothing to wire in, and nothing to accidentally start
+	// consulting later without a deliberate signature change reviewers would
+	// have to notice.
+	reg := NewRegistry(
+		Registration{Action: RegisteredAction{Key: "safe-action"}, Supports: func(stateauth.Fingerprint) bool { return true }},
+	)
+	policy := NewActionPolicy(reg, NewRecoveryRegistry())
+	state := fp(t, "scope-1", []byte("A"))
+	a, ok := policy.Select("scope-1", state, nil)
+	if !ok || a.ID().RegistryKey != "safe-action" {
+		t.Fatalf("Select must pick the one applicable registered action regardless of any external suggestion, got %+v ok=%v", a.ID(), ok)
 	}
 }
 
@@ -62,31 +142,43 @@ func TestBindRecoveryRequiresRegisteredRecoveryAndNonEmptyHashes(t *testing.T) {
 	}
 }
 
-func TestNilAndZeroValuePolicyNeverBind(t *testing.T) {
+func TestNilAndZeroValuePolicyNeverSelectOrBind(t *testing.T) {
 	var nilPolicy *ActionPolicy
-	if _, ok := nilPolicy.Bind(ActionID{RegistryKey: "anything"}, "s", "f"); ok {
-		t.Fatal("a nil *ActionPolicy must never bind")
+	if _, ok := nilPolicy.Select("scope-1", fp(t, "scope-1", []byte("A")), nil); ok {
+		t.Fatal("a nil *ActionPolicy must never select an action")
 	}
 	if _, ok := nilPolicy.BindRecovery(RecoveryPlanRef{RegistryKey: "anything"}, "s", "f"); ok {
 		t.Fatal("a nil *ActionPolicy must never bind a recovery")
 	}
 
 	empty := NewActionPolicy(nil, nil)
-	if _, ok := empty.Bind(ActionID{RegistryKey: "anything"}, "s", "f"); ok {
-		t.Fatal("a policy with a nil registry must never bind")
+	if _, ok := empty.Select("scope-1", fp(t, "scope-1", []byte("A")), nil); ok {
+		t.Fatal("a policy with a nil registry must never select an action")
 	}
 	if _, ok := empty.BindRecovery(RecoveryPlanRef{RegistryKey: "anything"}, "s", "f"); ok {
 		t.Fatal("a policy with a nil recovery registry must never bind")
 	}
 }
 
-func TestRegistryHasNoWayToAddAfterConstruction(t *testing.T) {
-	reg := NewRegistry(RegisteredAction{Key: "http-probe"})
+func TestRegistrationWithNilSupportsFailsClosed(t *testing.T) {
+	// A Registration given with no Supports predicate must support NOTHING —
+	// fail-closed — never silently default to "always applicable".
+	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "no-predicate"}})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
+	if _, ok := policy.Select("scope-1", fp(t, "scope-1", []byte("A")), nil); ok {
+		t.Fatal("a Registration with a nil Supports must never be selected")
+	}
+}
+
+func TestRegistryHasNoWayToAddAfterConstruction(t *testing.T) {
+	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "http-probe"}, Supports: func(stateauth.Fingerprint) bool { return true }})
+	policy := NewActionPolicy(reg, NewRecoveryRegistry())
+	state := fp(t, "scope-1", []byte("A"))
 	// There is no exported method on Registry that adds an entry — this test
 	// documents that absence by construction: only http-probe, given at
-	// NewRegistry time, was ever registered.
-	if _, ok := policy.Bind(ActionID{RegistryKey: "http-probe-v2"}, "scope-1", "state-1"); ok {
-		t.Fatal("an action never passed to NewRegistry must never bind, at any point in this registry's lifetime")
+	// NewRegistry time, was ever registered, and excluding it must leave
+	// nothing else to select, ever.
+	if _, ok := policy.Select("scope-1", state, map[string]bool{"http-probe": true}); ok {
+		t.Fatal("an action never passed to NewRegistry must never be selectable, at any point in this registry's lifetime")
 	}
 }

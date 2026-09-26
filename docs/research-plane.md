@@ -418,22 +418,45 @@ the guarantees hold under test:
   contract always reserved for it (`ActionPolicy` in `actionauth`, a concrete
   `StateProjector` in `stateauth`) — it changes no data shape above.
   - **The locked v1 loop:** `Baseline` (`Collector` → `StateArtifact` →
-    `StateProjector` → `Fingerprint`) once; then any number of `Step(id)` calls
-    (`ActionPolicy.Bind(id, scope, current)` → `BoundAction` → re-verify
+    `StateProjector` → `Fingerprint`) once; then any number of `Step()` calls
+    (`ActionPolicy.Select(scope, current, tried)` → `BoundAction` → re-verify
     `ValidFor` → `Executor.Execute` → collect/project again → `StateTransition`);
-    then `Recover(ref)` (`ActionPolicy.BindRecovery` → `BoundRecovery` →
+    then `Recover()` (`ActionPolicy.BindRecovery` against this Explorer's ONE
+    fixed, construction-time `RecoveryPlanRef` → `BoundRecovery` →
     `Executor.ExecuteRecovery` → collect/project → `stateauth.Recovered` →
     true allows continuing, false is a HARD, PERMANENT STOP).
+  - **Regression found and fixed after the first cut: `Step` took a
+    caller-supplied `actionauth.ActionID` and asked the policy "is this
+    registered?"** That reopened the exact bypass S10 exists to close, one
+    level down: whoever supplies the `ActionID` — a human, or indirectly an AI
+    `ActionSuggestion` — would be choosing WHICH action runs, with the
+    registry doing nothing but rubber-stamp membership. That is still "AI
+    action selection" even though the AI never writes a request. Fixed by
+    removing the parameter entirely: `Step()` takes no action-identifying
+    input at all. `ActionPolicy.Bind(id, ...)` was replaced with
+    `ActionPolicy.Select(scopeHash, fingerprint, exclude)`, which is the ONLY
+    way an action gets chosen: it walks the registry's own COMPILE-TIME
+    `Registration{Action, Supports func(stateauth.Fingerprint) bool}`
+    entries — `Supports` is Go code written by whoever builds the registry,
+    never data, never something an AI/candidate can supply — collects the
+    RegistryKeys that are both applicable (`Supports(fp)==true`) and not
+    already in `exclude`, sorts them, and binds the first one. "Registered !=
+    Allowed" is now a real, enforced relationship, not a slogan: being in the
+    registry only means the key exists; `Supports` is what makes it
+    APPLICABLE to a specific state. `exclude` is FACTS Explorer supplies
+    (which action keys have already been tried from this exact
+    `StateFingerprintHash`) — never a decision; v1 deliberately does not wire
+    any AI-authored suggestion into `Select` at all, not even as an advisory
+    tie-breaker. `TestExplorerStepSelectionIsDeterministicNotCallerChosen`
+    proves two independently constructed Explorers, given identical
+    scope/collector/policy, select the identical action — the choice comes
+    entirely from (scope, state, registry), never from a caller.
   - **`Explorer` holds no authority of its own — it is pure orchestration.** It
     never decides what the state IS (delegated to the injected
-    `stateauth.StateProjector`), never decides what action MAY run (delegated
-    to the injected `*actionauth.ActionPolicy`), and never decides whether a
-    transition is WORTH a hypothesis (left to a future producer against an
-    authoritative `ExpectationSource` — not implemented here). An `ActionID`
-    passed to `Step` may come from anywhere, including an AI
-    `ActionSuggestion` — exactly as advisory as the frozen contract requires;
-    only `ActionPolicy.Bind`, called against the CURRENT scope/state, can turn
-    it into a credential.
+    `stateauth.StateProjector`), never decides WHICH action MAY run (delegated
+    entirely to `ActionPolicy.Select`), and never decides whether a transition
+    is WORTH a hypothesis (left to a future producer against an authoritative
+    `ExpectationSource` — not implemented here).
   - **Serial, single-scope, single-session (boundary 12):** `Explorer` holds a
     `sync.Mutex` across the whole of `Step`/`Recover`, so at most one action is
     ever in flight — proved, not just documented, by
@@ -443,14 +466,27 @@ the guarantees hold under test:
     `action.ValidFor(scope, state)` immediately before calling `Executor.Execute`,
     in addition to (never instead of) whatever check a real `Executor`
     implementation must do itself.
-  - **`ExplorationBudget` is enforced, not just validated.** `MaxTransitions`/
-    `MaxDepth`/`MaxRequests`/`MaxWallTime` are checked BEFORE any side effect
-    (a bind or budget failure never calls the `Executor`); `MaxStates`/
-    `MaxVisitsPerState` are checked AFTER an observed transition (the step that
-    first exceeds one still returns its own result, but stops every step after
-    it). `MaxBranching` has no runtime check yet — v1 never branches at all (one
-    caller-supplied action per `Step`), so there is nothing for it to bound yet;
-    it stays reserved for a future multi-branch Explorer.
+  - **Regression found and fixed in the same audit round: a post-action budget
+    violation was treated as an ordinary stopping point, leaving Explorer
+    sitting in the over-budget state.** If `MaxStates=10` and the 11th state
+    is what a step actually produces, exploration has already gone one state
+    too far — that observed transition is kept (it is real evidence), but the
+    state it landed in must never become a point to continue from. Fixed:
+    `MaxTransitions`/`MaxDepth`/`MaxRequests`/`MaxWallTime` are still checked
+    BEFORE any side effect (a preflight failure never calls the `Executor`),
+    but `MaxStates`/`MaxVisitsPerState` — which depend on the state actually
+    observed, so they can only be known after — now trigger MANDATORY recovery
+    the instant they are exceeded: `Step` immediately runs this Explorer's
+    fixed recovery ref (bypassing the request-budget preflight, since an
+    already-exhausted budget must never block the one safety mechanism meant
+    to run exactly when the budget is exhausted), then stops permanently
+    regardless of whether that recovery verified — never a continuation from a
+    state already known to exceed the budget the moment it was observed.
+    `TestExplorerMaxVisitsPerStateTriggersMandatoryRecoveryThenStops` proves
+    the executor actually recorded a recovery call, not merely that `Stopped()`
+    became true. `MaxBranching` still has no runtime check — v1 never branches
+    at all (`Select` always picks at most one action), so there is nothing for
+    it to bound yet; it stays reserved for a future multi-branch Explorer.
   - **Recovery failure is a permanent stop, proved by test:**
     `TestExplorerRecoverySuccessAndFailure/failure_stops_exploration` drives a
     `Recover` call whose re-collected state does not match the baseline and
@@ -458,15 +494,20 @@ the guarantees hold under test:
     `ErrExplorerStopped`.
   - **`RawLenProjector`** is the first concrete `StateProjector` — deliberately
     minimal (one fact, the raw byte length), proving the contract end-to-end
-    without claiming to model any real protocol's state. A real
-    protocol-specific projector is future work and must live inside
-    `internal/stateauth` for the same reason `RawLenProjector` does.
+    without claiming to model any real protocol's state. It is a fixture/test
+    projector, not meant to carry real security-research weight (two
+    responses of identical length can differ completely, e.g. an
+    `admin=false`/`admin=true` flip) — a real protocol-specific projector
+    (status, content-type, stable headers, auth state, body structural shape)
+    is future work and must live inside `internal/stateauth` for the same
+    reason `RawLenProjector` does.
   - **v1 explicitly does NOT do:** concurrent actions, multiple sessions, AI
-    action selection, AI-generated network requests, dynamic registry / hot
-    reload, irreversible actions, exploration without a recovery check,
-    "different state = vulnerability", automatic exploitability judgment, or
-    unlimited depth/budget. None of these have any code path in
-    `research/explorer.go` today.
+    action selection (now closed at the API level, not just by convention —
+    `Step` has no parameter to carry one), AI-generated network requests,
+    dynamic registry / hot reload, irreversible actions, exploration without a
+    recovery check, "different state = vulnerability", automatic
+    exploitability judgment, or unlimited depth/budget. None of these have any
+    code path in `research/explorer.go` today.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
 

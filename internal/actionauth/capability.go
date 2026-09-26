@@ -1,8 +1,9 @@
-// Package actionauth is the S10 CAPABILITY BOUNDARY — still contract only. No
-// ActionPolicy, no registry, and no execution logic exists here or anywhere
-// else yet. It exists as its OWN PACKAGE, separate from research, specifically
-// so the authority boundary is enforced by the Go compiler across a real
-// package boundary, not merely by an unexported field within one package.
+// Package actionauth is the S10 CAPABILITY BOUNDARY. It now holds a real
+// ActionPolicy and Registry (policy.go) — the S10 data CONTRACT is frozen,
+// but Explorer v1 is real orchestration built on top of it. It exists as its
+// OWN PACKAGE, separate from research, specifically so the authority
+// boundary is enforced by the Go compiler across a real package boundary,
+// not merely by an unexported field within one package.
 //
 // The gap this closes: an unexported field on a type living IN package research
 // only stops OTHER packages from forging it — it does nothing to stop code
@@ -38,15 +39,17 @@ type RegisteredAction struct {
 	Reversible bool
 }
 
-// BoundAction is the ONLY value a future Executor may run. Its identity is
-// unexported and NO CONSTRUCTOR EXISTS YET anywhere, including in this
-// package — so only a zero-value (inert, resolves to nothing) BoundAction can
-// be produced today, by anyone, including code in package research. The
-// future ActionPolicy, implemented IN THIS PACKAGE, is the sole place a
-// constructor will ever be added: it alone selects a BoundAction from a
-// registry's AllowedActions(scope, state) for the current scope/state, taking
-// an ActionID (or a research.ActionSuggestion carrying one) at most as
-// advisory input to weigh — never as the value it binds.
+// BoundAction is the ONLY value an Executor may run. Its identity is
+// unexported, and the only way to produce a non-zero one is
+// ActionPolicy.Select (policy.go) — no other function in this package, and
+// nothing in any other package, can construct one with a real identity. A
+// caller (research.Explorer) supplies Select only the current scope, the
+// current authoritative stateauth.Fingerprint, and which action keys have
+// already been tried from that exact state — never the action identity
+// itself. An ActionID (or a research.ActionSuggestion carrying one) is
+// therefore NEVER the value that gets bound: Select alone decides which
+// registered, applicable action runs, deterministically, from the
+// registry's own compiled-in Supports predicates — see Registration's doc.
 //
 // Critically, a BoundAction is not JUST an authorized ActionID: it also binds
 // the scope and state fingerprint it was authorized FOR. Without this, a
