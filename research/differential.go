@@ -73,6 +73,57 @@ const (
 	ExpectBoundaryMonotonic ExpectedRelation = "boundary_monotonic"
 )
 
+// ExpectationSourceKind names WHO may author an Expectation/Expected — the
+// authority boundary for "what counts as correct behavior". This closes an
+// indirect bypass: AI never touches Verdict/State, but if it could author what a
+// protocol "should" do (via ExpectedRelation/Expected), it would control what
+// counts as an anomaly just as effectively as setting a verdict — a model could
+// say "this should be accepted" and any observed rejection would then
+// auto-produce a candidate, without ever writing "confirmed".
+//
+// This is a CLOSED WHITELIST, not a blacklist of bad values: only these four
+// kinds are ever authoritative. That structurally rejects "ai", "llm",
+// "proposal", "candidate_text" — or ANY other kind someone invents later — by
+// construction, not by needing to remember to add them to a deny-list.
+type ExpectationSourceKind string
+
+const (
+	// ExpectationSourceSpec: a documented protocol/product specification (RFC
+	// section, vendor doc, API contract).
+	ExpectationSourceSpec ExpectationSourceKind = "spec"
+	// ExpectationSourceDeterministicRule: a compile-time rule in this codebase
+	// (e.g. "HTTP normalization must be idempotent").
+	ExpectationSourceDeterministicRule ExpectationSourceKind = "deterministic_rule"
+	// ExpectationSourceHumanConfig: an operator/researcher-authored configuration
+	// (e.g. "this deployment's declared upload limit is 1024 bytes").
+	ExpectationSourceHumanConfig ExpectationSourceKind = "human_config"
+	// ExpectationSourceDetectionFact: an already-verified fact from the frozen
+	// detection plane (e.g. a checker's Evidence establishing a documented
+	// version boundary) — NOT a research Candidate, NOT AI output, NOT a
+	// Proposal. Only settled, deterministic detection evidence qualifies.
+	ExpectationSourceDetectionFact ExpectationSourceKind = "detection_fact"
+)
+
+// authoritativeExpectationSources is the closed set. Anything not in it —
+// including "ai", "llm", "proposal", "candidate_text", an empty Kind, or a typo —
+// is rejected and the case is never judged (see DifferentialCase.validate).
+var authoritativeExpectationSources = map[ExpectationSourceKind]bool{
+	ExpectationSourceSpec:              true,
+	ExpectationSourceDeterministicRule: true,
+	ExpectationSourceHumanConfig:       true,
+	ExpectationSourceDetectionFact:     true,
+}
+
+// ExpectationSource records who authored a case's Expectation/Expected values.
+// ID is a free-form pointer into that source (e.g. a spec section, a config
+// path, a detection finding id) — never a candidate id, never model output.
+type ExpectationSource struct {
+	Kind ExpectationSourceKind `json:"kind"`
+	ID   string                `json:"id,omitempty"`
+}
+
+func (s ExpectationSource) authoritative() bool { return authoritativeExpectationSources[s.Kind] }
+
 // DifferentialObservation is one variant's observed response, plus (for a
 // boundary variant) what SHOULD have happened per the documented contract.
 type DifferentialObservation struct {
@@ -97,15 +148,70 @@ type DifferentialObservation struct {
 }
 
 // DifferentialCase groups variant responses to one semantic request under one
-// documented Expectation. BaselineID names the Variant to compare against
-// (falling back to Kind==baseline, then the first element, for convenience).
+// documented Expectation, AUTHORED BY ExpectationSource. BaselineID names the
+// Variant to compare against (falling back to Kind==baseline, then the first
+// element, for convenience).
 type DifferentialCase struct {
-	ID          string                    `json:"id,omitempty"`
-	Target      string                    `json:"target"`
-	Intent      string                    `json:"intent"`
-	BaselineID  string                    `json:"baseline_id,omitempty"`
-	Expectation ExpectedRelation          `json:"expectation,omitempty"`
-	Variants    []DifferentialObservation `json:"variants"`
+	ID          string           `json:"id,omitempty"`
+	Target      string           `json:"target"`
+	Intent      string           `json:"intent"`
+	BaselineID  string           `json:"baseline_id,omitempty"`
+	Expectation ExpectedRelation `json:"expectation,omitempty"`
+	// ExpectationSource identifies who authored Expectation/Expected. Judgment
+	// refuses to run at all unless this is authoritative (see validate) — this is
+	// the structural guard against AI (or any unverified producer) indirectly
+	// defining what counts as an anomaly.
+	ExpectationSource ExpectationSource         `json:"expectation_source,omitempty"`
+	Variants          []DifferentialObservation `json:"variants"`
+}
+
+// validate reports whether c is well-formed enough to judge AT ALL. A malformed
+// or under-authorized case is never judged — it produces zero anomalies, exactly
+// like a case with no declared Expectation. This guards S9 against bad input (or
+// a bypassed authority) manufacturing a candidate; it is not a statement about
+// the target being probed.
+func (c DifferentialCase) validate() bool {
+	if c.Expectation == "" || !c.ExpectationSource.authoritative() {
+		return false
+	}
+	if len(c.Variants) < 2 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, v := range c.Variants {
+		if v.Variant == "" || seen[v.Variant] {
+			return false // empty or duplicate variant name — no stable identity
+		}
+		seen[v.Variant] = true
+	}
+	switch c.Expectation {
+	case ExpectEquivalent, ExpectNormalizeEqual:
+		if c.BaselineID != "" && !seen[c.BaselineID] {
+			return false // declared baseline does not exist among the variants
+		}
+		if _, ok := baselineOf(c); !ok {
+			return false
+		}
+		for _, v := range c.Variants {
+			if v.Expected != nil {
+				return false // Expected belongs only to boundary_monotonic — never mix contracts
+			}
+		}
+	case ExpectBoundaryMonotonic:
+		hasComparable := false
+		for _, v := range c.Variants {
+			if v.Kind == VariantBoundary && v.Expected != nil {
+				hasComparable = true
+				break
+			}
+		}
+		if !hasComparable {
+			return false // no boundary variant carries a comparable declared outcome
+		}
+	default:
+		return false
+	}
+	return true
 }
 
 // Anomaly types (candidate_type values).
@@ -398,6 +504,9 @@ func baselineOf(c DifferentialCase) (DifferentialObservation, bool) {
 // the observations themselves, but only "differs in a way that violates the
 // case's own documented contract" produces an anomaly.
 func (p *DifferentialProducer) Analyze(c DifferentialCase) []DiffAnomaly {
+	if !c.validate() {
+		return nil
+	}
 	switch c.Expectation {
 	case ExpectEquivalent, ExpectNormalizeEqual:
 		base, ok := baselineOf(c)
@@ -546,11 +655,13 @@ func (p *DifferentialProducer) Produce(c DifferentialCase) []*Candidate {
 		rationale := fmt.Sprintf("Differential on %s intent=%q expectation=%s: %s", c.Target, c.Intent, c.Expectation, strings.Join(details, "; "))
 		cand := NewHypothesis(p.newID(), typ, title, c.Target, rationale, origin, []string{"baseline_response", "variant_response"}, prov)
 		cand.Refs = map[string]string{
-			"intent":             c.Intent,
-			"anomaly_type":       typ,
-			"variants":           strings.Join(variants, ","),
-			"case_artifact_hash": artifactHash,
-			"comparison_hash":    cmpHash,
+			"intent":                  c.Intent,
+			"anomaly_type":            typ,
+			"variants":                strings.Join(variants, ","),
+			"case_artifact_hash":      artifactHash,
+			"comparison_hash":         cmpHash,
+			"expectation_source_kind": string(c.ExpectationSource.Kind),
+			"expectation_source_id":   c.ExpectationSource.ID,
 		}
 		candidates = append(candidates, cand)
 	}
@@ -564,7 +675,8 @@ func (p *DifferentialProducer) Produce(c DifferentialCase) []*Candidate {
 // information (a Date header value change still changes this hash).
 func caseArtifactHash(c DifferentialCase) string {
 	var b strings.Builder
-	b.WriteString("id=" + c.ID + "\nintent=" + c.Intent + "\nbaseline_id=" + c.BaselineID + "\nexpectation=" + string(c.Expectation) + "\n")
+	b.WriteString("id=" + c.ID + "\nintent=" + c.Intent + "\nbaseline_id=" + c.BaselineID + "\nexpectation=" + string(c.Expectation) +
+		"\nexpectation_source=" + string(c.ExpectationSource.Kind) + ":" + c.ExpectationSource.ID + "\n")
 	for i, v := range c.Variants {
 		b.WriteString(fmt.Sprintf("variant[%d]=%s\n", i, losslessObservation(v)))
 	}
@@ -601,7 +713,8 @@ func losslessObservation(o DifferentialObservation) string {
 // stable-header-key-set otherwise, body compared as a shape, variants sorted.
 // This is recorded in Refs — never in Provenance.RawInputHash.
 func comparisonHash(c DifferentialCase) string {
-	lines := []string{"target=" + c.Target, "intent=" + c.Intent, "expectation=" + string(c.Expectation)}
+	lines := []string{"target=" + c.Target, "intent=" + c.Intent, "expectation=" + string(c.Expectation),
+		"expectation_source=" + string(c.ExpectationSource.Kind) + ":" + c.ExpectationSource.ID}
 	rows := make([]string, 0, len(c.Variants))
 	for _, v := range c.Variants {
 		acc, exp := "?", "?"

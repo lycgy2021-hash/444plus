@@ -1,4 +1,4 @@
-# AI Research Plane (S1–S5)
+# AI Research Plane (S1–S9 frozen; S10 contract-only)
 
 This is an **additive** plane beside the deterministic detection plane, not a
 rewrite of it. The detection base — `--discover`, fingerprint, assessment cache,
@@ -206,6 +206,23 @@ case declared should hold is.**
   live probing in the producer (collection is deliberately deferred to a future,
   registered-template collector — never an LLM choosing arbitrary URLs/requests
   for the collector to send, mirroring the S5 Validator principle).
+- **Judgment authority is closed, not just the judgment logic.** `Expectation`
+  and `Expected` are only usable when the case declares an `ExpectationSource`
+  from a fixed whitelist — `spec`, `deterministic_rule`, `human_config`,
+  `detection_fact` (an already-verified fact from the frozen detection plane, not
+  a research Candidate). This closes an INDIRECT authority bypass: AI never
+  writes `Verdict`/`State`, but if it could author what a protocol "should" do,
+  it would control what counts as an anomaly just as effectively — "this should
+  be `accepted=true`" from a model, paired with an observed rejection, would
+  auto-produce a candidate without the model ever touching a verdict field. Because
+  this is a whitelist (not a blacklist), `"ai"`, `"llm"`, `"proposal"`,
+  `"candidate_text"`, or any kind nobody thought to name are rejected by
+  construction; an empty `ExpectationSource` is rejected the same way a missing
+  `Expectation` is. `DifferentialCase.validate()` also refuses to judge a
+  malformed case — fewer than 2 variants, duplicate/empty variant names, a
+  `BaselineID` that doesn't exist, `Expected` set on an equivalence-style case
+  (contract mixing), or a boundary case with no variant carrying a comparable
+  declared outcome — so bad input can't manufacture a candidate either.
 
 Differential candidates flow into the same spine and stay `hypothesis` until a
 validator reproduces the difference safely.
@@ -242,14 +259,22 @@ the guarantees hold under test:
   GroupArtifactHash` (raw producer artifact, not the derived identity),
   `MembersDigest` full-set commitment, structured refs, conservative classifier).
   No AI fuzz-input generation, no auto-exploitability. Contract frozen.
-- **S9 (differential engine): v1 landed & audited** (deterministic
-  `DifferentialProducer`; judged only against a declared `Expectation`, JSON
-  structural body comparison, security-header value comparison,
+- **S9 (differential engine): frozen.** Deterministic `DifferentialProducer`;
+  judged only against a declared `Expectation` from a whitelisted
+  `ExpectationSource` (`spec`/`deterministic_rule`/`human_config`/
+  `detection_fact` — AI/proposal/candidate-text kinds structurally rejected); JSON
+  structural body comparison; security-header value comparison;
   `RawInputHash = caseArtifactHash` (lossless) distinct from `comparisonHash`
-  (denoised)). Contract frozen.
-- **Deferred:** `S10` state-machine explorer (after S9), then `S7` large-scale
-  source audit — the local-model signal-to-noise on a whole repo is lower than the
-  diff/fuzz/differential sources already built.
+  (denoised); malformed-case guards.
+- **S10 (state-machine explorer): DESIGN CONTRACT ONLY** (`research/state_machine.go`)
+  — `StateFingerprint`, `ReadOnlyAction`, `StateTransition`, `ExplorationBudget`,
+  `RecoveryPlan`. No explorer, no execution logic, no `Origin` kind yet.
+  Deliberately stopped here for review before any implementation: S10 is the step
+  most likely to introduce state explosion, action-composition risk, and
+  probe-budget/side-effect problems, so the contract is frozen first, exactly as
+  S6/S8/S9 were audited before their code was trusted.
+- **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
+  a whole repo is lower than the diff/fuzz/differential sources already built.
 
 Three independent unknown-issue sources now feed the plane: **patch difference
 (S6), crash behavior (S8), runtime differential (S9)** — all deterministic
