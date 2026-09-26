@@ -1000,7 +1000,42 @@ the guarantees hold under test:
     against ever runs — E6 has no code path that looks at an observed
     transition and invents what "should" have happened; that would be
     hindsight bias wearing a detection hat.
-  - **`S10-E6 = FROZEN`** after this second audit round. 24-item freeze-gate
+  - **Fourth regression, found on a THIRD audit round, closing the last gap
+    before freeze: `NewTransitionRuleRegistry` accepted two DIFFERENT rules
+    registered for the SAME `(ActionID, ProjectorID)` pair, silently letting
+    the later one win via ordinary map assignment.** Which rule "won" for
+    that pair would then depend on registration order — a slice-order/
+    map-iteration-order dependency, never a deterministic authority — which
+    would have made `lookup`'s "exactly one match" a convention callers were
+    expected to follow, not a guarantee the registry itself enforced. Fixed:
+    `NewTransitionRuleRegistry` now returns `(*TransitionRuleRegistry,
+    error)` and REJECTS construction outright on: two rules sharing one
+    `(ActionID, ProjectorID)` key; an empty `RuleID`; a `RuleID` reused by
+    more than one rule; a non-authoritative `ExpectationSource`; or an
+    invalid `TransitionExpectation` (an unknown `Kind`, or an empty `Fact`
+    for a `Kind` that requires one) — via a new `TransitionExpectation.valid()`
+    helper, also now reused by `resolvedTransitionCase.validate()` itself.
+    A *successfully built* `*TransitionRuleRegistry` is therefore itself the
+    proof that `(ActionID, ProjectorID) -> exactly one rule` holds for every
+    entry it contains, not something `Produce`/`Analyze` have to hope is
+    true. `validate()` still independently re-checks `ExpectationSource`
+    authority and `BoundAction.ValidFor` at judgment time regardless
+    (`TestE6ValidateItselfRejectsNonAuthoritativeSource` isolates that
+    defense-in-depth layer directly, since a non-authoritative source can no
+    longer reach it through the registry's own public constructor).
+    `TestE6DuplicateActionProjectorPairRejectedAtRegistration`,
+    `TestE6DuplicateRuleIDRejectedAtRegistration`, and
+    `TestE6EmptyRuleIDRejectedAtRegistration` pin the three registration-time
+    rejections; `TestE6RuleRegistryUnaffectedByMutatingCallersSliceAfterConstruction`
+    proves a built registry is independent of the slice it was built from
+    (every `TransitionRule` is range-copied by value into the registry's own
+    map — it holds no pointers or slices, so nothing about it can alias the
+    caller's original values) by mutating the caller's slice element AFTER
+    construction and confirming the registry still resolves against the
+    ORIGINAL rule. `Refs["rule_id"]` (recorded since the second audit round)
+    now doubles as a genuinely unambiguous audit handle: a successfully
+    built registry guarantees no two rules ever share one.
+  - **`S10-E6 = FROZEN`** after this third audit round. 29-item freeze-gate
     battery (`research/state_machine_producer_test.go`), every fixture built
     through the REAL authority packages (`stateauth.HTTPFixtureRegistry()`/
     `stateauth.FixtureRegistry()` for `Fingerprint`, `actionauth.ActionPolicy.
@@ -1008,31 +1043,36 @@ the guarantees hold under test:
     can be constructed with a real identity from outside its own package):
     no rule registered → 0 candidates (covers both "no `ExpectationSource`"
     and "differing states with no declared expectation"); an
-    `ai`/`llm`/`candidate`/`proposal`/`fuzz`/`diff`/`state_machine` source,
-    even if registered → reject; a rule registered for one action never
-    applies to another action's transition; a zero-value `BoundAction`,
-    even with a rule registered for its zero `ActionID` → reject;
-    `state_unchanged` violated → exactly 1 hypothesis, satisfied → 0;
-    `fact_unchanged` with an absent fact → `insufficient_evidence`;
-    `fact_equals` satisfied → 0, violated → 1; `fact_transition` A→B as
-    declared → 0 (`satisfied`), A→C → 1 (`violated`), precondition never
-    held → 0 (`not_applicable`), before/after fact absent → 0
-    (`insufficient_evidence`, distinct from `not_applicable`); a
-    scope-inconsistent transition → reject; produced `Candidate.State` is
-    always `Hypothesis`; `Provenance().RawInputHash` equals the resolved case
-    hash and never equals `TransitionArtifactHash` alone; the case hash is
-    stable across repeated calls; and the case hash independently changes
-    when `BeforeFingerprint`, `AfterFingerprint`, the action identity,
-    `ScopeHash`, `Expectation`, or `ExpectationSource.ID` alone changes. All
-    24 pass.
+    `ai`/`llm`/`candidate`/`proposal`/`fuzz`/`diff`/`state_machine` source
+    rejected AT REGISTRATION (plus `validate()`'s own independent
+    defense-in-depth check, isolated directly); a rule registered for one
+    action never applies to another action's transition; a zero-value
+    `BoundAction`, even with a rule registered for its zero `ActionID` →
+    reject; two rules sharing one `(ActionID, ProjectorID)` pair, a
+    duplicate `RuleID`, or an empty `RuleID` → registration rejected; a
+    registry is unaffected by mutating the caller's rule slice after
+    construction; `state_unchanged` violated → exactly 1 hypothesis,
+    satisfied → 0; `fact_unchanged` with an absent fact →
+    `insufficient_evidence`; `fact_equals` satisfied → 0, violated → 1;
+    `fact_transition` A→B as declared → 0 (`satisfied`), A→C → 1
+    (`violated`), precondition never held → 0 (`not_applicable`),
+    before/after fact absent → 0 (`insufficient_evidence`, distinct from
+    `not_applicable`); a scope-inconsistent transition → reject; produced
+    `Candidate.State` is always `Hypothesis`; `Provenance().RawInputHash`
+    equals the resolved case hash and never equals `TransitionArtifactHash`
+    alone; the case hash is stable across repeated calls; and the case hash
+    independently changes when `BeforeFingerprint`, `AfterFingerprint`, the
+    action identity, `ScopeHash`, `Expectation`, or `ExpectationSource.ID`
+    alone changes. All 29 pass.
   - **v1 explicitly does NOT do:** a replay validator, LLM-based judgment of
     what counts as an anomaly, any new execution capability, auto-generating
     an `Expectation` from an observed transition, a `Check func(before,
     after) bool` callback, treating "fact absent" as `""`, letting a caller
-    pair an `Expectation` with an unrelated transition, or advancing a
-    `Candidate` past `Hypothesis`. None of these have any code path in
-    `research/state_machine_producer.go` today. A state-machine replay
-    validator is explicitly deferred to a future stage.
+    pair an `Expectation` with an unrelated transition, letting two rules
+    ambiguously claim the same `(ActionID, ProjectorID)` pair or the same
+    `RuleID`, or advancing a `Candidate` past `Hypothesis`. None of these
+    have any code path in `research/state_machine_producer.go` today. A
+    state-machine replay validator is explicitly deferred to a future stage.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
   A state-machine replay validator for S10/E6 anomalies is also deferred —

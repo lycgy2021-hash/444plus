@@ -136,20 +136,78 @@ type transitionRuleKey struct {
 // caller of Produce/Analyze supplies directly. This is what makes "which
 // rule applies" a function of the transition's own recorded facts, not a
 // choice made at the call site.
+//
+// A *TransitionRuleRegistry successfully built by NewTransitionRuleRegistry
+// is itself the proof that "(ActionID, ProjectorID) -> exactly one rule"
+// holds for every entry it contains — lookup never has to break a tie
+// between two candidates by slice order, map iteration order, or any other
+// incidental detail, because NewTransitionRuleRegistry refuses to build a
+// registry where a tie could ever arise.
 type TransitionRuleRegistry struct {
 	rules map[transitionRuleKey]TransitionRule
 }
 
 // NewTransitionRuleRegistry builds a closed registry from a fixed list of
-// rules. Like actionauth.NewRegistry, a later entry with the same
-// (ActionID, ProjectorID) key silently overrides an earlier one — callers
-// are expected to register each (action, projector) pair at most once.
-func NewTransitionRuleRegistry(rules ...TransitionRule) *TransitionRuleRegistry {
+// rules, or reports an error and returns nil if the list is not
+// unambiguous. Every rule is copied BY VALUE into the registry's own map
+// (TransitionRule holds no pointers/slices, so this is a real, independent
+// copy) — mutating the caller's original rules slice afterward has no
+// effect on anything a built registry ever resolves; see
+// TestE6RuleRegistryUnaffectedByMutatingCallersSliceAfterConstruction.
+//
+// Rejected, so a successfully built registry is itself the guarantee, not
+// merely a convention callers are expected to follow:
+//   - an empty RuleID (nothing to point an audit at),
+//   - a RuleID reused by more than one rule,
+//   - a non-authoritative ExpectationSource (S9's whitelist, reused
+//     unchanged — see ExpectationSource.authoritative),
+//   - a TransitionExpectation with an unknown Kind, or with an empty Fact
+//     for a Kind that requires one, and
+//   - MOST IMPORTANTLY: two rules registered for the SAME (ActionID,
+//     ProjectorID) pair. Without this, which rule "wins" for that pair would
+//     depend on slice order / map iteration order / an implementation
+//     detail — never a deterministic authority. Rejecting the ambiguity at
+//     construction time is what makes lookup's "exactly one match" real
+//     rather than "whichever happened to be inserted last".
+func NewTransitionRuleRegistry(rules ...TransitionRule) (*TransitionRuleRegistry, error) {
 	m := make(map[transitionRuleKey]TransitionRule, len(rules))
+	seenRuleIDs := make(map[string]bool, len(rules))
 	for _, r := range rules {
-		m[transitionRuleKey{r.ActionID.RegistryKey, r.ActionID.VariantID, r.ProjectorID}] = r
+		if r.RuleID == "" {
+			return nil, fmt.Errorf("research: TransitionRule has an empty RuleID (action=%+v, projector=%q)", r.ActionID, r.ProjectorID)
+		}
+		if seenRuleIDs[r.RuleID] {
+			return nil, fmt.Errorf("research: duplicate TransitionRule.RuleID %q", r.RuleID)
+		}
+		seenRuleIDs[r.RuleID] = true
+		if !r.ExpectationSource.authoritative() {
+			return nil, fmt.Errorf("research: TransitionRule %q has a non-authoritative ExpectationSource.Kind %q", r.RuleID, r.ExpectationSource.Kind)
+		}
+		if !r.Expectation.valid() {
+			return nil, fmt.Errorf("research: TransitionRule %q has an invalid TransitionExpectation (kind=%q, fact=%q)", r.RuleID, r.Expectation.Kind, r.Expectation.Fact)
+		}
+		key := transitionRuleKey{r.ActionID.RegistryKey, r.ActionID.VariantID, r.ProjectorID}
+		if existing, dup := m[key]; dup {
+			return nil, fmt.Errorf("research: duplicate TransitionRule for (ActionID=%+v, ProjectorID=%q): %q and %q both claim it",
+				r.ActionID, r.ProjectorID, existing.RuleID, r.RuleID)
+		}
+		m[key] = r
 	}
-	return &TransitionRuleRegistry{rules: m}
+	return &TransitionRuleRegistry{rules: m}, nil
+}
+
+// valid reports whether e is a well-formed TransitionExpectation: a known
+// Kind, and (for every Kind except ExpectStateUnchanged, which judges the
+// whole fingerprint rather than one named fact) a non-empty Fact.
+func (e TransitionExpectation) valid() bool {
+	switch e.Kind {
+	case ExpectStateUnchanged:
+		return true
+	case ExpectFactUnchanged, ExpectFactEquals, ExpectFactTransition:
+		return e.Fact != ""
+	default:
+		return false
+	}
 }
 
 // lookup returns the ONE rule registered for exactly this (actionID,
@@ -208,7 +266,11 @@ func (p *StateMachineProducer) resolve(c TransitionCase) (resolvedTransitionCase
 // actionauth.BoundAction always fails ValidFor and so always fails here,
 // EVEN IF some rule happens to be registered under a matching ActionID), or
 // a transition whose two fingerprints were not produced by the SAME
-// projector the rule was registered against.
+// projector the rule was registered against. Every one of these is ALSO
+// already enforced at registration time by NewTransitionRuleRegistry for
+// any rule that actually came from one — this re-checks them anyway,
+// independently, rather than trusting that every resolvedTransitionCase in
+// existence was necessarily built from a validated registry.
 func (rc resolvedTransitionCase) validate() bool {
 	if !rc.Rule.ExpectationSource.authoritative() {
 		return false
@@ -226,14 +288,7 @@ func (rc resolvedTransitionCase) validate() bool {
 	if t.BeforeFingerprint.ProjectorID() != rc.Rule.ProjectorID || t.AfterFingerprint.ProjectorID() != rc.Rule.ProjectorID {
 		return false // both sides of the transition must share the rule's own projector
 	}
-	switch rc.Rule.Expectation.Kind {
-	case ExpectStateUnchanged:
-		return true
-	case ExpectFactUnchanged, ExpectFactEquals, ExpectFactTransition:
-		return rc.Rule.Expectation.Fact != ""
-	default:
-		return false
-	}
+	return rc.Rule.Expectation.valid()
 }
 
 // TransitionAssessment is a FOUR-STATE result, never a bool — the same
