@@ -6,18 +6,18 @@ import (
 	"strings"
 	"time"
 
+	"gopoc/internal/actionauth"
 	"gopoc/internal/stateauth"
 )
 
 // StateMachineProducer (S10/E6) turns a TransitionCase — one real, already
-// recorded StateTransition paired with an explicit, pre-declared, authoritative
-// TransitionExpectation — into a hypothesis Candidate when the observed
-// transition VIOLATES that expectation. It is a deterministic PRODUCER, exactly
-// like the diff/fuzz/differential producers: it consumes an already-collected
-// StateTransition (Explorer's own output), judges it against a rule it never
-// authored, and emits at most one hypothesis per violated fact — it never
-// re-executes an action, re-collects state, calls an LLM, decides a validator,
-// or promotes anything.
+// recorded StateTransition — into a hypothesis Candidate when it VIOLATES a
+// pre-registered, authoritative TransitionRule. It is a deterministic
+// PRODUCER, exactly like the diff/fuzz/differential producers: it consumes an
+// already-collected StateTransition (Explorer's own output), judges it
+// against a rule it never authored, and emits at most one hypothesis per
+// violated fact — it never re-executes an action, re-collects state, calls an
+// LLM, decides a validator, or promotes anything.
 //
 // The one rule this file exists to enforce: "State A != State B" is NEVER
 // itself an anomaly. Only a transition that violates an ALREADY-AUTHORIZED
@@ -25,9 +25,9 @@ import (
 // ExpectationSource (S9's frozen whitelist, reused unchanged) — produces a
 // candidate. E6 invents no second "who may define correct behavior" system,
 // and it never lets exploration retroactively invent the expectation it is
-// then judged against (that would be hindsight bias, not detection): a future
-// caller must register/declare Expectation BEFORE running the Explorer
-// session that produces the StateTransition it will be checked against.
+// then judged against (that would be hindsight bias, not detection): a
+// TransitionRule must be registered BEFORE running the Explorer session that
+// produces the StateTransition it will be checked against.
 //
 // v1 is deliberately narrow (mirroring S9's own v1 scope note): four
 // declarative expectation kinds, no callback, no free-form rule language. E6
@@ -35,11 +35,16 @@ import (
 // execution capability live here; those are explicitly out of scope for this
 // pass.
 type StateMachineProducer struct {
+	rules *TransitionRuleRegistry
 	newID func() string
 }
 
-func NewStateMachineProducer() *StateMachineProducer {
-	return &StateMachineProducer{newID: SequentialIDs(time.Now().UTC().Year())}
+// NewStateMachineProducer builds a producer bound to exactly one
+// TransitionRuleRegistry — see that type's own doc for why the registry,
+// not the caller of Produce/Analyze, decides which Expectation applies to a
+// given transition.
+func NewStateMachineProducer(rules *TransitionRuleRegistry) *StateMachineProducer {
+	return &StateMachineProducer{rules: rules, newID: SequentialIDs(time.Now().UTC().Year())}
 }
 
 func (p *StateMachineProducer) WithIDFunc(fn func() string) *StateMachineProducer {
@@ -69,7 +74,10 @@ const (
 	ExpectFactEquals TransitionExpectationKind = "fact_equals"
 	// ExpectFactTransition: one named fact must move from a declared
 	// BeforeValue to a declared AfterValue — the only kind that judges both
-	// sides of the transition against declared values.
+	// sides of the transition against declared values, and the only kind with
+	// a PRECONDITION (see analyzeFactTransition: a before value that does not
+	// match BeforeValue means the rule never applied to this transition at
+	// all — TransitionNotApplicable, never a violation).
 	ExpectFactTransition TransitionExpectationKind = "fact_transition"
 )
 
@@ -86,50 +94,151 @@ type TransitionExpectation struct {
 	AfterValue  string
 }
 
-// TransitionCase is the E6 producer's ONLY input: one observed StateTransition
-// (Explorer's own recorded output), paired with the explicit expectation it is
-// judged against and who authored that expectation. ExpectationSource reuses
-// S9's frozen whitelist UNCHANGED — E6 invents no second "who may define
-// correct behavior" system, and "ai"/"llm"/"candidate"/"proposal"/"fuzz"/
-// "diff"/even "state_machine" itself all remain non-authoritative here exactly
-// as they are for S9's differential engine.
-type TransitionCase struct {
-	Transition StateTransition
+// TransitionRule pairs the ONE (ActionID, ProjectorID) combination it applies
+// to with the Expectation to judge and the ExpectationSource that authored
+// it. This is the fix for a gap the v1-without-a-registry design had: judging
+// a TransitionCase only against an ExpectationSource's AUTHORITY (is this
+// kind of source allowed to define correct behavior at all) is not the same
+// as judging it against the RIGHT expectation for the actual action that
+// ran — a caller could otherwise take a legitimately spec-authored
+// Expectation written for action A and (by mistake or by construction) pair
+// it, at the call site, with a transition whose Action was actually B. A
+// TransitionRule fixes WHICH action and WHICH state-authority (projector) it
+// applies to at REGISTRATION time, not at judgment time.
+type TransitionRule struct {
+	// RuleID is an opaque, human-assigned identity for this rule — recorded on
+	// any Candidate it produces (Refs["rule_id"]) so a rule can be found and
+	// audited independently of the ActionID/ProjectorID it happens to key on.
+	RuleID string
+
+	ActionID    actionauth.ActionID
+	ProjectorID stateauth.ProjectorID
 
 	Expectation       TransitionExpectation
 	ExpectationSource ExpectationSource
 }
 
-// validate reports whether c is well-formed and authorized enough to judge AT
-// ALL. An invalid case is never judged — it yields TransitionInsufficientEvidence
-// and zero candidates, exactly like S9's DifferentialCase.validate: this is the
-// structural guard against an unauthorized ExpectationSource, a self-
-// contradictory (scope-inconsistent) transition, or a transition whose Action
-// was never actually authorized for the state it claims to have started from
-// (a zero-value or replayed actionauth.BoundAction always fails ValidFor and so
-// always fails here).
-func (c TransitionCase) validate() bool {
-	if !c.ExpectationSource.authoritative() {
+// transitionRuleKey is the exact (ActionID, ProjectorID) tuple a
+// TransitionRuleRegistry keys on. ActionID is two fields (RegistryKey,
+// VariantID), so both are part of the key — a rule for one VariantID of a
+// registered action never silently matches another.
+type transitionRuleKey struct {
+	registryKey string
+	variantID   string
+	projectorID stateauth.ProjectorID
+}
+
+// TransitionRuleRegistry is a compile-time-only, closed set of
+// TransitionRules — the S10/E6 analogue of actionauth.Registry and S5's
+// Validator registry: built once, from a fixed list, with no method to add
+// an entry afterward. lookup is keyed by the (ActionID, ProjectorID) a REAL
+// StateTransition actually carries — never by a RuleID or an Expectation a
+// caller of Produce/Analyze supplies directly. This is what makes "which
+// rule applies" a function of the transition's own recorded facts, not a
+// choice made at the call site.
+type TransitionRuleRegistry struct {
+	rules map[transitionRuleKey]TransitionRule
+}
+
+// NewTransitionRuleRegistry builds a closed registry from a fixed list of
+// rules. Like actionauth.NewRegistry, a later entry with the same
+// (ActionID, ProjectorID) key silently overrides an earlier one — callers
+// are expected to register each (action, projector) pair at most once.
+func NewTransitionRuleRegistry(rules ...TransitionRule) *TransitionRuleRegistry {
+	m := make(map[transitionRuleKey]TransitionRule, len(rules))
+	for _, r := range rules {
+		m[transitionRuleKey{r.ActionID.RegistryKey, r.ActionID.VariantID, r.ProjectorID}] = r
+	}
+	return &TransitionRuleRegistry{rules: m}
+}
+
+// lookup returns the ONE rule registered for exactly this (actionID,
+// projectorID) pair. A nil registry (or no match) fails closed: no rule, no
+// judgment, zero candidates — never "judge against whatever expectation
+// happens to be lying around".
+func (r *TransitionRuleRegistry) lookup(actionID actionauth.ActionID, projectorID stateauth.ProjectorID) (TransitionRule, bool) {
+	if r == nil {
+		return TransitionRule{}, false
+	}
+	rule, ok := r.rules[transitionRuleKey{actionID.RegistryKey, actionID.VariantID, projectorID}]
+	return rule, ok
+}
+
+// TransitionCase is the E6 producer's per-observation input: one observed
+// StateTransition (Explorer's own recorded output). It carries NO Expectation
+// or ExpectationSource of its own — what a transition is judged against is
+// resolved internally, by the producer's own TransitionRuleRegistry, from the
+// transition's actual Action and BeforeFingerprint.ProjectorID(). See
+// TransitionRule's own doc for the mismatch this closes.
+type TransitionCase struct {
+	Transition StateTransition
+}
+
+// resolvedTransitionCase pairs a TransitionCase with the ONE TransitionRule
+// the registry resolved for it. It is unexported: nothing outside this file
+// constructs the (transition, rule) pairing that validate/Analyze/the hash
+// function actually judge — Produce/Analyze's only public parameter remains
+// the bare TransitionCase.
+type resolvedTransitionCase struct {
+	Transition StateTransition
+	Rule       TransitionRule
+}
+
+// resolve looks up the ONE rule registered for c's actual (ActionID,
+// ProjectorID) pair. ok is false if nothing is registered for it — including
+// the common case of a transition whose action has no declared Expectation
+// at all, which must never be silently treated as "nothing to judge, so
+// anything goes"; it means exactly that: zero candidates.
+func (p *StateMachineProducer) resolve(c TransitionCase) (resolvedTransitionCase, bool) {
+	before := c.Transition.BeforeFingerprint
+	rule, ok := p.rules.lookup(c.Transition.Action.ID(), before.ProjectorID())
+	if !ok {
+		return resolvedTransitionCase{}, false
+	}
+	return resolvedTransitionCase{Transition: c.Transition, Rule: rule}, true
+}
+
+// validate reports whether rc is well-formed and authorized enough to judge
+// AT ALL. An invalid case is never judged — it yields
+// TransitionInsufficientEvidence and zero candidates, exactly like S9's
+// DifferentialCase.validate: this is the structural guard against an
+// unauthorized ExpectationSource, a self-contradictory (scope-inconsistent)
+// transition, a transition whose Action was never actually authorized for
+// the state it claims to have started from (a zero-value or replayed
+// actionauth.BoundAction always fails ValidFor and so always fails here,
+// EVEN IF some rule happens to be registered under a matching ActionID), or
+// a transition whose two fingerprints were not produced by the SAME
+// projector the rule was registered against.
+func (rc resolvedTransitionCase) validate() bool {
+	if !rc.Rule.ExpectationSource.authoritative() {
 		return false
 	}
-	if !c.Transition.ScopeConsistent() {
+	t := rc.Transition
+	if !t.ScopeConsistent() {
 		return false
 	}
-	if !c.Transition.Action.ValidFor(c.Transition.ScopeHash, c.Transition.BeforeFingerprint.StateFingerprintHash()) {
+	if !t.Action.ValidFor(t.ScopeHash, t.BeforeFingerprint.StateFingerprintHash()) {
 		return false
 	}
-	switch c.Expectation.Kind {
+	if t.Action.ID() != rc.Rule.ActionID {
+		return false // defensive: resolve's own lookup key should already guarantee this
+	}
+	if t.BeforeFingerprint.ProjectorID() != rc.Rule.ProjectorID || t.AfterFingerprint.ProjectorID() != rc.Rule.ProjectorID {
+		return false // both sides of the transition must share the rule's own projector
+	}
+	switch rc.Rule.Expectation.Kind {
 	case ExpectStateUnchanged:
 		return true
 	case ExpectFactUnchanged, ExpectFactEquals, ExpectFactTransition:
-		return c.Expectation.Fact != ""
+		return rc.Rule.Expectation.Fact != ""
 	default:
 		return false
 	}
 }
 
-// TransitionAssessment is a THREE-STATE result, never a bool — the same
-// discipline that keeps "no evidence" from ever collapsing into "violated".
+// TransitionAssessment is a FOUR-STATE result, never a bool — the same
+// discipline that keeps "no evidence" (and, for fact_transition, "this rule's
+// own precondition never held") from ever collapsing into "violated".
 type TransitionAssessment string
 
 const (
@@ -138,11 +247,18 @@ const (
 	// TransitionViolated: the declared expectation demonstrably did not hold.
 	// The only assessment that ever produces a candidate.
 	TransitionViolated TransitionAssessment = "violated"
-	// TransitionInsufficientEvidence: the case is invalid/unauthorized, or a
-	// fact the rule needs was simply ABSENT (not present-with-empty-string —
-	// see the ok-check discipline in the analyze* helpers below). Zero
-	// candidates: absence of evidence is never itself a violation.
+	// TransitionInsufficientEvidence: the case is invalid/unauthorized, no
+	// rule is registered for it at all, or a fact the rule needs was simply
+	// ABSENT (not present-with-empty-string — see the ok-check discipline in
+	// the analyze* helpers below). Zero candidates: absence of evidence is
+	// never itself a violation.
 	TransitionInsufficientEvidence TransitionAssessment = "insufficient_evidence"
+	// TransitionNotApplicable: ExpectFactTransition ONLY — the rule's own
+	// declared precondition (before.Facts[key] == BeforeValue) did not hold,
+	// so the rule never applied to this transition in the first place. This
+	// is NOT a violation: "if before==A then after must==B" imposes no
+	// constraint on a transition that didn't start at A. Zero candidates.
+	TransitionNotApplicable TransitionAssessment = "not_applicable"
 )
 
 // TransitionAnomaly is FACTS ONLY — no Severity/Confidence/Exploitability/
@@ -170,35 +286,36 @@ type TransitionAnomaly struct {
 // / Candidate.Type value E6 v1 ever produces.
 const AnomalyStateTransitionExpectationViolation = "state_transition_expectation_violation"
 
-// Analyze judges c deterministically and with no I/O, returning a three-state
-// assessment plus (only when TransitionViolated) the anomaly it found. An
-// invalid/unauthorized case, or one whose rule needs a fact that is simply
-// ABSENT, is TransitionInsufficientEvidence — never TransitionViolated. This
-// is the E6 analogue of DifferentialProducer.Analyze: it never guesses "what
+// Analyze judges c deterministically and with no I/O, returning a four-state
+// assessment plus (only when TransitionViolated) the anomaly it found. This is
+// the E6 analogue of DifferentialProducer.Analyze: it never guesses "what
 // should have happened" from the observed transition itself (that would be
-// hindsight bias) — it only ever compares the observed transition against an
-// expectation that was declared before this method ever ran.
+// hindsight bias) — it only ever compares the observed transition against a
+// TransitionRule that was registered before this method ever ran, resolved
+// strictly by the transition's own (ActionID, ProjectorID) — never by
+// anything the caller of Analyze supplies alongside c.
 func (p *StateMachineProducer) Analyze(c TransitionCase) (TransitionAssessment, []TransitionAnomaly) {
-	if !c.validate() {
+	rc, ok := p.resolve(c)
+	if !ok || !rc.validate() {
 		return TransitionInsufficientEvidence, nil
 	}
-	switch c.Expectation.Kind {
+	switch rc.Rule.Expectation.Kind {
 	case ExpectStateUnchanged:
-		return analyzeStateUnchanged(c)
+		return analyzeStateUnchanged(rc)
 	case ExpectFactUnchanged:
-		return analyzeFactUnchanged(c)
+		return analyzeFactUnchanged(rc)
 	case ExpectFactEquals:
-		return analyzeFactEquals(c)
+		return analyzeFactEquals(rc)
 	case ExpectFactTransition:
-		return analyzeFactTransition(c)
+		return analyzeFactTransition(rc)
 	default:
 		return TransitionInsufficientEvidence, nil
 	}
 }
 
-func analyzeStateUnchanged(c TransitionCase) (TransitionAssessment, []TransitionAnomaly) {
-	before := c.Transition.BeforeFingerprint.StateFingerprintHash()
-	after := c.Transition.AfterFingerprint.StateFingerprintHash()
+func analyzeStateUnchanged(rc resolvedTransitionCase) (TransitionAssessment, []TransitionAnomaly) {
+	before := rc.Transition.BeforeFingerprint.StateFingerprintHash()
+	after := rc.Transition.AfterFingerprint.StateFingerprintHash()
 	if before == after {
 		return TransitionSatisfied, nil
 	}
@@ -209,7 +326,7 @@ func analyzeStateUnchanged(c TransitionCase) (TransitionAssessment, []Transition
 		ExpectedAfter:  before,
 		ObservedBefore: before,
 		ObservedAfter:  after,
-		EvidenceRefs:   c.Transition.EvidenceRefs,
+		EvidenceRefs:   rc.Transition.EvidenceRefs,
 	}}
 }
 
@@ -217,10 +334,10 @@ func analyzeStateUnchanged(c TransitionCase) (TransitionAssessment, []Transition
 // "fact present with a different value", and "fact absent" — absence maps to
 // TransitionInsufficientEvidence, never to a violation, via the ok-check
 // (value, ok := facts[key]) rather than treating a missing key as "".
-func analyzeFactUnchanged(c TransitionCase) (TransitionAssessment, []TransitionAnomaly) {
-	key := c.Expectation.Fact
-	beforeVal, beforeOK := c.Transition.BeforeFingerprint.Facts()[key]
-	afterVal, afterOK := c.Transition.AfterFingerprint.Facts()[key]
+func analyzeFactUnchanged(rc resolvedTransitionCase) (TransitionAssessment, []TransitionAnomaly) {
+	key := rc.Rule.Expectation.Fact
+	beforeVal, beforeOK := rc.Transition.BeforeFingerprint.Facts()[key]
+	afterVal, afterOK := rc.Transition.AfterFingerprint.Facts()[key]
 	if !beforeOK || !afterOK {
 		return TransitionInsufficientEvidence, nil
 	}
@@ -235,83 +352,106 @@ func analyzeFactUnchanged(c TransitionCase) (TransitionAssessment, []TransitionA
 		ExpectedAfter:  beforeVal,
 		ObservedBefore: beforeVal,
 		ObservedAfter:  afterVal,
-		EvidenceRefs:   c.Transition.EvidenceRefs,
+		EvidenceRefs:   rc.Transition.EvidenceRefs,
 	}}
 }
 
-func analyzeFactEquals(c TransitionCase) (TransitionAssessment, []TransitionAnomaly) {
-	key := c.Expectation.Fact
-	afterVal, ok := c.Transition.AfterFingerprint.Facts()[key]
+func analyzeFactEquals(rc resolvedTransitionCase) (TransitionAssessment, []TransitionAnomaly) {
+	key := rc.Rule.Expectation.Fact
+	afterVal, ok := rc.Transition.AfterFingerprint.Facts()[key]
 	if !ok {
 		return TransitionInsufficientEvidence, nil
 	}
-	if afterVal == c.Expectation.AfterValue {
+	if afterVal == rc.Rule.Expectation.AfterValue {
 		return TransitionSatisfied, nil
 	}
 	return TransitionViolated, []TransitionAnomaly{{
 		Type:          AnomalyStateTransitionExpectationViolation,
 		RuleKind:      ExpectFactEquals,
 		Fact:          key,
-		ExpectedAfter: c.Expectation.AfterValue,
+		ExpectedAfter: rc.Rule.Expectation.AfterValue,
 		ObservedAfter: afterVal,
-		EvidenceRefs:  c.Transition.EvidenceRefs,
+		EvidenceRefs:  rc.Transition.EvidenceRefs,
 	}}
 }
 
-// analyzeFactTransition judges BOTH sides against their declared values (per
-// the E6 contract's own stated semantics: before==BeforeValue AND
-// after==AfterValue). Either fact being ABSENT (not merely mismatched) is
-// insufficient evidence, never a violation.
-func analyzeFactTransition(c TransitionCase) (TransitionAssessment, []TransitionAnomaly) {
-	key := c.Expectation.Fact
-	beforeVal, beforeOK := c.Transition.BeforeFingerprint.Facts()[key]
-	afterVal, afterOK := c.Transition.AfterFingerprint.Facts()[key]
-	if !beforeOK || !afterOK {
+// analyzeFactTransition judges a rule with an explicit PRECONDITION: it only
+// ever imposes a constraint on a transition that actually started at the
+// declared BeforeValue.
+//
+//	before fact absent                      -> insufficient_evidence
+//	before present, != BeforeValue           -> not_applicable (precondition never held)
+//	before == BeforeValue, after fact absent -> insufficient_evidence
+//	before == BeforeValue, after != AfterValue -> violated
+//	before == BeforeValue, after == AfterValue -> satisfied
+//
+// Checking the precondition BEFORE requiring the after-fact to be present
+// means a transition that never matched BeforeValue is correctly
+// not_applicable even if the after-fact happens to be absent for an unrelated
+// reason — the precondition failing is decisive on its own.
+func analyzeFactTransition(rc resolvedTransitionCase) (TransitionAssessment, []TransitionAnomaly) {
+	key := rc.Rule.Expectation.Fact
+	beforeVal, beforeOK := rc.Transition.BeforeFingerprint.Facts()[key]
+	if !beforeOK {
 		return TransitionInsufficientEvidence, nil
 	}
-	if beforeVal == c.Expectation.BeforeValue && afterVal == c.Expectation.AfterValue {
+	if beforeVal != rc.Rule.Expectation.BeforeValue {
+		return TransitionNotApplicable, nil
+	}
+	afterVal, afterOK := rc.Transition.AfterFingerprint.Facts()[key]
+	if !afterOK {
+		return TransitionInsufficientEvidence, nil
+	}
+	if afterVal == rc.Rule.Expectation.AfterValue {
 		return TransitionSatisfied, nil
 	}
 	return TransitionViolated, []TransitionAnomaly{{
 		Type:           AnomalyStateTransitionExpectationViolation,
 		RuleKind:       ExpectFactTransition,
 		Fact:           key,
-		ExpectedBefore: c.Expectation.BeforeValue,
-		ExpectedAfter:  c.Expectation.AfterValue,
+		ExpectedBefore: rc.Rule.Expectation.BeforeValue,
+		ExpectedAfter:  rc.Rule.Expectation.AfterValue,
 		ObservedBefore: beforeVal,
 		ObservedAfter:  afterVal,
-		EvidenceRefs:   c.Transition.EvidenceRefs,
+		EvidenceRefs:   rc.Transition.EvidenceRefs,
 	}}
 }
 
 // Produce judges c and emits a hypothesis Candidate per violated anomaly,
 // tagged Origin{Kind: OriginStateMachine} — a SOURCE label, never a confidence
-// signal. Internally it is deliberately boring: validate authority, hash the
-// raw case artifact, analyze deterministically, take only TransitionViolated,
-// call NewHypothesis. It never re-executes the action, re-collects state,
-// calls an LLM, decides a validator, or promotes anything — a Validator (not
-// yet built in this pass) and the Engine own everything past this point.
+// signal. Internally it is deliberately boring: resolve the ONE registered
+// rule for this transition's actual (ActionID, ProjectorID), validate
+// authority, hash the raw case artifact, analyze deterministically, take only
+// TransitionViolated, call NewHypothesis. It never re-executes the action,
+// re-collects state, calls an LLM, decides a validator, or promotes anything
+// — a Validator (not yet built in this pass) and the Engine own everything
+// past this point.
 //
 // Two distinct hashes, never mixed (the S8/S9 discipline again):
 //   - c.Transition.TransitionArtifactHash is Explorer's OWN record of the
-//     transition it observed — it does not cover Expectation/ExpectationSource
-//     at all, so it is never what Candidate.Provenance.RawInputHash points at.
+//     transition it observed — it does not cover the Rule's Expectation/
+//     ExpectationSource at all, so it is never what
+//     Candidate.Provenance.RawInputHash points at.
 //   - transitionCaseArtifactHash is the LOSSLESS canonical serialization of
-//     the full TransitionCase this producer actually consumed (Transition +
-//     Expectation + ExpectationSource) — THIS is what Provenance.RawInputHash
-//     points at, keeping RawInputHash's frozen, cross-producer meaning: "hash
-//     of the raw input the producer ingested". TransitionArtifactHash is still
+//     the full resolved case this producer actually judged (Transition +
+//     the resolved Rule) — THIS is what Provenance.RawInputHash points at,
+//     keeping RawInputHash's frozen, cross-producer meaning: "hash of the
+//     raw input the producer ingested". TransitionArtifactHash is still
 //     recorded, in Refs, alongside it — never in place of it.
 func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 	assessment, anomalies := p.Analyze(c)
 	if assessment != TransitionViolated || len(anomalies) == 0 {
 		return nil
 	}
+	rc, ok := p.resolve(c)
+	if !ok {
+		return nil // Analyze already proved this resolves; never trust that silently
+	}
 
-	artifactHash := transitionCaseArtifactHash(c)
-	origin := Origin{Kind: OriginStateMachine, ID: c.Transition.ScopeHash}
-	prov := newProvenance(string(OriginStateMachine), c.Transition.ScopeHash, "state_machine", artifactHash)
-	action := c.Transition.Action.ID()
+	artifactHash := transitionCaseArtifactHash(rc)
+	origin := Origin{Kind: OriginStateMachine, ID: rc.Transition.ScopeHash}
+	prov := newProvenance(string(OriginStateMachine), rc.Transition.ScopeHash, "state_machine", artifactHash)
+	action := rc.Transition.Action.ID()
 
 	var candidates []*Candidate
 	for _, a := range anomalies {
@@ -324,14 +464,15 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 			"Observed state transition violated the authorized %s expectation for %s: expected before=%q after=%q, observed before=%q after=%q.",
 			a.RuleKind, factDesc, a.ExpectedBefore, a.ExpectedAfter, a.ObservedBefore, a.ObservedAfter,
 		)
-		cand := NewHypothesis(p.newID(), AnomalyStateTransitionExpectationViolation, title, c.Transition.ScopeHash, rationale,
+		cand := NewHypothesis(p.newID(), AnomalyStateTransitionExpectationViolation, title, rc.Transition.ScopeHash, rationale,
 			origin, []string{"state_transition", "authorized_expectation"}, prov)
 		cand.Refs = map[string]string{
-			"transition_artifact_hash": c.Transition.TransitionArtifactHash,
+			"transition_artifact_hash": rc.Transition.TransitionArtifactHash,
 			"case_artifact_hash":       artifactHash,
-			"expectation_source_kind":  string(c.ExpectationSource.Kind),
-			"expectation_source_id":    c.ExpectationSource.ID,
-			"expectation_kind":         string(c.Expectation.Kind),
+			"rule_id":                  rc.Rule.RuleID,
+			"expectation_source_kind":  string(rc.Rule.ExpectationSource.Kind),
+			"expectation_source_id":    rc.Rule.ExpectationSource.ID,
+			"expectation_kind":         string(rc.Rule.Expectation.Kind),
 			"action_registry_key":      action.RegistryKey,
 			"action_variant_id":        action.VariantID,
 		}
@@ -341,13 +482,26 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 }
 
 // transitionCaseArtifactHash is the LOSSLESS canonical serialization hash of
-// the full TransitionCase (Transition + Expectation + ExpectationSource) —
-// every field, no denoising. Map keys (a Fingerprint's Facts) are sorted only
-// because Go maps have no defined iteration order; that sort discards no
-// information (a changed fact value still changes this hash).
-func transitionCaseArtifactHash(c TransitionCase) string {
+// the full resolved case (Transition + the resolved Rule) — every field, no
+// denoising, and NEVER a bare json.Marshal of an opaque type: stateauth.
+// Fingerprint and actionauth.BoundAction both keep their real fields
+// unexported specifically so no outside package can construct or serialize
+// them directly, and json.Marshal on either would silently produce "{}" (no
+// exported fields), which would make this hash blind to everything that
+// actually identifies the observed state or the executed action. Every value
+// below is therefore read through that type's own exported ACCESSOR methods
+// (Fingerprint.ScopeHash/RawStateArtifactHash/StateFingerprintHash/
+// ProjectorID/Facts; BoundAction.ID) and written into the hash input
+// explicitly, field by field — see canonicalTransitionFingerprint.
+// TestE6CaseArtifactHash* proves each of BeforeFingerprint, AfterFingerprint,
+// the action identity, ScopeHash, the Rule's Expectation, and the Rule's
+// ExpectationSource independently moves this hash. Map keys (a Fingerprint's
+// Facts) are sorted only because Go maps have no defined iteration order;
+// that sort discards no information (a changed fact value still changes this
+// hash).
+func transitionCaseArtifactHash(rc resolvedTransitionCase) string {
 	var b strings.Builder
-	t := c.Transition
+	t := rc.Transition
 	b.WriteString("scope_hash=" + t.ScopeHash + "\n")
 	b.WriteString("before=" + canonicalTransitionFingerprint(t.BeforeFingerprint) + "\n")
 	b.WriteString("action_registry_key=" + t.Action.ID().RegistryKey + "\n")
@@ -356,18 +510,24 @@ func transitionCaseArtifactHash(c TransitionCase) string {
 	b.WriteString("evidence_refs=" + strings.Join(t.EvidenceRefs, ",") + "\n")
 	b.WriteString("transition_artifact_hash=" + t.TransitionArtifactHash + "\n")
 	b.WriteString("timestamp=" + t.Timestamp.UTC().Format(time.RFC3339Nano) + "\n")
-	b.WriteString("expectation_kind=" + string(c.Expectation.Kind) + "\n")
-	b.WriteString("expectation_fact=" + c.Expectation.Fact + "\n")
-	b.WriteString("expectation_before_value=" + c.Expectation.BeforeValue + "\n")
-	b.WriteString("expectation_after_value=" + c.Expectation.AfterValue + "\n")
-	b.WriteString("expectation_source=" + string(c.ExpectationSource.Kind) + ":" + c.ExpectationSource.ID + "\n")
+	b.WriteString("rule_id=" + rc.Rule.RuleID + "\n")
+	b.WriteString("rule_action_registry_key=" + rc.Rule.ActionID.RegistryKey + "\n")
+	b.WriteString("rule_action_variant_id=" + rc.Rule.ActionID.VariantID + "\n")
+	b.WriteString("rule_projector_id=" + string(rc.Rule.ProjectorID) + "\n")
+	b.WriteString("expectation_kind=" + string(rc.Rule.Expectation.Kind) + "\n")
+	b.WriteString("expectation_fact=" + rc.Rule.Expectation.Fact + "\n")
+	b.WriteString("expectation_before_value=" + rc.Rule.Expectation.BeforeValue + "\n")
+	b.WriteString("expectation_after_value=" + rc.Rule.Expectation.AfterValue + "\n")
+	b.WriteString("expectation_source=" + string(rc.Rule.ExpectationSource.Kind) + ":" + rc.Rule.ExpectationSource.ID + "\n")
 	return RawInputHash([]byte(b.String()))
 }
 
 // canonicalTransitionFingerprint renders every exported facet of a
 // stateauth.Fingerprint (its own hashes, its ProjectorID, and its full Facts
-// map) into one canonical, lossless line — Facts keys sorted for determinism
-// only, never filtered or normalized away.
+// map — read through Fingerprint's own accessor methods, never a struct
+// literal or json.Marshal, since its fields are unexported) into one
+// canonical, lossless line — Facts keys sorted for determinism only, never
+// filtered or normalized away.
 func canonicalTransitionFingerprint(fp stateauth.Fingerprint) string {
 	facts := fp.Facts()
 	keys := make([]string, 0, len(facts))

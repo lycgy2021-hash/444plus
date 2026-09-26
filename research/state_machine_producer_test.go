@@ -8,14 +8,31 @@ import (
 	"gopoc/internal/stateauth"
 )
 
-// This file is E6's freeze-gate battery: the exact list of behaviors the S10
-// state-machine Candidate Producer contract must satisfy before it can be
-// considered locked. Every fixture below builds REAL, non-zero
-// stateauth.Fingerprint and actionauth.BoundAction values through their own
-// authority packages (HTTPFixtureRegistry + ActionPolicy.Select) — never a
-// struct literal — because both types refuse to be constructed with a real
-// identity from outside their own package, and a test that could fake one
-// would not actually be testing the authority boundary at all.
+// This file is E6's freeze-gate battery, covering both the original
+// producer contract (authority, zero-FP, provenance) AND the three
+// freeze-blockers from the follow-up audit:
+//
+//   E6-A: an Expectation is resolved from a TransitionRuleRegistry, keyed by
+//         the transition's OWN (ActionID, ProjectorID) — never supplied
+//         independently alongside the transition, which would let a caller
+//         mismatch a legitimately authoritative Expectation to the wrong
+//         action.
+//   E6-B: ExpectFactTransition has an explicit PRECONDITION: a before value
+//         that never matches the rule's declared BeforeValue is
+//         TransitionNotApplicable, never TransitionViolated.
+//   E6-C: transitionCaseArtifactHash is proven, by direct test, to be
+//         sensitive to EACH of BeforeFingerprint, AfterFingerprint, the
+//         action identity, ScopeHash, Expectation, and ExpectationSource
+//         independently — never a bare json.Marshal of the opaque
+//         Fingerprint/BoundAction types (which would silently serialize to
+//         "{}", since both keep their real fields unexported).
+//
+// Every fixture below builds REAL, non-zero stateauth.Fingerprint and
+// actionauth.BoundAction values through their own authority packages
+// (HTTPFixtureRegistry + ActionPolicy.Select) — never a struct literal —
+// because both types refuse to be constructed with a real identity from
+// outside their own package, and a test that could fake one would not
+// actually be testing the authority boundary at all.
 
 const e6ScopeHash = "e6-scope"
 
@@ -36,33 +53,37 @@ func e6Fingerprint(t *testing.T, status int, body string) stateauth.Fingerprint 
 	return fp
 }
 
-// e6BoundAction obtains a REAL actionauth.BoundAction via ActionPolicy.Select
-// — the only place, in any package, a non-zero BoundAction is ever produced —
-// bound to scopeHash and fp's own StateFingerprintHash, exactly as a real
-// Explorer session would.
-func e6BoundAction(t *testing.T, scopeHash string, fp stateauth.Fingerprint) actionauth.BoundAction {
+// e6BoundActionForKey obtains a REAL actionauth.BoundAction, registered under
+// actionKey, via ActionPolicy.Select — the only place, in any package, a
+// non-zero BoundAction is ever produced — bound to scopeHash and fp's own
+// StateFingerprintHash, exactly as a real Explorer session would.
+func e6BoundActionForKey(t *testing.T, actionKey, scopeHash string, fp stateauth.Fingerprint) actionauth.BoundAction {
 	t.Helper()
 	registry := actionauth.NewRegistry(actionauth.Registration{
-		Action:       actionauth.RegisteredAction{Key: "noop"},
+		Action:       actionauth.RegisteredAction{Key: actionKey},
 		Requirements: actionauth.StateRequirements{ProjectorID: fp.ProjectorID()},
 	})
 	policy := actionauth.NewActionPolicy(registry, actionauth.NewRecoveryRegistry())
 	bound, ok := policy.Select(scopeHash, fp, nil)
 	if !ok {
-		t.Fatal("ActionPolicy.Select: expected a match, got none")
+		t.Fatalf("ActionPolicy.Select: expected a match for action %q, got none", actionKey)
 	}
 	return bound
 }
 
-// e6Transition builds a self-consistent, fully-authorized StateTransition:
-// ScopeConsistent() is true and Action.ValidFor(...) is true, exactly as
-// Explorer.Step would leave it.
-func e6Transition(t *testing.T, before, after stateauth.Fingerprint) StateTransition {
+func e6BoundAction(t *testing.T, scopeHash string, fp stateauth.Fingerprint) actionauth.BoundAction {
 	t.Helper()
+	return e6BoundActionForKey(t, "noop", scopeHash, fp)
+}
+
+// e6TransitionWithAction builds a self-consistent, fully-authorized
+// StateTransition using the given already-bound action, exactly as
+// Explorer.Step would leave it.
+func e6TransitionWithAction(before, after stateauth.Fingerprint, action actionauth.BoundAction) StateTransition {
 	return StateTransition{
 		ScopeHash:              e6ScopeHash,
 		BeforeFingerprint:      before,
-		Action:                 e6BoundAction(t, e6ScopeHash, before),
+		Action:                 action,
 		AfterFingerprint:       after,
 		EvidenceRefs:           []string{"evidence-1"},
 		TransitionArtifactHash: "explorer-own-transition-artifact-hash",
@@ -70,68 +91,133 @@ func e6Transition(t *testing.T, before, after stateauth.Fingerprint) StateTransi
 	}
 }
 
+// e6Transition is the common case: one registered action key ("noop"),
+// bound fresh for this transition.
+func e6Transition(t *testing.T, before, after stateauth.Fingerprint) StateTransition {
+	t.Helper()
+	return e6TransitionWithAction(before, after, e6BoundAction(t, e6ScopeHash, before))
+}
+
 func e6AuthoritativeSource() ExpectationSource {
 	return ExpectationSource{Kind: ExpectationSourceHumanConfig, ID: "e6-test-config"}
 }
 
-// --- 1. no ExpectationSource -> reject / 0 candidates -----------------------
-
-func TestE6NoExpectationSourceRejected(t *testing.T) {
-	before := e6Fingerprint(t, 200, "ok")
-	after := e6Fingerprint(t, 200, "ok")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectStateUnchanged},
-		ExpectationSource: ExpectationSource{}, // zero value: no Kind at all
-	}
-	if got := NewStateMachineProducer().Produce(c); got != nil {
-		t.Fatalf("Produce with no ExpectationSource = %v, want nil", got)
+// e6RuleFor builds a TransitionRule matching tr's own (ActionID,
+// ProjectorID) — the registration a real deployment would author BEFORE
+// running the Explorer session that produces tr.
+func e6RuleFor(tr StateTransition, expectation TransitionExpectation, source ExpectationSource) TransitionRule {
+	return TransitionRule{
+		RuleID:            "rule-under-test",
+		ActionID:          tr.Action.ID(),
+		ProjectorID:       tr.BeforeFingerprint.ProjectorID(),
+		Expectation:       expectation,
+		ExpectationSource: source,
 	}
 }
 
-// --- 2. AI/LLM source -> reject / 0 candidates ------------------------------
+// --- E6-A: rule resolution is bound to (ActionID, ProjectorID) -------------
 
-func TestE6AIOrLLMSourceRejected(t *testing.T) {
+// TestE6NoRegisteredRuleMeansNoJudgment covers gate #1 ("无 ExpectationSource
+// -> reject") and #3 ("State A != State B 但没有 expectation -> 0 candidate")
+// under the new registry design: with NO TransitionRule registered for this
+// transition's action at all, Produce must never invent something to judge
+// against, even though the states genuinely differ.
+func TestE6NoRegisteredRuleMeansNoJudgment(t *testing.T) {
+	before := e6Fingerprint(t, 200, "ok")
+	after := e6Fingerprint(t, 500, "error")
+	tr := e6Transition(t, before, after)
+	p := NewStateMachineProducer(NewTransitionRuleRegistry()) // empty registry
+	if got := p.Produce(TransitionCase{Transition: tr}); got != nil {
+		t.Fatalf("Produce with no registered rule = %v, want nil", got)
+	}
+	assessment, _ := p.Analyze(TransitionCase{Transition: tr})
+	if assessment != TransitionInsufficientEvidence {
+		t.Fatalf("Analyze with no registered rule = %q, want %q", assessment, TransitionInsufficientEvidence)
+	}
+}
+
+// TestE6AIOrLLMSourceRejectedEvenIfSomehowRegistered proves defense in depth:
+// even if a rule with a non-authoritative ExpectationSource were somehow
+// registered, Produce still refuses it at judgment time.
+func TestE6AIOrLLMSourceRejectedEvenIfSomehowRegistered(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 403, "denied")
 	for _, kind := range []ExpectationSourceKind{"ai", "llm", "candidate", "proposal", "fuzz", "diff", "state_machine"} {
-		c := TransitionCase{
-			Transition:        e6Transition(t, before, after),
-			Expectation:       TransitionExpectation{Kind: ExpectStateUnchanged},
-			ExpectationSource: ExpectationSource{Kind: kind, ID: "whatever"},
-		}
-		if got := NewStateMachineProducer().Produce(c); got != nil {
+		tr := e6Transition(t, before, after)
+		rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectStateUnchanged}, ExpectationSource{Kind: kind, ID: "whatever"})
+		p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+		if got := p.Produce(TransitionCase{Transition: tr}); got != nil {
 			t.Fatalf("Produce with ExpectationSource.Kind=%q = %v, want nil (non-authoritative)", kind, got)
 		}
 	}
 }
 
-// --- 3. State A != State B but no declared Expectation -> 0 candidates -----
-
-func TestE6DifferentStatesWithoutExpectationIsNotAnAnomaly(t *testing.T) {
+// TestE6RuleRegisteredForOneActionNeverAppliesToAnother is the core new
+// guarantee E6-A adds: a legitimately authoritative rule, registered for
+// action "action-a", must NEVER be applied to a transition whose actual
+// action is "action-b" — even though both share the same projector and the
+// same scope. Before the registry existed, an Expectation and
+// ExpectationSource were free-form caller input alongside ANY transition, so
+// nothing stopped exactly this mismatch.
+func TestE6RuleRegisteredForOneActionNeverAppliesToAnother(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
-	after := e6Fingerprint(t, 500, "error")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{}, // no Kind declared
-		ExpectationSource: e6AuthoritativeSource(),
+	afterA := e6Fingerprint(t, 200, "ok") // satisfies fact_equals(status=200) if it were checked
+	afterB := e6Fingerprint(t, 999, "should never be judged by action-a's rule")
+
+	actionA := e6BoundActionForKey(t, "action-a", e6ScopeHash, before)
+	actionB := e6BoundActionForKey(t, "action-b", e6ScopeHash, before)
+
+	trA := e6TransitionWithAction(before, afterA, actionA)
+	ruleA := e6RuleFor(trA, TransitionExpectation{Kind: ExpectFactEquals, Fact: "status", AfterValue: "200"}, e6AuthoritativeSource())
+
+	registry := NewTransitionRuleRegistry(ruleA) // ONLY action-a has a registered rule
+	p := NewStateMachineProducer(registry)
+
+	// action-a's own transition: satisfied, 0 candidates.
+	if got := p.Produce(TransitionCase{Transition: trA}); got != nil {
+		t.Fatalf("Produce (action-a, satisfied) = %v, want nil", got)
 	}
-	if got := NewStateMachineProducer().Produce(c); got != nil {
-		t.Fatalf("Produce with no declared Expectation.Kind = %v, want nil: differing states are never themselves an anomaly", got)
+
+	// action-b's transition, even with a status that WOULD have violated
+	// action-a's rule, must produce nothing: no rule is registered for
+	// action-b, so action-a's rule must never be reused for it.
+	trB := e6TransitionWithAction(before, afterB, actionB)
+	if got := p.Produce(TransitionCase{Transition: trB}); got != nil {
+		t.Fatalf("Produce (action-b, no rule registered for it) = %v, want nil — action-a's rule must never apply to action-b", got)
 	}
 }
 
-// --- 4/5. state_unchanged ----------------------------------------------------
+// TestE6ZeroValueBoundActionRejectedEvenIfRuleRegisteredForItsID proves
+// defense in depth for gate #12: even a rule mistakenly registered against
+// the ZERO-VALUE ActionID cannot turn a zero-value (never authorized)
+// BoundAction into a judgeable transition — ValidFor gates on real
+// authorization regardless of what the registry contains.
+func TestE6ZeroValueBoundActionRejectedEvenIfRuleRegisteredForItsID(t *testing.T) {
+	before := e6Fingerprint(t, 200, "ok")
+	after := e6Fingerprint(t, 403, "denied")
+	tr := e6TransitionWithAction(before, after, actionauth.BoundAction{}) // never actually authorized
+	rule := TransitionRule{
+		RuleID:            "phantom-rule",
+		ActionID:          actionauth.BoundAction{}.ID(), // zero-value ActionID, matching tr.Action.ID()
+		ProjectorID:       before.ProjectorID(),
+		Expectation:       TransitionExpectation{Kind: ExpectStateUnchanged},
+		ExpectationSource: e6AuthoritativeSource(),
+	}
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	if got := p.Produce(TransitionCase{Transition: tr}); got != nil {
+		t.Fatalf("Produce (zero-value BoundAction, rule registered for its zero ActionID) = %v, want nil", got)
+	}
+}
+
+// --- state_unchanged ---------------------------------------------------------
 
 func TestE6StateUnchangedRealChangeProducesExactlyOneHypothesis(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 403, "denied")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectStateUnchanged},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	got := NewStateMachineProducer().Produce(c)
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectStateUnchanged}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	got := p.Produce(TransitionCase{Transition: tr})
 	if len(got) != 1 {
 		t.Fatalf("Produce (state changed, expected unchanged) = %d candidates, want exactly 1", len(got))
 	}
@@ -140,50 +226,43 @@ func TestE6StateUnchangedRealChangeProducesExactlyOneHypothesis(t *testing.T) {
 func TestE6StateUnchangedNoChangeProducesNoCandidate(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 200, "ok")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectStateUnchanged},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	if got := NewStateMachineProducer().Produce(c); got != nil {
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectStateUnchanged}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	if got := p.Produce(TransitionCase{Transition: tr}); got != nil {
 		t.Fatalf("Produce (state genuinely unchanged) = %v, want nil", got)
 	}
 }
 
-// --- 6. fact_unchanged with an absent fact -> insufficient evidence --------
+// --- fact_unchanged with an absent fact -> insufficient evidence -----------
 
 func TestE6FactUnchangedMissingFactIsInsufficientEvidenceNotViolation(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 200, "ok")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectFactUnchanged, Fact: "no_such_fact"},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	p := NewStateMachineProducer()
-	assessment, anomalies := p.Analyze(c)
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectFactUnchanged, Fact: "no_such_fact"}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	assessment, anomalies := p.Analyze(TransitionCase{Transition: tr})
 	if assessment != TransitionInsufficientEvidence {
 		t.Fatalf("Analyze (missing fact) assessment = %q, want %q", assessment, TransitionInsufficientEvidence)
 	}
 	if anomalies != nil {
 		t.Fatalf("Analyze (missing fact) anomalies = %v, want nil", anomalies)
 	}
-	if got := p.Produce(c); got != nil {
+	if got := p.Produce(TransitionCase{Transition: tr}); got != nil {
 		t.Fatalf("Produce (missing fact) = %v, want nil", got)
 	}
 }
 
-// --- 7/8. fact_equals --------------------------------------------------------
+// --- fact_equals -------------------------------------------------------------
 
 func TestE6FactEqualsObservedMatchesExpectedProducesNoCandidate(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 200, "ok")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectFactEquals, Fact: "status", AfterValue: "200"},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	if got := NewStateMachineProducer().Produce(c); got != nil {
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectFactEquals, Fact: "status", AfterValue: "200"}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	if got := p.Produce(TransitionCase{Transition: tr}); got != nil {
 		t.Fatalf("Produce (fact_equals satisfied) = %v, want nil", got)
 	}
 }
@@ -191,28 +270,28 @@ func TestE6FactEqualsObservedMatchesExpectedProducesNoCandidate(t *testing.T) {
 func TestE6FactEqualsObservedDiffersFromExpectedProducesOneHypothesis(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 403, "denied")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectFactEquals, Fact: "status", AfterValue: "200"},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	got := NewStateMachineProducer().Produce(c)
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectFactEquals, Fact: "status", AfterValue: "200"}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	got := p.Produce(TransitionCase{Transition: tr})
 	if len(got) != 1 {
 		t.Fatalf("Produce (fact_equals violated) = %d candidates, want exactly 1", len(got))
 	}
 }
 
-// --- 9/10. fact_transition ---------------------------------------------------
+// --- E6-B: fact_transition, including the new not_applicable state --------
 
 func TestE6FactTransitionNormalABProducesNoCandidate(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 403, "denied")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "403"},
-		ExpectationSource: e6AuthoritativeSource(),
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "403"}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	assessment, _ := p.Analyze(TransitionCase{Transition: tr})
+	if assessment != TransitionSatisfied {
+		t.Fatalf("Analyze (fact_transition A->B as declared) = %q, want %q", assessment, TransitionSatisfied)
 	}
-	if got := NewStateMachineProducer().Produce(c); got != nil {
+	if got := p.Produce(TransitionCase{Transition: tr}); got != nil {
 		t.Fatalf("Produce (fact_transition satisfied, A->B as declared) = %v, want nil", got)
 	}
 }
@@ -220,65 +299,121 @@ func TestE6FactTransitionNormalABProducesNoCandidate(t *testing.T) {
 func TestE6FactTransitionActuallyGoesToCProducesOneHypothesis(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 500, "error") // declared AfterValue is 403, observed is 500
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "403"},
-		ExpectationSource: e6AuthoritativeSource(),
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "403"}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	assessment, _ := p.Analyze(TransitionCase{Transition: tr})
+	if assessment != TransitionViolated {
+		t.Fatalf("Analyze (fact_transition A->C not A->B) = %q, want %q", assessment, TransitionViolated)
 	}
-	got := NewStateMachineProducer().Produce(c)
+	got := p.Produce(TransitionCase{Transition: tr})
 	if len(got) != 1 {
 		t.Fatalf("Produce (fact_transition violated, A->C not A->B) = %d candidates, want exactly 1", len(got))
 	}
 }
 
-// --- 11. scope-inconsistent transition -> reject ----------------------------
+// TestE6FactTransitionPreconditionNeverHeldIsNotApplicable is the E6-B fix
+// itself: the observed transition did not even start at the rule's declared
+// BeforeValue, so the rule's "if before==A then after must==B" constraint
+// never engaged. This must be TransitionNotApplicable, and must NEVER
+// produce a candidate — treating it as "violated" would flag every
+// transition the rule was simply never written for.
+func TestE6FactTransitionPreconditionNeverHeldIsNotApplicable(t *testing.T) {
+	before := e6Fingerprint(t, 200, "ok") // rule's BeforeValue is declared as "999", not "200"
+	after := e6Fingerprint(t, 403, "denied")
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "999", AfterValue: "403"}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	assessment, anomalies := p.Analyze(TransitionCase{Transition: tr})
+	if assessment != TransitionNotApplicable {
+		t.Fatalf("Analyze (precondition before=200 != declared BeforeValue=999) = %q, want %q", assessment, TransitionNotApplicable)
+	}
+	if anomalies != nil {
+		t.Fatalf("Analyze (not_applicable) anomalies = %v, want nil", anomalies)
+	}
+	if got := p.Produce(TransitionCase{Transition: tr}); got != nil {
+		t.Fatalf("Produce (precondition never held) = %v, want nil: not_applicable must never produce a candidate", got)
+	}
+}
+
+// TestE6FactTransitionBeforeMissingIsInsufficientEvidenceNotNotApplicable
+// distinguishes "we don't know what before was" (insufficient_evidence) from
+// "we know what before was, and it wasn't the declared precondition"
+// (not_applicable) — the same absence-vs-mismatch discipline as
+// analyzeFactUnchanged/analyzeFactEquals, now also proven for the
+// precondition check itself.
+func TestE6FactTransitionBeforeMissingIsInsufficientEvidenceNotNotApplicable(t *testing.T) {
+	before := e6Fingerprint(t, 200, "ok")
+	after := e6Fingerprint(t, 403, "denied")
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectFactTransition, Fact: "no_such_fact", BeforeValue: "200", AfterValue: "403"}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	assessment, _ := p.Analyze(TransitionCase{Transition: tr})
+	if assessment != TransitionInsufficientEvidence {
+		t.Fatalf("Analyze (before fact absent) = %q, want %q", assessment, TransitionInsufficientEvidence)
+	}
+}
+
+// TestE6FactTransitionAfterMissingIsInsufficientEvidence covers "before
+// matched the precondition, but the fact is absent from AFTER" ->
+// insufficient_evidence, never violated and never satisfied. Both real
+// projectors this codebase has (HTTPStateProjector, RawLenProjector) always
+// populate a FIXED set of Fact keys regardless of input content, so this
+// specific combination — the same named fact present before, absent after —
+// cannot arise through Explorer's own validated Produce/Analyze path (which
+// requires both fingerprints to share one projector, and therefore one fixed
+// key set). It is still real defensive code (structurally identical to the
+// analogous ok-checks in analyzeFactUnchanged/analyzeFactEquals, and a future
+// projector's Facts could legitimately be content-dependent), so this test
+// exercises analyzeFactTransition directly with two REAL, independently
+// projector-built Fingerprints — deliberately bypassing Analyze's own
+// validate() (which would reject a cross-projector transition before ever
+// reaching this code path) to isolate the analyzer helper's own ok-check
+// logic.
+func TestE6FactTransitionAfterMissingIsInsufficientEvidence(t *testing.T) {
+	before := e6Fingerprint(t, 200, "ok") // HTTPStateProjector: has "status"
+	after, err := stateauth.FixtureRegistry().Project(stateauth.StateArtifact{ScopeHash: e6ScopeHash, Raw: []byte("rawlen-fixture")})
+	if err != nil {
+		t.Fatalf("Project: %v", err)
+	} // RawLenProjector: only "raw_len" — no "status" fact at all
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "200"}, e6AuthoritativeSource())
+	rc := resolvedTransitionCase{Transition: tr, Rule: rule}
+	assessment, anomalies := analyzeFactTransition(rc)
+	if assessment != TransitionInsufficientEvidence {
+		t.Fatalf("analyzeFactTransition (after fact absent) = %q, want %q", assessment, TransitionInsufficientEvidence)
+	}
+	if anomalies != nil {
+		t.Fatalf("analyzeFactTransition (after fact absent) anomalies = %v, want nil", anomalies)
+	}
+}
+
+// --- scope-inconsistent / illegal action, with a rule that WOULD otherwise apply
 
 func TestE6ScopeInconsistentTransitionRejected(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 403, "denied")
 	tr := e6Transition(t, before, after)
-	tr.ScopeHash = "a-completely-different-scope" // now self-contradictory
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectStateUnchanged}, e6AuthoritativeSource())
+	tr.ScopeHash = "a-completely-different-scope" // now self-contradictory, AFTER the rule was keyed on the original action
 	if tr.ScopeConsistent() {
 		t.Fatal("test setup bug: transition must actually be scope-inconsistent")
 	}
-	c := TransitionCase{
-		Transition:        tr,
-		Expectation:       TransitionExpectation{Kind: ExpectStateUnchanged},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	if got := NewStateMachineProducer().Produce(c); got != nil {
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	if got := p.Produce(TransitionCase{Transition: tr}); got != nil {
 		t.Fatalf("Produce (scope-inconsistent transition) = %v, want nil", got)
 	}
 }
 
-// --- 12. illegal / zero-value BoundAction transition -> reject -------------
-
-func TestE6ZeroValueBoundActionTransitionRejected(t *testing.T) {
-	before := e6Fingerprint(t, 200, "ok")
-	after := e6Fingerprint(t, 403, "denied")
-	tr := e6Transition(t, before, after)
-	tr.Action = actionauth.BoundAction{} // never actually authorized
-	c := TransitionCase{
-		Transition:        tr,
-		Expectation:       TransitionExpectation{Kind: ExpectStateUnchanged},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	if got := NewStateMachineProducer().Produce(c); got != nil {
-		t.Fatalf("Produce (zero-value BoundAction) = %v, want nil", got)
-	}
-}
-
-// --- 13. Candidate.State is always Hypothesis -------------------------------
+// --- Candidate.State is always Hypothesis -----------------------------------
 
 func TestE6ProducedCandidateStateIsAlwaysHypothesis(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 403, "denied")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectStateUnchanged},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	got := NewStateMachineProducer().Produce(c)
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectStateUnchanged}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	got := p.Produce(TransitionCase{Transition: tr})
 	if len(got) != 1 {
 		t.Fatalf("setup: expected exactly 1 candidate, got %d", len(got))
 	}
@@ -287,81 +422,119 @@ func TestE6ProducedCandidateStateIsAlwaysHypothesis(t *testing.T) {
 	}
 }
 
-// --- 14. Candidate.Provenance().RawInputHash == case hash, != TransitionArtifactHash
+// --- Candidate.Provenance().RawInputHash == resolved case hash -------------
 
 func TestE6CandidateRawInputHashIsCaseHashNotTransitionArtifactHash(t *testing.T) {
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 403, "denied")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectStateUnchanged},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	got := NewStateMachineProducer().Produce(c)
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectStateUnchanged}, e6AuthoritativeSource())
+	p := NewStateMachineProducer(NewTransitionRuleRegistry(rule))
+	got := p.Produce(TransitionCase{Transition: tr})
 	if len(got) != 1 {
 		t.Fatalf("setup: expected exactly 1 candidate, got %d", len(got))
 	}
-	wantCaseHash := transitionCaseArtifactHash(c)
+	wantCaseHash := transitionCaseArtifactHash(resolvedTransitionCase{Transition: tr, Rule: rule})
 	rawInputHash := got[0].Provenance().RawInputHash
 	if rawInputHash != wantCaseHash {
-		t.Fatalf("Provenance().RawInputHash = %q, want the TransitionCase artifact hash %q", rawInputHash, wantCaseHash)
+		t.Fatalf("Provenance().RawInputHash = %q, want the resolved case artifact hash %q", rawInputHash, wantCaseHash)
 	}
-	if rawInputHash == c.Transition.TransitionArtifactHash {
-		t.Fatalf("Provenance().RawInputHash must NEVER equal StateTransition.TransitionArtifactHash alone (it omits Expectation/ExpectationSource)")
+	if rawInputHash == tr.TransitionArtifactHash {
+		t.Fatalf("Provenance().RawInputHash must NEVER equal StateTransition.TransitionArtifactHash alone (it omits the resolved Rule)")
 	}
-	if got[0].Refs["transition_artifact_hash"] != c.Transition.TransitionArtifactHash {
+	if got[0].Refs["transition_artifact_hash"] != tr.TransitionArtifactHash {
 		t.Fatalf("Refs[transition_artifact_hash] = %q, want %q (still recorded, just not as RawInputHash)",
-			got[0].Refs["transition_artifact_hash"], c.Transition.TransitionArtifactHash)
+			got[0].Refs["transition_artifact_hash"], tr.TransitionArtifactHash)
 	}
 	if got[0].Refs["case_artifact_hash"] != wantCaseHash {
 		t.Fatalf("Refs[case_artifact_hash] = %q, want %q", got[0].Refs["case_artifact_hash"], wantCaseHash)
 	}
+	if got[0].Refs["rule_id"] != rule.RuleID {
+		t.Fatalf("Refs[rule_id] = %q, want %q", got[0].Refs["rule_id"], rule.RuleID)
+	}
 }
 
-// --- 15/16/17. transitionCaseArtifactHash stability and sensitivity --------
+// --- E6-C: transitionCaseArtifactHash canonical-DTO coverage ---------------
+//
+// Each test below constructs two resolvedTransitionCase values differing in
+// EXACTLY ONE field and proves the hash differs — direct evidence that
+// transitionCaseArtifactHash actually reads through to that field via
+// Fingerprint/BoundAction's real accessor methods, rather than silently
+// hashing "{}" for an opaque struct it never actually unpacked.
 
-func TestE6CaseArtifactHashStableForIdenticalCase(t *testing.T) {
+func e6BaseResolvedCase(t *testing.T) resolvedTransitionCase {
+	t.Helper()
 	before := e6Fingerprint(t, 200, "ok")
 	after := e6Fingerprint(t, 403, "denied")
-	c := TransitionCase{
-		Transition:        e6Transition(t, before, after),
-		Expectation:       TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "403"},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
-	h1 := transitionCaseArtifactHash(c)
-	h2 := transitionCaseArtifactHash(c)
+	tr := e6Transition(t, before, after)
+	rule := e6RuleFor(tr, TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "403"}, e6AuthoritativeSource())
+	return resolvedTransitionCase{Transition: tr, Rule: rule}
+}
+
+func TestE6CaseArtifactHashStableForIdenticalCase(t *testing.T) {
+	rc := e6BaseResolvedCase(t)
+	h1 := transitionCaseArtifactHash(rc)
+	h2 := transitionCaseArtifactHash(rc)
 	if h1 != h2 {
 		t.Fatalf("transitionCaseArtifactHash is not stable across calls on the identical case: %q != %q", h1, h2)
 	}
 }
 
-func TestE6CaseArtifactHashChangesWhenExpectationChanges(t *testing.T) {
-	before := e6Fingerprint(t, 200, "ok")
-	after := e6Fingerprint(t, 403, "denied")
-	tr := e6Transition(t, before, after)
-	base := TransitionCase{
-		Transition:        tr,
-		Expectation:       TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "403"},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
+func TestE6CaseArtifactHashChangesWhenBeforeFingerprintChanges(t *testing.T) {
+	base := e6BaseResolvedCase(t)
 	changed := base
-	changed.Expectation.AfterValue = "418" // only the Expectation moved
+	changed.Transition.BeforeFingerprint = e6Fingerprint(t, 201, "different before body")
+	if transitionCaseArtifactHash(base) == transitionCaseArtifactHash(changed) {
+		t.Fatal("transitionCaseArtifactHash must change when ONLY BeforeFingerprint changes")
+	}
+}
+
+func TestE6CaseArtifactHashChangesWhenAfterFingerprintChanges(t *testing.T) {
+	base := e6BaseResolvedCase(t)
+	changed := base
+	changed.Transition.AfterFingerprint = e6Fingerprint(t, 404, "different after body")
+	if transitionCaseArtifactHash(base) == transitionCaseArtifactHash(changed) {
+		t.Fatal("transitionCaseArtifactHash must change when ONLY AfterFingerprint changes")
+	}
+}
+
+func TestE6CaseArtifactHashChangesWhenActionIdentityChanges(t *testing.T) {
+	base := e6BaseResolvedCase(t)
+	// A different BoundAction, same scope/state, same projector, but a
+	// DIFFERENT registered action key -> a different ActionID.
+	otherAction := e6BoundActionForKey(t, "a-different-action-key", e6ScopeHash, base.Transition.BeforeFingerprint)
+	changed := base
+	changed.Transition.Action = otherAction
+	if base.Transition.Action.ID() == changed.Transition.Action.ID() {
+		t.Fatal("test setup bug: the two BoundActions must have different ActionIDs")
+	}
+	if transitionCaseArtifactHash(base) == transitionCaseArtifactHash(changed) {
+		t.Fatal("transitionCaseArtifactHash must change when ONLY the action identity changes")
+	}
+}
+
+func TestE6CaseArtifactHashChangesWhenScopeHashChanges(t *testing.T) {
+	base := e6BaseResolvedCase(t)
+	changed := base
+	changed.Transition.ScopeHash = "a-different-scope-hash-string"
+	if transitionCaseArtifactHash(base) == transitionCaseArtifactHash(changed) {
+		t.Fatal("transitionCaseArtifactHash must change when ONLY Transition.ScopeHash changes")
+	}
+}
+
+func TestE6CaseArtifactHashChangesWhenExpectationChanges(t *testing.T) {
+	base := e6BaseResolvedCase(t)
+	changed := base
+	changed.Rule.Expectation.AfterValue = "a-different-after-value" // only the Expectation moved
 	if transitionCaseArtifactHash(base) == transitionCaseArtifactHash(changed) {
 		t.Fatal("transitionCaseArtifactHash must change when Expectation changes")
 	}
 }
 
 func TestE6CaseArtifactHashChangesWhenExpectationSourceIDChanges(t *testing.T) {
-	before := e6Fingerprint(t, 200, "ok")
-	after := e6Fingerprint(t, 403, "denied")
-	tr := e6Transition(t, before, after)
-	base := TransitionCase{
-		Transition:        tr,
-		Expectation:       TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "403"},
-		ExpectationSource: e6AuthoritativeSource(),
-	}
+	base := e6BaseResolvedCase(t)
 	changed := base
-	changed.ExpectationSource.ID = "a-different-config-pointer" // only ExpectationSource.ID moved
+	changed.Rule.ExpectationSource.ID = "a-different-config-pointer" // only ExpectationSource.ID moved
 	if transitionCaseArtifactHash(base) == transitionCaseArtifactHash(changed) {
 		t.Fatal("transitionCaseArtifactHash must change when ExpectationSource.ID changes")
 	}

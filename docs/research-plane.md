@@ -877,17 +877,45 @@ the guarantees hold under test:
     added to `research/candidate.go` beside `diff`/`fuzz`/`differential`/`ai`
     at the exact same level — a SOURCE label, never a higher-confidence
     marker.
-  - **`TransitionCase` is the producer's ONLY input**: an already-recorded
-    `StateTransition` (Explorer's own output), paired with an explicit
-    `TransitionExpectation` and the `ExpectationSource` that authored it.
-    `ExpectationSource` is S9's already-frozen whitelist, reused
-    **UNCHANGED** — E6 invents no second "who may define correct behavior"
-    system. `spec` / `deterministic_rule` / `human_config` / `detection_fact`
-    remain the only authoritative kinds; `ai`, `llm`, `candidate`,
-    `proposal`, `fuzz`, `diff`, and even `state_machine` itself all remain
-    non-authoritative — so an AI that looks at a transition and says "I
-    think this should stay unauthenticated" produces analysis text, never a
-    `TransitionExpectation`.
+  - **`TransitionCase` is the producer's per-observation input: just the
+    observed `StateTransition`** (Explorer's own output) — it carries no
+    `Expectation`/`ExpectationSource` of its own. What it is judged against
+    is resolved INTERNALLY, from the producer's own `TransitionRuleRegistry`
+    (below), by the transition's actual `(ActionID, ProjectorID)` pair.
+  - **First regression, found on audit before freeze: v1's first cut let a
+    caller pair ANY `TransitionExpectation`/`ExpectationSource` directly with
+    ANY `TransitionCase`, checking only that the `ExpectationSource` was
+    authoritative — never that it was the RIGHT expectation for the action
+    that actually ran.** A legitimately spec-authored `Expectation` written
+    for action A could be paired, at the call site, with a transition whose
+    real `Action` was B, and nothing would catch the mismatch — an
+    authoritative source is not the same guarantee as "this rule applies to
+    this transition". Fixed: `TransitionRule{RuleID, ActionID, ProjectorID,
+    Expectation, ExpectationSource}` plus `TransitionRuleRegistry` — a
+    compile-time-only, closed set (the S10/E6 analogue of `actionauth.Registry`
+    and S5's Validator registry) — is now the ONLY place an `Expectation` and
+    `ExpectationSource` are ever paired. `NewStateMachineProducer(rules
+    *TransitionRuleRegistry)` binds a producer to exactly one registry;
+    `Produce`/`Analyze` resolve the ONE rule registered for a transition's own
+    `Action.ID()` and `BeforeFingerprint.ProjectorID()` — never accept one
+    supplied alongside the transition. No rule registered for that pair means
+    no judgment at all (`TransitionInsufficientEvidence`, zero candidates) —
+    covering both "no `ExpectationSource`" and "differing states with no
+    declared expectation" from the original gate list, since both are now
+    simply "nothing is registered for this action". `TestE6RuleRegisteredForOneActionNeverAppliesToAnother`
+    proves the fix directly: a rule registered for action `action-a` never
+    applies to a transition whose actual action is `action-b`, even with a
+    status that would have violated `action-a`'s rule.
+    `TestE6ZeroValueBoundActionRejectedEvenIfRuleRegisteredForItsID` and
+    `TestE6AIOrLLMSourceRejectedEvenIfSomehowRegistered` prove defense in
+    depth: `validate()` (below) still independently re-checks authority and
+    authorization even for a rule the registry did resolve — a phantom rule
+    mistakenly registered against the zero-value `ActionID`, or one built
+    with a non-authoritative `ExpectationSource`, still produces nothing.
+    `validate()` also newly requires both `BeforeFingerprint` and
+    `AfterFingerprint` to have been produced by the SAME `ProjectorID` the
+    rule itself names — a transition straddling two different state-authority
+    models is rejected, never judged.
   - **`TransitionExpectation` is PLAIN DATA, never a callback.** The same
     declarative-not-closure lesson `actionauth.Registration.Requirements`
     already forced (a closure can silently capture anything — a candidate,
@@ -895,77 +923,113 @@ the guarantees hold under test:
     a closed `TransitionExpectationKind` enum (`state_unchanged`,
     `fact_unchanged`, `fact_equals`, `fact_transition`) plus `Fact`,
     `BeforeValue`, `AfterValue` string fields is the entire vocabulary v1
-    supports. `TransitionCase.validate()` rejects a non-authoritative
-    `ExpectationSource`, a self-contradictory (`ScopeConsistent() == false`)
-    transition, and — reusing `actionauth.BoundAction.ValidFor` exactly as
-    designed — a transition whose `Action` was never actually authorized
-    for the state it claims to have started from (a zero-value or replayed
-    `BoundAction` always fails `ValidFor` and so always fails validation
-    here too).
+    supports.
   - **Fact absence is never silently treated as an empty string.** Every
     `analyzeFact*` helper reads `value, ok := facts[key]` and returns
     `TransitionInsufficientEvidence` — never `TransitionViolated` — the
     instant a fact the rule needs is simply ABSENT. This is the same
     zero-false-positive discipline S9's boundary judgment already follows:
     absence of evidence must never manufacture a violation.
-  - **`TransitionAssessment` is THREE-STATE, never a bool**: `satisfied` /
-    `violated` / `insufficient_evidence`. Only `violated` ever produces a
-    candidate; both `satisfied` and `insufficient_evidence` produce zero.
+  - **Second regression, found on the same audit: `fact_transition`'s
+    original v1 treated "before doesn't even match the declared BeforeValue"
+    as a plain mismatch, collapsing it into the same `violated` bucket as an
+    actual after-side deviation.** `fact_transition`'s own contract — "IF
+    before==BeforeValue THEN after must==AfterValue" — is a rule with an
+    explicit precondition; a transition that never started at BeforeValue
+    isn't violating it, the rule simply never engaged. Treating every
+    precondition-mismatch as a violation would flag every transition the
+    rule was never written for. Fixed: `TransitionAssessment` grew a FOURTH
+    state, `TransitionNotApplicable`, used ONLY by `analyzeFactTransition`.
+    Its check order is precondition-first: `before` fact absent →
+    `insufficient_evidence`; `before` present but `!= BeforeValue` →
+    `not_applicable` (checked and returned BEFORE ever looking at `after` —
+    so a precondition mismatch is decisive even if `after`'s fact happens to
+    be absent for an unrelated reason); `before == BeforeValue` and `after`
+    absent → `insufficient_evidence`; `before == BeforeValue` and `after !=
+    AfterValue` → `violated`; both match → `satisfied`. Only `violated` ever
+    produces a candidate. `TestE6FactTransitionPreconditionNeverHeldIsNotApplicable`
+    pins the fix; `TestE6FactTransitionBeforeMissingIsInsufficientEvidenceNotNotApplicable`
+    and `TestE6FactTransitionAfterMissingIsInsufficientEvidence` pin the two
+    absence cases distinctly from it (the latter exercises the analyzer
+    helper directly with two independently-projected real `Fingerprint`
+    values, since both projectors this codebase has today populate a FIXED
+    Facts key set regardless of content, making "present before, absent
+    after" for the SAME key unreachable through Explorer's own validated
+    path — the check is still real defensive code, proven correct in
+    isolation).
   - **`TransitionAnomaly` is FACTS ONLY** — `Type`, `RuleKind`, `Fact`,
     `ExpectedBefore/After`, `ObservedBefore/After`, `EvidenceRefs`; no
     `Severity`/`Confidence`/`Exploitability`/`Vulnerable`/`Confirmed`/`State`
     field anywhere, and deliberately not called `Finding` — it is what the
     deterministic analyzer found, nothing about what it means.
     `StateMachineProducer.Produce` is the only thing that wraps it into a
-    hypothesis `Candidate`, and it is kept BORING on purpose: validate
-    authority → hash the raw case artifact → analyze deterministically →
-    take only `violated` → `NewHypothesis`. It never re-executes the
-    action, re-collects state, calls an LLM, decides a validator, or
-    promotes anything.
-  - **Provenance/hash discipline, the S8/S9 lossless-vs-denoised split
-    extended to E6.** `StateTransition.TransitionArtifactHash` is
-    Explorer's OWN record of the transition it observed — it does not cover
-    `Expectation`/`ExpectationSource` at all, so it is never what
-    `Candidate.Provenance().RawInputHash` points at.
-    `transitionCaseArtifactHash` is the LOSSLESS canonical serialization of
-    the FULL `TransitionCase` this producer actually consumed (`Transition`
-    + `Expectation` + `ExpectationSource`, including every fact in both
-    fingerprints, sorted only because Go maps have no defined order) — THIS
-    is what `RawInputHash` points at, keeping that field's frozen,
-    cross-producer meaning intact. `TransitionArtifactHash` is still
-    recorded, in `Refs`, alongside `case_artifact_hash`,
-    `expectation_source_kind/id`, `expectation_kind`, and
-    `action_registry_key/variant_id` — never in place of the case hash.
+    hypothesis `Candidate`, and it is kept BORING on purpose: resolve the
+    registered rule → validate authority → hash the raw case artifact →
+    analyze deterministically → take only `violated` → `NewHypothesis`. It
+    never re-executes the action, re-collects state, calls an LLM, decides a
+    validator, or promotes anything.
+  - **Third regression, found on the same audit: nothing PROVED
+    `transitionCaseArtifactHash` actually read through
+    `stateauth.Fingerprint`/`actionauth.BoundAction`'s real fields rather than
+    (say) silently hashing an opaque struct's zero-exported-field JSON
+    (`"{}"`) — both types keep their real fields unexported specifically so
+    no outside package can construct OR serialize them directly.** The
+    original gate list only proved the hash was sensitive to `Expectation`
+    and `ExpectationSource.ID`; it never independently proved sensitivity to
+    `BeforeFingerprint`, `AfterFingerprint`, the action identity, or
+    `ScopeHash` — exactly the fields most likely to be silently dropped by an
+    unsafe serialization. `transitionCaseArtifactHash` already read every
+    value through the correct exported accessor methods
+    (`Fingerprint.ScopeHash/RawStateArtifactHash/StateFingerprintHash/
+    ProjectorID/Facts`, `BoundAction.ID`) rather than `json.Marshal`-ing
+    either opaque type — the audit asked for this to be PROVEN, not
+    redesigned. Fixed by adding six direct, single-field-diff tests
+    (`TestE6CaseArtifactHashChangesWhen{BeforeFingerprint,AfterFingerprint,
+    ActionIdentity,ScopeHash,Expectation,ExpectationSourceID}Changes`), each
+    holding every other field fixed and proving the hash moves. Provenance/
+    hash discipline otherwise unchanged from the S8/S9 lossless-vs-denoised
+    split: `StateTransition.TransitionArtifactHash` (Explorer's OWN record)
+    is never what `Candidate.Provenance().RawInputHash` points at;
+    `transitionCaseArtifactHash` — now covering the resolved `Transition` +
+    `TransitionRule` pair, including `RuleID` — is. Both, plus
+    `expectation_source_kind/id`, `expectation_kind`, `rule_id`, and
+    `action_registry_key/variant_id`, are recorded in `Refs`.
   - **E6 registers no second "define correct behavior after the fact"
-    escape hatch.** An `Expectation` must exist, authored by an
-    authoritative `ExpectationSource`, BEFORE the `Explorer` session that
-    produces the `StateTransition` it will be judged against ever runs —
-    E6 has no code path that looks at an observed transition and invents
-    what "should" have happened; that would be hindsight bias wearing a
-    detection hat.
-  - **17-item freeze-gate battery** (`research/state_machine_producer_test.go`),
-    every fixture built through the REAL authority packages
-    (`stateauth.HTTPFixtureRegistry()` for `Fingerprint`,
-    `actionauth.ActionPolicy.Select` for `BoundAction` — never a struct
-    literal, since neither type can be constructed with a real identity
-    from outside its own package): no `ExpectationSource` → reject; an
-    `ai`/`llm`/`candidate`/`proposal`/`fuzz`/`diff`/`state_machine` source →
-    reject; differing states with no declared `Expectation` → 0 candidates;
-    `state_unchanged` violated → exactly 1 hypothesis; `state_unchanged`
-    satisfied → 0; `fact_unchanged` with an absent fact →
-    `insufficient_evidence`, 0 candidates; `fact_equals` satisfied → 0;
-    `fact_equals` violated → 1; `fact_transition` A→B as declared → 0;
-    `fact_transition` actually A→C → 1; a scope-inconsistent transition →
-    reject; a zero-value `BoundAction` transition → reject; produced
-    `Candidate.State` is always `Hypothesis`; `Provenance().RawInputHash`
-    equals the `TransitionCase` artifact hash and never equals
-    `TransitionArtifactHash` alone; the case hash is stable across repeated
-    calls on an identical case; and the case hash changes when either
-    `Expectation` or `ExpectationSource.ID` alone changes. All 17 pass.
+    escape hatch.** A `TransitionRule` must be registered BEFORE the
+    `Explorer` session that produces the `StateTransition` it will be judged
+    against ever runs — E6 has no code path that looks at an observed
+    transition and invents what "should" have happened; that would be
+    hindsight bias wearing a detection hat.
+  - **`S10-E6 = FROZEN`** after this second audit round. 24-item freeze-gate
+    battery (`research/state_machine_producer_test.go`), every fixture built
+    through the REAL authority packages (`stateauth.HTTPFixtureRegistry()`/
+    `stateauth.FixtureRegistry()` for `Fingerprint`, `actionauth.ActionPolicy.
+    Select` for `BoundAction` — never a struct literal, since neither type
+    can be constructed with a real identity from outside its own package):
+    no rule registered → 0 candidates (covers both "no `ExpectationSource`"
+    and "differing states with no declared expectation"); an
+    `ai`/`llm`/`candidate`/`proposal`/`fuzz`/`diff`/`state_machine` source,
+    even if registered → reject; a rule registered for one action never
+    applies to another action's transition; a zero-value `BoundAction`,
+    even with a rule registered for its zero `ActionID` → reject;
+    `state_unchanged` violated → exactly 1 hypothesis, satisfied → 0;
+    `fact_unchanged` with an absent fact → `insufficient_evidence`;
+    `fact_equals` satisfied → 0, violated → 1; `fact_transition` A→B as
+    declared → 0 (`satisfied`), A→C → 1 (`violated`), precondition never
+    held → 0 (`not_applicable`), before/after fact absent → 0
+    (`insufficient_evidence`, distinct from `not_applicable`); a
+    scope-inconsistent transition → reject; produced `Candidate.State` is
+    always `Hypothesis`; `Provenance().RawInputHash` equals the resolved case
+    hash and never equals `TransitionArtifactHash` alone; the case hash is
+    stable across repeated calls; and the case hash independently changes
+    when `BeforeFingerprint`, `AfterFingerprint`, the action identity,
+    `ScopeHash`, `Expectation`, or `ExpectationSource.ID` alone changes. All
+    24 pass.
   - **v1 explicitly does NOT do:** a replay validator, LLM-based judgment of
     what counts as an anomaly, any new execution capability, auto-generating
     an `Expectation` from an observed transition, a `Check func(before,
-    after) bool` callback, treating "fact absent" as `""`, or advancing a
+    after) bool` callback, treating "fact absent" as `""`, letting a caller
+    pair an `Expectation` with an unrelated transition, or advancing a
     `Candidate` past `Hypothesis`. None of these have any code path in
     `research/state_machine_producer.go` today. A state-machine replay
     validator is explicitly deferred to a future stage.
