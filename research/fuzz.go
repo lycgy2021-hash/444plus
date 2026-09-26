@@ -117,16 +117,26 @@ func (k CrashGroupKey) GroupHash() string {
 	return RawInputHash([]byte(k.ScopeHash + "|" + k.SignatureHash))
 }
 
-// CrashGroup is a set of artifacts sharing a signature WITHIN a scope. GroupHash
-// is derived only from scope+signature, so which sample happens to be first never
-// changes the group identity.
+// CrashGroup is a set of artifacts sharing a signature WITHIN a scope. It carries
+// three separate group-level identifiers, none of which is a raw-input hash:
+//   - GroupHash: the logical identity (ScopeHash + SignatureHash) — order- and
+//     content-independent, so the same scope+signature is always the same group.
+//   - MembersDigest: a commitment over ALL members (sorted CrashOutputHashes),
+//     so the full membership set is tamper-evident without storing every hash.
+//   - GroupArtifactHash: the SHA-256 of the canonical serialized group — the exact
+//     artifact the producer ingests to emit a Candidate. This, not GroupHash, is
+//     what a candidate's Provenance.RawInputHash points at, so RawInputHash keeps
+//     its frozen meaning ("byte-for-byte hash of the producer's raw input
+//     artifact") consistently across the AI, diff and fuzz producers.
 type CrashGroup struct {
 	Scope             FuzzScope       `json:"scope"`
 	GroupHash         string          `json:"group_hash"`
+	MembersDigest     string          `json:"members_digest"`
+	GroupArtifactHash string          `json:"group_artifact_hash"`
 	Signature         CrashSignature  `json:"signature"`
 	Interest          CrashInterest   `json:"interest"`
 	Count             uint64          `json:"count"`
-	MemberCrashHashes []string        `json:"member_crash_hashes,omitempty"` // capped; Count is exact
+	MemberCrashHashes []string        `json:"member_crash_hashes,omitempty"` // capped representative membership; Count is exact
 	Samples           []CrashArtifact `json:"-"`
 }
 
@@ -338,6 +348,7 @@ func normalizedTopLine(raw []byte) string {
 func (p *FuzzProducer) Group(scope FuzzScope, artifacts []CrashArtifact) []CrashGroup {
 	scopeHash := scope.Hash()
 	byKey := map[CrashGroupKey]*CrashGroup{}
+	allMembers := map[CrashGroupKey][]string{} // transient: every member's CrashOutputHash
 	for _, a := range artifacts {
 		sig := Signature(a)
 		key := CrashGroupKey{ScopeHash: scopeHash, SignatureHash: sig.Hash}
@@ -348,19 +359,50 @@ func (p *FuzzProducer) Group(scope FuzzScope, artifacts []CrashArtifact) []Crash
 			byKey[key] = g
 		}
 		g.Count++
+		ch := a.CrashOutputHash()
+		allMembers[key] = append(allMembers[key], ch)
 		if len(g.MemberCrashHashes) < p.maxMembers {
-			g.MemberCrashHashes = append(g.MemberCrashHashes, a.CrashOutputHash())
+			g.MemberCrashHashes = append(g.MemberCrashHashes, ch)
 		}
 		if len(g.Samples) < p.maxSamples {
 			g.Samples = append(g.Samples, a)
 		}
 	}
 	out := make([]CrashGroup, 0, len(byKey))
-	for _, g := range byKey {
+	for key, g := range byKey {
+		g.MembersDigest = membersDigest(allMembers[key])
+		g.GroupArtifactHash = groupArtifactHash(g)
 		out = append(out, *g)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].GroupHash < out[j].GroupHash })
 	return out
+}
+
+// membersDigest commits to the FULL membership set: sort every member's
+// CrashOutputHash, join canonically, hash once. Order-independent, and it detects
+// any silent substitution of the set without storing all member hashes.
+func membersDigest(hashes []string) string {
+	sorted := append([]string(nil), hashes...)
+	sort.Strings(sorted)
+	return RawInputHash([]byte(strings.Join(sorted, "\n")))
+}
+
+// groupArtifactHash is the SHA-256 of the canonical serialized group — the exact
+// artifact the producer consumes to emit a candidate. It folds in the membership
+// commitment, so changing the member set changes this hash (and thus the
+// candidate's Provenance.RawInputHash). It is distinct from GroupHash (identity)
+// and SignatureHash (fingerprint).
+func groupArtifactHash(g *CrashGroup) string {
+	canonical := strings.Join([]string{
+		"scope=" + g.Scope.Hash(),
+		"signature=" + g.Signature.Hash,
+		"type=" + g.Signature.CrashType,
+		"access=" + g.Signature.AccessType + "/" + strconv.FormatUint(g.Signature.AccessSize, 10),
+		"interest=" + string(g.Interest),
+		"count=" + strconv.FormatUint(g.Count, 10),
+		"members=" + g.MembersDigest,
+	}, "\n")
+	return RawInputHash([]byte(canonical))
 }
 
 // --- candidate production --------------------------------------------------
@@ -379,7 +421,10 @@ func (p *FuzzProducer) Produce(scope FuzzScope, artifacts []CrashArtifact) []*Ca
 		if g.Interest == InterestNoise {
 			continue
 		}
-		prov := newProvenance(string(OriginFuzz), scope.Hash(), "fuzz", g.GroupHash)
+		// RawInputHash points at the exact producer-input artifact (the serialized
+		// group), NOT at the derived GroupHash identity — keeping RawInputHash's
+		// frozen meaning consistent across producers.
+		prov := newProvenance(string(OriginFuzz), scope.Hash(), "fuzz", g.GroupArtifactHash)
 		short := g.GroupHash
 		if len(short) > 12 {
 			short = short[:12]
@@ -394,13 +439,15 @@ func (p *FuzzProducer) Produce(scope FuzzScope, artifacts []CrashArtifact) []*Ca
 			g.Signature.AccessType, g.Signature.AccessSize, strings.Join(frames, " -> "))
 		c := NewHypothesis(p.newID(), string(g.Interest), title, "", rationale, origin, []string{"crash_input", "crash_reproduced"}, prov)
 		c.Refs = map[string]string{
-			"scope_hash":     g.Scope.Hash(),
-			"signature_hash": g.Signature.Hash,
-			"group_hash":     g.GroupHash,
-			"count":          strconv.FormatUint(g.Count, 10),
-			"crash_type":     g.Signature.CrashType,
-			"access_type":    g.Signature.AccessType,
-			"access_size":    strconv.FormatUint(g.Signature.AccessSize, 10),
+			"scope_hash":          g.Scope.Hash(),
+			"signature_hash":      g.Signature.Hash,
+			"group_hash":          g.GroupHash,
+			"group_artifact_hash": g.GroupArtifactHash,
+			"members_digest":      g.MembersDigest,
+			"count":               strconv.FormatUint(g.Count, 10),
+			"crash_type":          g.Signature.CrashType,
+			"access_type":         g.Signature.AccessType,
+			"access_size":         strconv.FormatUint(g.Signature.AccessSize, 10),
 		}
 		candidates = append(candidates, c)
 	}

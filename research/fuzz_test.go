@@ -159,6 +159,41 @@ func TestFourHashesDistinct(t *testing.T) {
 	}
 }
 
+func TestMembersDigestAndArtifactHash(t *testing.T) {
+	p := NewFuzzProducer()
+	scope := FuzzScope{TargetID: "t", BuildID: "A", HarnessID: "h", Fuzzer: "libfuzzer"}
+	// Two members of the same bug (different raw bytes -> different CrashOutputHash).
+	m := []CrashArtifact{{RawOutput: []byte(asanRun1)}, {RawOutput: []byte(asanRun1 + "\nnonce 0x1")}}
+	g := p.Group(scope, m)[0]
+	if g.MembersDigest == "" || g.GroupArtifactHash == "" {
+		t.Fatal("digest/artifact hash not computed")
+	}
+	// MembersDigest is order-independent.
+	gRev := p.Group(scope, []CrashArtifact{m[1], m[0]})[0]
+	if g.MembersDigest != gRev.MembersDigest || g.GroupArtifactHash != gRev.GroupArtifactHash {
+		t.Fatal("MembersDigest/GroupArtifactHash must be order-independent")
+	}
+	// A different member set (add a third member) changes both digests — the
+	// membership set is tamper-evident even though only capped members are stored.
+	g3 := p.Group(scope, append(append([]CrashArtifact{}, m...), CrashArtifact{RawOutput: []byte(asanRun1 + "\nnonce 0x2")}))[0]
+	if g3.MembersDigest == g.MembersDigest {
+		t.Fatal("changing the member set must change MembersDigest")
+	}
+	if g3.GroupArtifactHash == g.GroupArtifactHash {
+		t.Fatal("changing the member set must change GroupArtifactHash")
+	}
+	// The group-level identifiers are all distinct from each other and from the
+	// fingerprint.
+	all := []string{g.GroupHash, g.MembersDigest, g.GroupArtifactHash, g.Signature.Hash, g.Scope.Hash()}
+	for i := range all {
+		for j := i + 1; j < len(all); j++ {
+			if all[i] == all[j] {
+				t.Fatalf("group identifiers %d and %d must differ", i, j)
+			}
+		}
+	}
+}
+
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		name string
@@ -201,17 +236,21 @@ func TestFuzzProducerCandidates(t *testing.T) {
 		if c.State != Hypothesis || c.Origin.Kind != OriginFuzz {
 			t.Errorf("bad candidate: state=%s origin=%+v", c.State, c.Origin)
 		}
-		// Provenance traces the whole GROUP, not one crash: RawInputHash == GroupHash.
-		if c.Provenance().RawInputHash != c.Refs["group_hash"] {
-			t.Errorf("provenance must point at the group hash, got %q vs %q", c.Provenance().RawInputHash, c.Refs["group_hash"])
+		// Provenance points at the producer's raw INPUT ARTIFACT (the serialized
+		// group), i.e. GroupArtifactHash — NOT the derived GroupHash identity. This
+		// keeps RawInputHash's frozen meaning consistent across producers.
+		if c.Provenance().RawInputHash != c.Refs["group_artifact_hash"] {
+			t.Errorf("RawInputHash must be the group artifact hash, got %q vs %q", c.Provenance().RawInputHash, c.Refs["group_artifact_hash"])
+		}
+		if c.Provenance().RawInputHash == c.Refs["group_hash"] {
+			t.Error("RawInputHash must NOT be the GroupHash (raw-input vs derived-identity semantics)")
 		}
 		// Structured, queryable refs — not just rationale.
-		for _, k := range []string{"scope_hash", "signature_hash", "group_hash", "count", "crash_type"} {
+		for _, k := range []string{"scope_hash", "signature_hash", "group_hash", "group_artifact_hash", "members_digest", "count", "crash_type"} {
 			if c.Refs[k] == "" {
 				t.Errorf("missing structured ref %q", k)
 			}
 		}
-		// The two hashes must stay distinct.
 		if c.Refs["group_hash"] == c.Refs["signature_hash"] {
 			t.Error("group hash and signature hash must not be equal")
 		}

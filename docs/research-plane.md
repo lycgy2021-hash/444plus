@@ -121,12 +121,19 @@ within a FuzzScope into a CrashGroup → deterministic CrashInterest → (only
 non-noise groups) → Candidate{Origin{Kind:"fuzz"}}`. Core principle: **a
 `CrashSignature` is a crash fingerprint, not a global bug id; a `CrashGroup` is
 scoped by build/harness; a Candidate traces the whole group, not one crash.**
-- **Four hashes, never mixed.** `TestcaseHash` (crashing input bytes),
+- **Distinct hashes, never mixed.** `TestcaseHash` (crashing input bytes),
   `CrashOutputHash` (raw crash output), `SignatureHash` (normalized type + access
-  + top stable frames — the fingerprint), `GroupHash` (`ScopeHash + SignatureHash`
-  — the group identity). A fuzz candidate's `Provenance.RawInputHash` is the
-  **GroupHash** (the whole producing group), and structured `Refs`
-  (scope/signature/group hashes, count, type) make it queryable — not just prose.
+  + top stable frames — the *fingerprint*), `GroupHash` (`ScopeHash +
+  SignatureHash` — the group's logical *identity*), `MembersDigest` (a commitment
+  over ALL members' `CrashOutputHash`, sorted — full-set tamper-evidence without
+  storing every hash), and `GroupArtifactHash` (SHA-256 of the canonical
+  serialized group — the exact producer-input artifact). A fuzz candidate's
+  `Provenance.RawInputHash` is the **`GroupArtifactHash`** — the raw producer-input
+  artifact, *not* the derived `GroupHash` — so `RawInputHash` keeps its frozen
+  meaning ("byte-for-byte hash of the raw input the producer ingested")
+  consistently across the AI, diff and fuzz producers. Structured `Refs`
+  (scope/signature/group/artifact hashes, members digest, count, type) make the
+  candidate queryable — not just prose.
 - **Signature discriminates.** It includes sanitizer **access type/size** and
   `StableFrame{Module,Function,Source-basename}`, so two independent faults in one
   function (READ-of-1 vs WRITE-of-4) or different crash types don't merge — while
@@ -177,10 +184,11 @@ the guarantees hold under test:
 - **Provenance: locked.**
 - **S6 (patch/diff intelligence): v1 landed & audited** (deterministic
   `DiffProducer`; an AI diff pass can enrich later). Contract frozen.
-- **S8 (fuzz/crash intelligence): v1 landed + audited** (deterministic
-  `FuzzProducer`; scope-bounded groups, discriminating signatures, four-hash
-  group-level provenance, structured refs, conservative classifier). No AI
-  fuzz-input generation, no auto-exploitability. Ready to freeze.
+- **S8 (fuzz/crash intelligence): v1 frozen** (deterministic `FuzzProducer`;
+  scope-bounded groups, discriminating signatures, `RawInputHash =
+  GroupArtifactHash` (raw producer artifact, not the derived identity),
+  `MembersDigest` full-set commitment, structured refs, conservative classifier).
+  No AI fuzz-input generation, no auto-exploitability. Contract frozen.
 - **Deferred:** `S7` large-scale source audit, `S9` differential engine, `S10`
   state-machine explorer — not until S6/S8 are stable.
 
