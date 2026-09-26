@@ -104,7 +104,11 @@ type Candidate struct {
 	// Refs are producer-specific structured references (not free text), so a
 	// candidate can be queried/aggregated/correlated without parsing the rationale
 	// — e.g. a fuzz candidate carries scope_hash/signature_hash/group_hash/count.
-	// They are descriptive metadata, never authority (they cannot change state).
+	// They are descriptive metadata for humans, never authority: Refs is an
+	// ordinary, exported, MUTABLE map — any caller holding *Candidate can rewrite
+	// it after construction. Nothing may gate a decision on it. S10/E7's replay
+	// validator specifically must not (see stateMachineBinding below for the
+	// authoritative alternative it actually uses).
 	Refs    map[string]string `json:"refs,omitempty"`
 	History []Transition      `json:"history,omitempty"`
 
@@ -116,10 +120,37 @@ type Candidate struct {
 	// gives the full, tamper-evident lineage of any conclusion.
 	provenance Provenance
 
+	// stateMachineBinding is S10/E6's own immutable, tamper-proof identity for a
+	// state-machine Candidate — set ONLY by StateMachineProducer.Produce (this
+	// package's own S10/E6 code; there is no exported setter), never nil-checked
+	// or reachable from any other producer or external caller. Unlike Refs, a
+	// caller cannot rewrite it: StateMachineBinding() returns a VALUE COPY of an
+	// already-immutable, pointer/slice/map-free value type, so nothing the
+	// caller does with the copy can affect this Candidate's own identity. This
+	// exists specifically because S10/E7's replay validator must resolve WHICH
+	// rule/action/projector/target to replay from something a caller cannot have
+	// silently swapped out after E6 produced it — trusting the mutable Refs map
+	// for that would let a caller retarget a replay to a different (still
+	// trusted) rule after the fact. nil for every Candidate not produced by
+	// StateMachineProducer.
+	stateMachineBinding *StateMachineBinding
+
 	// mu guards the read-modify-write in Promote so concurrent promotions cannot
 	// skip a rung (one wins hypothesis→reproducible; the rest see the advanced
 	// state and are rejected). A Candidate is always held by pointer, never copied.
 	mu sync.Mutex
+}
+
+// StateMachineBinding returns a copy of c's immutable S10/E6 replay
+// identity, if c was produced by StateMachineProducer (ok=false otherwise).
+// The returned value is a copy of an already-immutable value type (plain
+// strings and an actionauth.ActionID — no pointers, slices, or maps), so it
+// can never be used to mutate c's own binding.
+func (c *Candidate) StateMachineBinding() (StateMachineBinding, bool) {
+	if c.stateMachineBinding == nil {
+		return StateMachineBinding{}, false
+	}
+	return *c.stateMachineBinding, true
 }
 
 // NewHypothesis constructs a candidate at Hypothesis — the only entry point for

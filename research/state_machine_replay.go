@@ -23,23 +23,41 @@ import (
 //
 // INDEPENDENT EVIDENCE, NOT A REPLAY OF OLD DATA. Replay never reads the
 // original StateTransition's own BeforeFingerprint/AfterFingerprint as if
-// they were evidence — it treats the Candidate's Refs purely as "what to
-// test" (which rule, which action, which projector, which target), and
-// produces every fact fresh: a new Collect, a new authorized Action bind,
-// a new Execute, a new Collect. The original transition is provenance
-// (what raised the hypothesis); it is never replay evidence (what confirms
-// or refutes it).
+// they were evidence — it treats the Candidate's immutable
+// StateMachineBinding purely as "what to test" (which rule, which action,
+// which projector, which target), and produces every fact fresh: a new
+// Collect, a new authorized Action bind, a new Execute, a new Collect. The
+// original transition is provenance (what raised the hypothesis); it is
+// never replay evidence (what confirms or refutes it).
 //
-// NO REOPENED "CALLER PICKS ACTIONID" BYPASS. A Candidate's own
-// Refs["action_registry_key"]/["action_variant_id"] are NEVER handed
-// directly to an Executor. Replay resolves rule := rules.LookupByRuleID(c.
-// Refs["rule_id"]) against its OWN trusted TransitionRuleRegistry FIRST,
-// cross-checks the Candidate's claimed action/projector identity against
-// THAT rule (rejecting on any mismatch), and only then binds rule.ActionID
-// — via a throwaway, single-entry actionauth.Registry scoped to exactly
-// that RegistryKey, so ActionPolicy.Select is structurally incapable of
-// returning anything else. The Candidate never supplies an execution
-// credential, directly or indirectly.
+// NO REOPENED "CALLER PICKS ACTIONID" BYPASS, AND RULE AUTHORITY NEVER
+// SUBSTITUTES FOR ACTION AUTHORITY. TransitionRuleRegistry defines WHAT a
+// transition is judged against; it is NOT the authority for WHETHER an
+// action may execute right now — that remains v.policy's (the SAME trusted
+// actionauth.ActionPolicy a real Explorer session for this target would
+// use) job alone, exactly as S10-E1 established. Replay resolves rule :=
+// rules.LookupByRuleID(binding.RuleID()) against its OWN trusted
+// TransitionRuleRegistry FIRST, cross-checks binding.ActionID()/
+// ProjectorID() against THAT rule (rejecting on any mismatch), then calls
+// v.policy.Select against the FRESH baseline — exactly like a real
+// Explorer's own Step — and ONLY proceeds if the policy's own selection
+// happens to equal rule.ActionID. If Select returns nothing applicable, or
+// returns a DIFFERENT action than the rule names, Replay reports
+// OutcomeNoSignal and executes NOTHING: it never falls back to forcing
+// rule.ActionID through a registry Replay builds for itself. A rule
+// authored by a trusted TransitionRuleRegistry never grants an execution
+// credential on its own; only the SAME ActionPolicy that would have
+// authorized it during real exploration does.
+//
+// CANDIDATE.REFS IS NEVER TRUSTED FOR AUTHORITY. Replay resolves rule_id/
+// action identity/projector identity/target hash exclusively from
+// c.StateMachineBinding() — an immutable value StateMachineProducer.Produce
+// attaches through an unexported Candidate field with no exported setter,
+// so no caller holding *Candidate can rewrite it after construction (unlike
+// Refs, an ordinary mutable map any caller can and does rewrite for
+// human-readable audit purposes). Without this, a caller could retarget a
+// replay to a different — still individually trusted — rule after E6 had
+// already produced the Candidate, by editing Refs["rule_id"] in place.
 //
 // FRESH SESSION, SAME TARGET. v.target (a ReplayTarget — TargetID/BuildID/
 // Protocol/HarnessID, deliberately WITHOUT SessionID) is fixed at
@@ -48,7 +66,15 @@ import (
 // proves reproduction under a genuinely INDEPENDENT session against the
 // SAME real-world target — never "the same recorded session replayed", and
 // never a substituted target (Replay rejects a Candidate whose
-// Refs["replay_target_hash"] does not match v.target.Hash()).
+// binding.ReplayTargetHash() does not match v.target.Hash()).
+//
+// STRICT READ-ONLY ACTIONS ONLY. v1 implements no verified-recovery flow
+// (Execute -> collect -> BoundRecovery -> ExecuteRecovery -> collect ->
+// stateauth.Recovered()), so it refuses to replay any rule whose
+// TransitionRule.ReadOnlyAction is not explicitly true
+// (ErrReplayActionNotReadOnly) — see that field's own doc. A future version
+// that wants to replay actions needing real recovery must implement and
+// prove that flow first, as its own explicit, separately reviewed design.
 //
 // NO STATE PREPARATION. If ExpectFactTransition's own precondition
 // (before.Facts[Fact] == BeforeValue) does not hold against the FRESH
@@ -69,6 +95,7 @@ type StateMachineReplayValidator struct {
 	rules     *TransitionRuleRegistry
 	collector Collector
 	projector *stateauth.BoundRegistry
+	policy    *actionauth.ActionPolicy
 	executor  Executor
 	budget    ReplayBudget
 }
@@ -91,23 +118,27 @@ func (b ReplayBudget) Valid() bool { return b.MaxRequests > 0 && b.MaxWallTime >
 // NewStateMachineReplayValidator builds a validator bound to exactly one
 // ReplayTarget, one TRUSTED TransitionRuleRegistry (the SAME registry — or
 // an equally trusted one built the same way — that produced the candidates
-// it will be asked to replay), and one Collector/projector/Executor triple
-// for that target. It performs no I/O.
+// it will be asked to replay), one TRUSTED actionauth.ActionPolicy (the
+// SAME policy — or an equally trusted one built the same way — a real
+// Explorer session for this target would use; Replay defers to it, never
+// substitutes a rule's own ActionID for its authority), and one
+// Collector/projector/Executor triple for that target. It performs no I/O.
 func NewStateMachineReplayValidator(
 	target ReplayTarget,
 	rules *TransitionRuleRegistry,
+	policy *actionauth.ActionPolicy,
 	collector Collector,
 	projector *stateauth.BoundRegistry,
 	executor Executor,
 	budget ReplayBudget,
 ) (*StateMachineReplayValidator, error) {
-	if rules == nil || collector == nil || projector == nil || executor == nil {
-		return nil, errors.New("research: replay validator requires a non-nil rules registry, collector, projector, and executor")
+	if rules == nil || policy == nil || collector == nil || projector == nil || executor == nil {
+		return nil, errors.New("research: replay validator requires a non-nil rules registry, action policy, collector, projector, and executor")
 	}
 	if !budget.Valid() {
 		return nil, errors.New("research: replay budget is invalid (MaxRequests and MaxWallTime must both be strictly positive)")
 	}
-	return &StateMachineReplayValidator{target: target, rules: rules, collector: collector, projector: projector, executor: executor, budget: budget}, nil
+	return &StateMachineReplayValidator{target: target, rules: rules, policy: policy, collector: collector, projector: projector, executor: executor, budget: budget}, nil
 }
 
 // Name identifies this validator in ValidationResult.Validator and in
@@ -121,11 +152,13 @@ func (v *StateMachineReplayValidator) Name() string { return "state_machine_repl
 // timeout -> error" rule).
 var (
 	ErrReplayUnsupportedOrigin = errors.New("research: replay validator only supports OriginStateMachine candidates")
-	ErrReplayMissingRuleID     = errors.New("research: candidate has no rule_id ref to replay against")
-	ErrReplayUnknownRule       = errors.New("research: candidate's rule_id is not registered in this validator's TransitionRuleRegistry")
-	ErrReplayActionMismatch    = errors.New("research: candidate's recorded action identity does not match the resolved rule's ActionID")
-	ErrReplayProjectorMismatch = errors.New("research: candidate's recorded projector identity does not match the resolved rule's ProjectorID")
-	ErrReplayTargetMismatch    = errors.New("research: candidate's replay_target_hash does not match this validator's own ReplayTarget")
+	ErrReplayMissingBinding    = errors.New("research: candidate has no StateMachineBinding to replay against")
+	ErrReplayMissingRuleID     = errors.New("research: candidate's StateMachineBinding has no RuleID to replay against")
+	ErrReplayUnknownRule       = errors.New("research: candidate's RuleID is not registered in this validator's TransitionRuleRegistry")
+	ErrReplayActionMismatch    = errors.New("research: candidate's bound action identity does not match the resolved rule's ActionID")
+	ErrReplayProjectorMismatch = errors.New("research: candidate's bound projector identity does not match the resolved rule's ProjectorID")
+	ErrReplayTargetMismatch    = errors.New("research: candidate's ReplayTargetHash does not match this validator's own ReplayTarget")
+	ErrReplayActionNotReadOnly = errors.New("research: the resolved rule's action is not declared ReadOnlyAction — v1 replays only strict read-only actions")
 	ErrReplaySessionIDRequired = errors.New("research: replay requires a non-empty, freshly chosen sessionID")
 )
 
@@ -136,37 +169,47 @@ var (
 //
 // Outcome mapping (deliberately conservative, per the S10/E7 contract):
 //
-//	c is not OriginStateMachine, has no/an unknown rule_id, or its recorded
-//	action/projector/target identity disagrees with the resolved rule/this
-//	validator's own target                          -> error (never attempted)
+//	c is not OriginStateMachine, has no binding/unknown RuleID, its bound
+//	action/projector identity disagrees with the resolved rule, its
+//	ReplayTargetHash disagrees with this validator's own target, or the
+//	resolved rule is not ReadOnlyAction                -> error (never attempted)
+//	v.policy.Select (against the FRESH baseline) returns
+//	nothing applicable, or an action OTHER than
+//	rule.ActionID                                       -> OutcomeNoSignal (never executes rule.ActionID anyway)
 //	fresh baseline does not satisfy a fact_transition
-//	rule's own precondition                          -> OutcomeNoSignal (no execute)
-//	fresh replay: rule satisfied, or not_applicable   -> OutcomeNoSignal
+//	rule's own precondition                             -> OutcomeNoSignal (no execute)
+//	fresh replay: rule satisfied, or not_applicable      -> OutcomeNoSignal
 //	fresh replay: insufficient evidence (a fact the
-//	rule needs is absent from the FRESH after-state) -> error (validation incomplete, never a claim)
-//	fresh replay: rule violated again                -> OutcomeReproduced
+//	rule needs is absent from the FRESH after-state)    -> error (validation incomplete, never a claim)
+//	fresh replay: rule violated again                   -> OutcomeReproduced
 //	network error / scope drift / budget exhausted /
-//	timeout / projector failure                      -> error
+//	timeout / projector failure                         -> error
 func (v *StateMachineReplayValidator) Replay(ctx context.Context, c *Candidate, sessionID string) (ValidationResult, error) {
 	if c.Origin.Kind != OriginStateMachine {
 		return ValidationResult{}, ErrReplayUnsupportedOrigin
 	}
-	ruleID := c.Refs["rule_id"]
-	if ruleID == "" {
+	binding, ok := c.StateMachineBinding()
+	if !ok {
+		return ValidationResult{}, ErrReplayMissingBinding
+	}
+	if binding.RuleID() == "" {
 		return ValidationResult{}, ErrReplayMissingRuleID
 	}
-	rule, ok := v.rules.LookupByRuleID(ruleID)
+	rule, ok := v.rules.LookupByRuleID(binding.RuleID())
 	if !ok {
 		return ValidationResult{}, ErrReplayUnknownRule
 	}
-	if c.Refs["action_registry_key"] != rule.ActionID.RegistryKey || c.Refs["action_variant_id"] != rule.ActionID.VariantID {
+	if binding.ActionID() != rule.ActionID {
 		return ValidationResult{}, ErrReplayActionMismatch
 	}
-	if c.Refs["projector_id"] != string(rule.ProjectorID) {
+	if binding.ProjectorID() != rule.ProjectorID {
 		return ValidationResult{}, ErrReplayProjectorMismatch
 	}
-	if c.Refs["replay_target_hash"] != v.target.Hash() {
+	if binding.ReplayTargetHash() != v.target.Hash() {
 		return ValidationResult{}, ErrReplayTargetMismatch
+	}
+	if !rule.ReadOnlyAction {
+		return ValidationResult{}, ErrReplayActionNotReadOnly
 	}
 	if sessionID == "" {
 		return ValidationResult{}, ErrReplaySessionIDRequired
@@ -196,19 +239,21 @@ func (v *StateMachineReplayValidator) Replay(ctx context.Context, c *Candidate, 
 		}
 	}
 
-	// Bind EXACTLY rule.ActionID — never the Candidate's claimed
-	// action_registry_key directly. A throwaway, single-entry Registry
-	// scoped to rule.ActionID.RegistryKey/rule.ProjectorID makes
-	// ActionPolicy.Select structurally incapable of returning anything
-	// else, exactly like S10-E1 already requires of a real Explorer.
-	replayRegistry := actionauth.NewRegistry(actionauth.Registration{
-		Action:       actionauth.RegisteredAction{Key: rule.ActionID.RegistryKey},
-		Requirements: actionauth.StateRequirements{ProjectorID: rule.ProjectorID},
-	})
-	policy := actionauth.NewActionPolicy(replayRegistry, actionauth.NewRecoveryRegistry())
-	boundAction, ok := policy.Select(scope.Hash(), before, nil)
-	if !ok {
-		return ValidationResult{}, fmt.Errorf("research: replay could not bind action %q for the fresh baseline", rule.ActionID.RegistryKey)
+	// ACTION AUTHORITY STAYS WITH v.policy, NEVER WITH THE RULE. Ask the
+	// SAME trusted ActionPolicy a real Explorer session would use to select
+	// an action for this FRESH baseline — exactly like Explorer.Step. Only
+	// if it happens to select rule.ActionID do we proceed; if it selects
+	// nothing, or selects a DIFFERENT action, Replay reports OutcomeNoSignal
+	// and executes NOTHING. The rule's own ActionID is a description of
+	// "which action this rule is about", never a credential Replay grants
+	// on the rule's say-so.
+	boundAction, policyOK := v.policy.Select(scope.Hash(), before, nil)
+	if !policyOK || boundAction.ID() != rule.ActionID {
+		return ValidationResult{
+			Validator: v.Name(),
+			Outcome:   OutcomeNoSignal,
+			Evidence:  []Observation{replayFingerprintObservation("replay_baseline_action_not_currently_authorized", before)},
+		}, nil
 	}
 
 	execCtx := ContextWithRequestMeter(deadlineCtx, meter)

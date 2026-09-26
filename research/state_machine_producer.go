@@ -116,7 +116,46 @@ type TransitionRule struct {
 
 	Expectation       TransitionExpectation
 	ExpectationSource ExpectationSource
+
+	// ReadOnlyAction is the rule AUTHOR's own explicit attestation that
+	// ActionID's action needs no compensating recovery — either because it
+	// has no observable side effect at all, or because any side effect it
+	// does have has been reviewed and is acceptable to leave in place. S10/
+	// E7's replay validator v1 REFUSES to replay any rule for which this is
+	// not exactly true (ErrReplayActionNotReadOnly): v1 implements no
+	// verified-recovery flow (Execute -> collect -> BoundRecovery ->
+	// ExecuteRecovery -> collect -> stateauth.Recovered()), so replaying a
+	// rule that needed one would risk leaving a real target parked in a
+	// changed state purely to reproduce a hypothesis. A future version that
+	// wants to replay actions needing real recovery must implement and
+	// prove that flow FIRST, as its own explicit, separately reviewed
+	// design — never by silently trusting this flag beyond what it
+	// declares. NewTransitionRuleRegistry does NOT require this to be true
+	// — E6's own producer judges transitions regardless of whether the
+	// action was read-only; only E7's Replay method checks it.
+	ReadOnlyAction bool
 }
+
+// StateMachineBinding is the immutable, tamper-proof identity a
+// state-machine Candidate carries for S10/E7's replay validator to resolve
+// against — see Candidate.stateMachineBinding's own doc for why this exists
+// instead of trusting Candidate.Refs (an ordinary, mutable map). Every
+// field here is a plain value (a string or an actionauth.ActionID) with no
+// exported constructor and no exported mutator; the only way to obtain one
+// is Candidate.StateMachineBinding(), which returns a copy.
+type StateMachineBinding struct {
+	ruleID           string
+	actionID         actionauth.ActionID
+	projectorID      stateauth.ProjectorID
+	replayTargetHash string
+	caseArtifactHash string
+}
+
+func (b StateMachineBinding) RuleID() string                     { return b.ruleID }
+func (b StateMachineBinding) ActionID() actionauth.ActionID      { return b.actionID }
+func (b StateMachineBinding) ProjectorID() stateauth.ProjectorID { return b.projectorID }
+func (b StateMachineBinding) ReplayTargetHash() string           { return b.replayTargetHash }
+func (b StateMachineBinding) CaseArtifactHash() string           { return b.caseArtifactHash }
 
 // ReplayTarget identifies WHAT is being explored/replayed against: the same
 // target/build/protocol/harness dimensions as ExplorationScope, but
@@ -604,6 +643,16 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 		)
 		cand := NewHypothesis(p.newID(), AnomalyStateTransitionExpectationViolation, title, rc.Transition.ScopeHash, rationale,
 			origin, []string{"state_transition", "authorized_expectation"}, prov)
+		// The immutable binding is what S10/E7's replay validator actually
+		// resolves against — see Candidate.stateMachineBinding's own doc for
+		// why Refs (below) is never trusted for that.
+		cand.stateMachineBinding = &StateMachineBinding{
+			ruleID:           rc.Rule.RuleID,
+			actionID:         action,
+			projectorID:      rc.Rule.ProjectorID,
+			replayTargetHash: replayTargetOf(rc.Scope).Hash(),
+			caseArtifactHash: artifactHash,
+		}
 		cand.Refs = map[string]string{
 			"transition_artifact_hash": rc.Transition.TransitionArtifactHash,
 			"case_artifact_hash":       artifactHash,

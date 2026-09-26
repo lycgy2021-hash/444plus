@@ -1108,29 +1108,87 @@ the guarantees hold under test:
     own — turns evidence into a `Fingerprint` through the exact SAME
     scope-checked path, never a hand-rolled shortcut.
   - **INDEPENDENT EVIDENCE, never old data.** `Replay` treats a Candidate's
-    `Refs` purely as "what to test" — never as evidence itself. Every fact a
-    `ValidationResult` reports comes from a FRESH `collectAndProject` call, a
-    FRESH authorized action bind, and a FRESH `Execute`, through the SAME
+    identity purely as "what to test" — never as evidence itself. Every fact
+    a `ValidationResult` reports comes from a FRESH `collectAndProject` call,
+    a FRESH authorized action bind, and a FRESH `Execute`, through the SAME
     `Collector`/`stateauth.BoundRegistry`/`Executor` triple a real Explorer
     session would use.
-  - **No reopened "caller picks ActionID" bypass.** `Replay` resolves
-    `rule := rules.LookupByRuleID(c.Refs["rule_id"])` against its OWN
-    trusted `TransitionRuleRegistry` FIRST, cross-checks the Candidate's
-    claimed `action_registry_key`/`action_variant_id`/`projector_id` against
-    THAT rule (rejecting on any mismatch — `ErrReplayActionMismatch`/
-    `ErrReplayProjectorMismatch`), and only then binds `rule.ActionID` — via
-    a throwaway, single-entry `actionauth.Registry` scoped to exactly that
-    `RegistryKey`, so `ActionPolicy.Select` is structurally incapable of
-    returning anything else. The Candidate never supplies an execution
-    credential, directly or indirectly, exactly mirroring S10-E1's original
-    "no caller-supplied ActionID" guarantee one layer further out.
+  - **First regression, found on a second audit round before freeze: rule
+    authority was substituting for action authority.** v1's first cut
+    resolved the trusted rule, then bound `rule.ActionID` by building its
+    OWN throwaway, single-entry `actionauth.Registry`/`ActionPolicy` scoped
+    to exactly that key — which meant `TransitionRuleRegistry` (whose job is
+    defining what a transition is judged AGAINST) was effectively also
+    deciding whether an action may execute RIGHT NOW, a decision that
+    belongs to `actionauth.ActionPolicy` alone, per S10's own original
+    separation of authorities. Fixed: `NewStateMachineReplayValidator` now
+    takes a `*actionauth.ActionPolicy` — the SAME trusted policy a real
+    Explorer session for this target would use — and `Replay` calls
+    `v.policy.Select(scope.Hash(), before, nil)` against the FRESH baseline,
+    exactly like `Explorer.Step`. It proceeds ONLY if the policy's own
+    selection happens to equal `rule.ActionID`; if `Select` returns nothing
+    applicable, or a DIFFERENT action, `Replay` reports `OutcomeNoSignal` and
+    executes NOTHING — it never falls back to forcing `rule.ActionID`
+    through a registry it built for itself. A rule never grants an execution
+    credential on its own; only the policy that would have authorized it
+    during real exploration does. `TestE7ActionPolicySelectsDifferentActionProducesNoSignal`
+    (a policy that would select a different, equally-applicable action) and
+    `TestE7ActionPolicySelectFailsProducesNoSignal` (nothing applicable at
+    all) both prove `Replay` executes nothing in either case, via the
+    fixture's own action-hit counter staying unchanged.
+  - **Second regression, found on the same audit: `Replay` resolved its
+    authority-bearing identity (`rule_id`, action/projector identity, the
+    target hash) from `Candidate.Refs` — an ORDINARY, MUTABLE map any caller
+    holding `*Candidate` can rewrite after construction.** Even with every
+    individual rule trustworthy, a caller could retarget a replay to a
+    DIFFERENT — still individually trusted — rule after E6 had already
+    produced the Candidate, simply by editing `Refs["rule_id"]` in place;
+    Refs was never meant to be authority (`Refs`'s own doc already said so),
+    but nothing stopped `Replay` from treating it as such. Fixed:
+    `Candidate` gained an unexported `stateMachineBinding
+    *StateMachineBinding` field, settable only by
+    `StateMachineProducer.Produce` (this package's own S10/E6 code — there
+    is no exported setter, matching exactly how `provenance` is already
+    unexported), and a new `StateMachineBinding{RuleID, ActionID,
+    ProjectorID, ReplayTargetHash, CaseArtifactHash}` accessor type whose
+    only constructor is `Candidate.StateMachineBinding()`, returning a VALUE
+    COPY (all plain strings and an `actionauth.ActionID` — no pointers,
+    slices, or maps to alias). `Replay` now resolves EXCLUSIVELY from this
+    binding; `Refs` is kept, unchanged, for human-readable audit convenience
+    only, and is provably irrelevant to resolution:
+    `TestE7RefsMutationDoesNotAffectReplayResolution` corrupts every
+    replay-relevant `Refs` entry after a real Candidate is produced and
+    proves `Replay` still resolves and reproduces correctly regardless.
+    `TestE7MissingBindingRejected`/`TestE7EmptyRuleIDInBindingRejected` cover
+    the (never reachable via `Produce`, kept as real defensive checks)
+    missing/malformed-binding cases; `TestE7ActionMismatchRejected`/
+    `TestE7ProjectorMismatchRejected` now prove the cross-check against a
+    validator whose OWN trusted registry has since diverged from the one
+    that produced the candidate — a realistic scenario Refs mutation never
+    was.
+  - **Third regression, same audit: no post-replay recovery semantics were
+    specified for an action that might not truly be side-effect-free.**
+    v1 implements no verified-recovery flow (`Execute → collect →
+    BoundRecovery → ExecuteRecovery → collect → stateauth.Recovered()`), so
+    replaying a rule whose action needed one could leave a real target
+    parked in a changed state purely to reproduce a hypothesis. Fixed, via
+    the simpler of the two options the audit offered: `TransitionRule`
+    gained `ReadOnlyAction bool` — the rule AUTHOR's own explicit attestation
+    that the action needs no compensating recovery. `Replay` refuses
+    outright (`ErrReplayActionNotReadOnly`) unless it is exactly `true`
+    (`TestE7NonReadOnlyActionRejected`); `NewTransitionRuleRegistry` does
+    NOT require it (E6's own producer judges transitions regardless of
+    whether the action was read-only — only E7's `Replay` checks it). A
+    future version that wants to replay actions genuinely needing recovery
+    must implement and prove that flow first, as its own explicit,
+    separately reviewed design.
   - **Fresh session, same target, never a substituted one.** `ReplayTarget`
     (`TargetID`/`BuildID`/`Protocol`/`HarnessID`, no `SessionID`) is fixed at
     a validator's construction; each `Replay` call takes a caller-supplied
     `sessionID` and builds the full `ExplorationScope` from
     `target.Scope(sessionID)`. `Replay` rejects a Candidate whose
-    `Refs["replay_target_hash"]` does not match `v.target.Hash()`
-    (`ErrReplayTargetMismatch`) — proven by
+    `StateMachineBinding().ReplayTargetHash()` does not match
+    `v.target.Hash()` (`ErrReplayTargetMismatch`) — proven by
     `TestE7TargetMismatchRejected`; `TestE7ViolatedProducesReproducedWithIndependentEvidence`
     proves the positive case with a session ID that is deliberately
     DIFFERENT from the original transition's own.
@@ -1176,28 +1234,34 @@ the guarantees hold under test:
     `shouldPromote`/`Promote` pipeline (S5's `Engine.Validate` already owns
     that decision generically) is future work, not required to prove this
     stage's own contract.
-  - **14-item freeze-gate battery** (`research/state_machine_replay_test.go`):
-    a non-`OriginStateMachine` Candidate, a missing/unknown `rule_id`, a
-    mismatched action/projector/target, and an empty `sessionID` are all
-    rejected before any I/O; a real fresh baseline that doesn't satisfy
-    `fact_transition`'s precondition produces `no_signal` without ever
-    executing the action; a real fresh replay that satisfies the rule
-    produces `no_signal`; a real fresh replay that violates the rule again
-    produces `reproduced`, with a `replay_case_artifact_hash` that is
-    provably distinct from the original Candidate's own `case_artifact_hash`
-    and a Candidate left at exactly `Hypothesis`; the pure outcome-mapping
-    table is proven for all four assessments plus an unrecognized one; a
-    real request-budget exhaustion and a real wall-time timeout both fail as
-    errors; and construction itself rejects a nil dependency or an invalid
-    `ReplayBudget`. All pass, every fixture built through the REAL E6
-    pipeline (a real `StateMachineProducer.Produce` against a real
-    transition observed over real HTTP) rather than a hand-built Candidate.
+  - **19-item freeze-gate battery** (`research/state_machine_replay_test.go`):
+    a non-`OriginStateMachine` Candidate, a missing/malformed binding, a
+    `rule_id` unregistered in this validator's own registry, a diverged
+    action/projector identity, a mismatched target, a non-`ReadOnlyAction`
+    rule, and an empty `sessionID` are all rejected before any I/O; Refs
+    corruption is proven irrelevant to resolution; a policy that selects a
+    different (or no) action never falls back to the rule's own ActionID; a
+    real fresh baseline that doesn't satisfy `fact_transition`'s precondition
+    produces `no_signal` without ever executing the action; a real fresh
+    replay that satisfies the rule produces `no_signal`; a real fresh replay
+    that violates the rule again produces `reproduced`, with a
+    `replay_case_artifact_hash` provably distinct from the original
+    Candidate's own `CaseArtifactHash()` and a Candidate left at exactly
+    `Hypothesis`; the pure outcome-mapping table is proven for all four
+    assessments plus an unrecognized one; a real request-budget exhaustion
+    and a real wall-time timeout both fail as errors; and construction
+    itself rejects a nil dependency or an invalid `ReplayBudget`. All pass,
+    every fixture built through the REAL E6 pipeline (a real
+    `StateMachineProducer.Produce` against a real transition observed over
+    real HTTP) rather than a hand-built Candidate.
   - **v1 explicitly does NOT do:** state preparation to satisfy a
-    precondition, letting a Candidate's own claimed action/projector
-    identity authorize anything directly, replaying against the same
-    recorded session, LLM judgment of what counts as reproduction, any new
-    exploration capability, or Promoting a Candidate itself. None of these
-    have any code path in `research/state_machine_replay.go` today.
+    precondition, trusting `Candidate.Refs` for any authority decision,
+    letting a rule's own `ActionID` substitute for `ActionPolicy`'s
+    authority, replaying an action not attested `ReadOnlyAction`, replaying
+    against the same recorded session, LLM judgment of what counts as
+    reproduction, any new exploration capability, or Promoting a Candidate
+    itself. None of these have any code path in
+    `research/state_machine_replay.go` today.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
   Wiring S10-E7's `ValidationResult` into the Engine's existing promotion
