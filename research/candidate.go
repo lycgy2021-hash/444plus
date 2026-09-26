@@ -92,7 +92,12 @@ type Candidate struct {
 	RequiredEvidence []string      `json:"required_evidence,omitempty"`
 	Evidence         []Observation `json:"evidence,omitempty"`
 	CreatedAt        time.Time     `json:"created_at"`
-	History          []Transition  `json:"history,omitempty"`
+	// Refs are producer-specific structured references (not free text), so a
+	// candidate can be queried/aggregated/correlated without parsing the rationale
+	// — e.g. a fuzz candidate carries scope_hash/signature_hash/group_hash/count.
+	// They are descriptive metadata, never authority (they cannot change state).
+	Refs    map[string]string `json:"refs,omitempty"`
+	History []Transition      `json:"history,omitempty"`
 
 	// provenance is the immutable origin record set once at birth: which producer,
 	// which exact raw input (RawInputHash). It is unexported so no other package

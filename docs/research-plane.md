@@ -117,23 +117,34 @@ the deterministic classification.
 
 **S8 v1 — `research/fuzz.go`** — the fuzz/crash producer, deterministic and
 volume-controlled. Pipeline: `CrashArtifact → Normalize → CrashSignature → dedup
-into CrashGroup → deterministic CrashInterest → (only non-noise groups) →
-Candidate{Origin{Kind:"fuzz"}}`. Boundaries locked from v1:
-- **Two hashes never mixed.** `CrashArtifact.RawInputHash()` is the byte-for-byte
-  hash of the raw crash output; `CrashSignature.Hash` is the hash of the
-  *normalized* crash type + top stable frames (the dedup key). A fuzz candidate's
-  `Provenance.RawInputHash` is a representative raw-crash hash; the signature hash
-  lives in its rationale — distinct fields, distinct meanings.
-- **Normalize before hashing.** Addresses, PIDs, timestamps, temp paths, corpus
-  names, line:col and concrete indices are stripped; crash type and top function
-  frames are kept — so the same bug across runs (different address/PID/temp file)
-  collapses to one signature instead of thousands.
-- **Deterministic classification.** ASAN/sanitizer → memory_safety, SIGSEGV/SIGBUS
-  → memory_safety, Go index/slice/nil panic → panic, timeout/OOM → hang,
-  assertion/abort → invariant_violation, else unknown, and no crash marker →
-  noise. An AI pass may later explain/enrich/suggest-merges — never decide state.
-- **Group before candidate.** Crashes dedup into groups first; only non-noise
-  groups become candidates, so 100k crashes of one bug yield one candidate.
+within a FuzzScope into a CrashGroup → deterministic CrashInterest → (only
+non-noise groups) → Candidate{Origin{Kind:"fuzz"}}`. Core principle: **a
+`CrashSignature` is a crash fingerprint, not a global bug id; a `CrashGroup` is
+scoped by build/harness; a Candidate traces the whole group, not one crash.**
+- **Four hashes, never mixed.** `TestcaseHash` (crashing input bytes),
+  `CrashOutputHash` (raw crash output), `SignatureHash` (normalized type + access
+  + top stable frames — the fingerprint), `GroupHash` (`ScopeHash + SignatureHash`
+  — the group identity). A fuzz candidate's `Provenance.RawInputHash` is the
+  **GroupHash** (the whole producing group), and structured `Refs`
+  (scope/signature/group hashes, count, type) make it queryable — not just prose.
+- **Signature discriminates.** It includes sanitizer **access type/size** and
+  `StableFrame{Module,Function,Source-basename}`, so two independent faults in one
+  function (READ-of-1 vs WRITE-of-4) or different crash types don't merge — while
+  addresses/PIDs/timestamps/temp paths/line:col are normalized away so the same
+  bug across runs collapses.
+- **Scope prevents over-merge.** Grouping is keyed by `ScopeHash + SignatureHash`,
+  so the same signature under a different `BuildID`/`HarnessID` is a different
+  group — old vs new build, or two harnesses, are never silently merged.
+- **Deterministic, conservative classification.** sanitizer → memory_safety; bare
+  SIGSEGV/SIGBUS *without* sanitizer evidence → **unknown** (not over-claimed as
+  memory_safety); Go index/slice/nil panic → panic; timeout → hang; **OOM →
+  resource_exhaustion** (kept distinct from hang); assertion/abort →
+  invariant_violation; no crash marker → noise. An AI pass may later
+  explain/enrich/suggest-merges — never decide state.
+- **Group before candidate.** Crashes dedup into scoped groups first with an exact
+  `Count` and capped, still-traceable member hashes; only non-noise groups become
+  candidates, so 100k crashes of one bug yield one candidate. `GroupHash` is
+  representative-independent (input order can't change it).
 
 Fuzz candidates flow into the **same** Registry → Validator → Engine spine; with
 no fuzz validator registered they stay `hypothesis` (no auto-promotion, no
@@ -166,9 +177,10 @@ the guarantees hold under test:
 - **Provenance: locked.**
 - **S6 (patch/diff intelligence): v1 landed & audited** (deterministic
   `DiffProducer`; an AI diff pass can enrich later). Contract frozen.
-- **S8 (fuzz/crash intelligence): v1 landed** (deterministic `FuzzProducer`;
-  raw→normalize→signature→dedup→classify→candidate). No AI fuzz-input generation,
-  no auto-exploitability. Next: review dedup stability + provenance, then freeze.
+- **S8 (fuzz/crash intelligence): v1 landed + audited** (deterministic
+  `FuzzProducer`; scope-bounded groups, discriminating signatures, four-hash
+  group-level provenance, structured refs, conservative classifier). No AI
+  fuzz-input generation, no auto-exploitability. Ready to freeze.
 - **Deferred:** `S7` large-scale source audit, `S9` differential engine, `S10`
   state-machine explorer — not until S6/S8 are stable.
 
