@@ -266,13 +266,49 @@ the guarantees hold under test:
   structural body comparison; security-header value comparison;
   `RawInputHash = caseArtifactHash` (lossless) distinct from `comparisonHash`
   (denoised); malformed-case guards.
-- **S10 (state-machine explorer): DESIGN CONTRACT ONLY** (`research/state_machine.go`)
-  — `StateFingerprint`, `ReadOnlyAction`, `StateTransition`, `ExplorationBudget`,
-  `RecoveryPlan`. No explorer, no execution logic, no `Origin` kind yet.
-  Deliberately stopped here for review before any implementation: S10 is the step
-  most likely to introduce state explosion, action-composition risk, and
-  probe-budget/side-effect problems, so the contract is frozen first, exactly as
-  S6/S8/S9 were audited before their code was trusted.
+- **S10 (state-machine explorer): DESIGN CONTRACT ONLY, still under audit**
+  (`research/state_machine.go`) — no explorer, no registry, no execution logic,
+  no `Origin` kind yet. Five boundaries are locked into the TYPE SHAPES
+  themselves (not left to comments alone), because a boundary a later change can
+  route around by adding one field is not a boundary:
+  1. **No executable content anywhere.** `ActionRef{RegistryKey, VariantID}` and
+     `RecoveryPlanRef{RegistryKey}` are opaque lookups — there is no Method, URL,
+     Headers, Body, or Command field in this file. What an action or recovery
+     procedure actually does exists only in a future compile-time registry (the
+     S10 analogue of S5's Validator registry); AI or candidate text can at most
+     name a `RegistryKey`/`VariantID` to try, never supply what it does.
+     `RegisteredAction.Reversible` is registry metadata, declared once by the
+     registering code — not a field any instance, candidate, or AI output can set.
+  2. **Raw evidence vs identity, never conflated** (the S8/S9 discipline again):
+     `StateFingerprint` splits `RawStateArtifactHash` (the actual collected
+     artifact, undenoised) from `StateFingerprintHash` (the denoised projection
+     state-equality is judged on); `ExplorationScope.Hash()` (target+build+
+     session+protocol+harness) bounds which fingerprints are even comparable —
+     there is no method to compare across scopes.
+  3. **Recovery is registry-backed and must be VERIFIED, never assumed.**
+     `RecoveryOutcome{Baseline, ResultFingerprint, Verified}` is a fact: did the
+     post-recovery fingerprint actually match baseline. `Verified=false` means
+     exploration stops — there is no continuing on the assumption a rollback
+     worked.
+  4. **`StateTransition` carries facts only** — no `Unexpected`/`Vulnerable`/
+     `Severity`/`State` field, exactly like `Observation`/`DiffAnomaly`
+     elsewhere. Whether a transition is worth a hypothesis is a future
+     producer's judgment against an authoritative `ExpectationSource` — **S9's,
+     reused verbatim, no second "who defines correct behavior" system for S10**.
+     `TransitionArtifactHash` is the lossless record hash (the S9
+     `caseArtifactHash` analogue); it is never the denoised
+     `StateFingerprintHash`.
+  5. **No "0 = unlimited" in `ExplorationBudget`**, unlike `ai.Budget` (where
+     unlimited is a cost tradeoff for a free local model). Unbounded state
+     exploration is a live-system risk, not a cost concern: every one of
+     `MaxStates/MaxTransitions/MaxDepth/MaxRequests/MaxVisitsPerState/
+     MaxBranching/MaxWallTime` must be strictly positive or `Valid()` reports the
+     whole budget invalid.
+  One v1 rule has no corresponding type, since it constrains execution behavior
+  rather than data shape: within one `ExplorationScope`, v1 is **single-session,
+  serial** — at most one in-flight action at a time, so "which action produced
+  this `AfterFingerprint`" is never ambiguous. Recorded here for the eventual
+  Explorer to honor.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
 
