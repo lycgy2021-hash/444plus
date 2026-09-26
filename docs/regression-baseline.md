@@ -60,6 +60,27 @@ docker restart gopoc-wildfly
 Note: real GET /management returns the DMR root **without** an `"outcome"` wrapper
 (that only wraps POST results) — the checker must match the bare-GET shape.
 
+## Jenkins two lines (four-state, real-validated)
+
+`scripts/lab/jenkins.sh` → two real containers. Probe from **inside** each
+container (`docker exec … /tmp/gopoc scan http://localhost:8080 --discover`);
+Docker-Desktop Windows→WSL forwarding is flaky, the containers are stable.
+Product ID requires **≥2 Jenkins headers** (`X-Jenkins` + `X-Hudson`/`X-Jenkins-Session`),
+so a single forged header never elevates.
+
+| Target | Config | Checker | Expected verdict |
+| --- | --- | --- | --- |
+| `gopoc-jenkins` (2.x LTS, wizard off) | Script Console open (anonymous) | `MISCONFIG-JENKINS-ANON-SCRIPT-CONSOLE` | `likely` / `anonymous_script_console_exposed` |
+| `gopoc-jenkins` (same) | version above fix line | `CVE-2024-23897` | `not_found` / `version_not_affected` |
+| `gopoc-jenkins-cve` (2.426.2, secure default) | Script Console 403 | `MISCONFIG-JENKINS-ANON-SCRIPT-CONSOLE` | `detected` / `script_console_protected` |
+| `gopoc-jenkins-cve` (same) | affected LTS + CLI reachable | `CVE-2024-23897` | `likely` / `affected_surface_exposed` |
+
+The CVE caps at `likely`: the message reads "Exploit execution was NOT attempted …
+Arbitrary file read was NOT attempted". A confirmation that actually exercises the
+`@file` read exists only as a controlled lab test (a benign marker file), never on
+the default single-IP path. Version boundary (`go test ./checks/jenkins/ -run
+TestVersionBoundary`) pins weekly 2.441/2.442 and LTS 2.426.2/2.426.3.
+
 ## Standing gates (must stay green on every change)
 
 - `go build ./... && go vet ./... && go test ./...`

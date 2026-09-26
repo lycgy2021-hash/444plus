@@ -34,7 +34,7 @@ func TestCLIEndToEndAndOutputIsolation(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		t.Fatalf("stdout is not pure JSON: %s: %v", stdout.String(), err)
 	}
-	if len(result.Targets) != 1 || len(result.Findings) != 26 || result.Findings[0].Verdict != model.VerdictNotFound || result.Findings[1].Verdict != model.VerdictDetected {
+	if len(result.Targets) != 1 || len(result.Findings) != 28 || result.Findings[0].Verdict != model.VerdictNotFound || result.Findings[1].Verdict != model.VerdictDetected {
 		t.Fatalf("unexpected result %+v, hits %d", result, hits.Load())
 	}
 	firstHits := hits.Load()
@@ -100,7 +100,7 @@ func TestCLIActiveConfigurationAndCancellationReport(t *testing.T) {
 	if code := run(ctx, []string{"scan", "-u", s.URL, "--rate", "0", "--json", "-"}, &stdout, &stderr); code != 130 {
 		t.Fatalf("cancel code %d: %s", code, stderr.String())
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || !result.Cancelled || len(result.Findings) != 26 || result.Findings[0].Reason != "cancelled" {
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || !result.Cancelled || len(result.Findings) != 28 || result.Findings[0].Reason != "cancelled" {
 		t.Fatalf("partial report invalid: %s", stdout.String())
 	}
 }

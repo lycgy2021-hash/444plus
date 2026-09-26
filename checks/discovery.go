@@ -69,6 +69,12 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 	if hasHeader("Request-Id") || hasHeader("X-Nginx-Ui") {
 		add("nginx-ui")
 	}
+	// Jenkins advertises X-Jenkins/X-Hudson on every response, including 403s;
+	// the checkers re-verify with the ≥2-signal rule, so a single header here is
+	// only a routing hint.
+	if hasHeader("X-Jenkins") || hasHeader("X-Hudson") {
+		add("jenkins")
+	}
 	if hasHeader("MicrosoftSharePointTeamServices") || hasHeader("X-SharePointHealthScore") || strings.Contains(body, "/_layouts/15/") {
 		add("sharepoint")
 	}

@@ -149,6 +149,39 @@ func TestFalsePositiveCorpusHTTP(t *testing.T) {
 		{"fake_wildfly_welcome", "", func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(`<html><body>Welcome to WildFly - powered by our totally unrelated product</body></html>`))
 		}},
+		// Adversarial (Jenkins): a single forged X-Jenkins header must not identify
+		// the product (the ≥2-signal rule), so no Jenkins checker may elevate.
+		{"forged_x_jenkins_only", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Jenkins", "2.441") // affected-looking, but no X-Hudson/Session
+			w.Write([]byte(`<html>not really jenkins</html>`))
+		}},
+		// Adversarial (Jenkins): an ordinary page that merely mentions Jenkins.
+		{"mentions_jenkins", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html>We build with Jenkins and deploy nightly.</html>`))
+		}},
+		// Adversarial (Jenkins): a non-Jenkins app that serves /script with a 200
+		// (and even a Groovy word) must not be read as an open Script Console.
+		{"plain_script_200", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html><body>Our Groovy script runner dashboard</body></html>`))
+		}},
+		// Adversarial (Jenkins): a generic JSON API returning 200 must not elevate
+		// (anonymous /api/json readable is evidence, never a high-risk verdict).
+		{"plain_json_api", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"status":"ok"}`))
+		}},
+		// Adversarial (Jenkins): a 403 carrying only a forged X-Jenkins (no second
+		// signal) must not be identified as Jenkins.
+		{"forbidden_x_jenkins", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Jenkins", "2.426.2")
+			w.WriteHeader(403)
+		}},
+		// Adversarial (Jenkins): a reverse proxy that answers EVERY path with the
+		// same 200 page (including /script) must not be mistaken for an open
+		// console — the page is not the Script Console.
+		{"uniform_200_proxy", "", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<!doctype html><html><body>Welcome</body></html>`))
+		}},
 	}
 	for _, tc := range corpus {
 		t.Run(tc.name, func(t *testing.T) {
@@ -193,6 +226,18 @@ func TestVerdictElevationGuards(t *testing.T) {
 		{"fortinet_exposed_no_version", "CVE-2024-55591", func(w http.ResponseWriter, r *http.Request) {
 			// FortiOS fingerprint + management surface, but no version exposed.
 			w.Write([]byte(`<html>FortiGate fgt_lang /remote/login logindisclaimer</html>`))
+		}},
+		{"jenkins_cli_exposed_no_version", "CVE-2024-23897", func(w http.ResponseWriter, r *http.Request) {
+			// Jenkins identified (two headers) and the CLI surface is reachable,
+			// but the version is unreadable (non-numeric X-Jenkins, no data-version):
+			// affected status is unknown, so the CVE must not elevate.
+			w.Header().Set("X-Jenkins", "unreleased")
+			w.Header().Set("X-Hudson", "1.395")
+			if r.URL.Path == "/jnlpJars/jenkins-cli.jar" {
+				w.WriteHeader(200)
+				return
+			}
+			w.Write([]byte(`<html>jenkins, no version marker</html>`))
 		}},
 	}
 	for _, tc := range cases {
