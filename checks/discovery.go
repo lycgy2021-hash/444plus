@@ -23,7 +23,9 @@ type Discovery struct {
 }
 
 // Discover probes the target and returns candidate products. It makes at most
-// two HTTP GETs and, only when the response hints WebLogic, one T3 handshake.
+// two baseline HTTP GETs (root + 404), then conditional HTTP GETs: up to two for
+// JBoss management preflight (9990, 9993), and up to one for GitLab sign_in fallback.
+// Only when the response hints WebLogic, one T3 handshake.
 func Discover(ctx context.Context, client httpx.Probe, target model.Target) Discovery {
 	d := Discovery{Products: map[string]bool{}}
 	add := func(p string) { d.Products[p] = true }
@@ -81,12 +83,28 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 		add("gitlab")
 	}
 	// Fallback: when X-Gitlab-Meta is stripped by proxy, probe for GitLab's sign-in page.
-	// This catches cases where the checker can still verify via body + manifest.
-	if !hasHeader("X-Gitlab-Meta") && (strings.Contains(body, "/users/sign_in") || strings.Contains(body, "new_user") || strings.Contains(body, "gitlab")) {
-		signInResp, err := client.Get(ctx, target, "/users/sign_in")
-		if err == nil && signInResp.StatusCode >= 200 && signInResp.StatusCode < 300 && strings.Contains(strings.ToLower(string(signInResp.Body)), "gitlab") {
-			d.HTTPRequests++
-			add("gitlab")
+	// This catches cases where: (1) body hints at /users/sign_in, or (2) Location redirects to it,
+	// or (3) page mentions GitLab. The checker verifies via body + manifest.
+	if !hasHeader("X-Gitlab-Meta") {
+		shouldProbeSignIn := false
+		// Case 1: body mentions sign_in or GitLab
+		if strings.Contains(body, "/users/sign_in") || strings.Contains(body, "new_user") || strings.Contains(body, "gitlab") {
+			shouldProbeSignIn = true
+		}
+		// Case 2: Location header redirects to /users/sign_in (typical GitLab pattern)
+		if root.Location != "" && strings.Contains(strings.ToLower(root.Location), "/users/sign_in") {
+			shouldProbeSignIn = true
+		}
+		if notFound.Location != "" && strings.Contains(strings.ToLower(notFound.Location), "/users/sign_in") {
+			shouldProbeSignIn = true
+		}
+
+		if shouldProbeSignIn {
+			signInResp, err := client.Get(ctx, target, "/users/sign_in")
+			if err == nil && signInResp.StatusCode >= 200 && signInResp.StatusCode < 300 && strings.Contains(strings.ToLower(string(signInResp.Body)), "gitlab") {
+				d.HTTPRequests++
+				add("gitlab")
+			}
 		}
 	}
 	// JBoss/WildFly Management Interface signals. /management probe happens in the
@@ -98,6 +116,30 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 	// has no JBoss markers. This routes checkers to explore independent management endpoint.
 	if target.Port == 9990 || target.Port == 9993 {
 		add("jbosswildfly")
+	}
+	// Preflight: when app port has no JBoss markers, probe sibling management port.
+	// Real topology: app:8080 (business page) + management:9990 (WildFly). Avoid
+	// false negative by doing one lightweight /management probe on standard ports.
+	if !strings.Contains(body, "jboss") && !strings.Contains(body, "wildfly") && target.Port != 9990 && target.Port != 9993 {
+		mgmtTarget := target
+		for _, mgmtPort := range []int{9990, 9993} {
+			mgmtTarget.Port = mgmtPort
+			mgmtResp, err := client.Get(ctx, mgmtTarget, "/management")
+			if err == nil && mgmtResp.StatusCode >= 200 && mgmtResp.StatusCode < 300 {
+				// Check for management interface signatures
+				body := strings.ToLower(string(mgmtResp.Body))
+				if strings.Contains(body, "managementrealm") || strings.Contains(body, "dmr") || strings.Contains(body, "wildfly") {
+					d.HTTPRequests++
+					add("jbosswildfly")
+					break
+				}
+			} else if err == nil && mgmtResp.StatusCode == 401 {
+				// 401 with basic auth challenge is typical for management interface
+				d.HTTPRequests++
+				add("jbosswildfly")
+				break
+			}
+		}
 	}
 	if hasHeader("MicrosoftSharePointTeamServices") || hasHeader("X-SharePointHealthScore") || strings.Contains(body, "/_layouts/15/") {
 		add("sharepoint")
