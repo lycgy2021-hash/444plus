@@ -17,62 +17,138 @@ var validationRecords = map[string]model.Validation{
 	"CVE-2021-41773": {
 		Tier:           model.ValidationLive,
 		TestedVersions: []string{"2.4.49"},
-		EvidenceRefs:   []string{"CHANGELOG.md#coverage"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			PositivePath:    true,
+		},
+		EvidenceRefs: []string{"CHANGELOG.md#coverage"},
 	},
 	"CVE-2021-42013": {
 		Tier:           model.ValidationLive,
 		TestedVersions: []string{"2.4.50"},
-		EvidenceRefs:   []string{"CHANGELOG.md#coverage"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			PositivePath:    true,
+		},
+		EvidenceRefs: []string{"CHANGELOG.md#coverage"},
 	},
 	"CVE-2025-1974": {
 		Tier:         model.ValidationLive,
 		TestedStates: []string{"k3d_v1.11.2_cluster"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			PositivePath:    true,
+		},
 		EvidenceRefs: []string{"CHANGELOG.md#coverage"},
 	},
 	"CVE-2025-24813": {
 		Tier:           model.ValidationLive,
 		TestedVersions: []string{"9.0.97", "9.0.99"},
 		TestedStates:   []string{"writable_default_servlet", "readonly_default", "fixed_version"},
-		EvidenceRefs:   []string{"docs/regression-baseline.md#tomcat-3-state-cve-2025-24813"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			NegativePath:    true,
+			PositivePath:    true,
+			FixedPath:       true,
+		},
+		EvidenceRefs: []string{"docs/regression-baseline.md#tomcat-3-state-cve-2025-24813"},
 	},
 	"CVE-2023-21839": {
 		Tier:           model.ValidationLive,
 		TestedVersions: []string{"12.2.1.3"},
 		TestedStates:   []string{"http_and_t3_exposed"},
-		EvidenceRefs:   []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			PositivePath:    true,
+		},
+		EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"},
 	},
 	// The CPU-2026-07 batch shares WebLogic's assessment cache with
 	// CVE-2023-21839 and was run against the same live 12.2.1.3 instance —
 	// but only to observe version_not_affected (12.2.1.3 predates the
 	// 12.2.1.4+ affected range), never against an affected build.
-	"CVE-2026-60199": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
-	"CVE-2026-60291": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
-	"CVE-2026-60292": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
-	"CVE-2026-60200": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
-	"CVE-2026-60294": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
-	"CVE-2026-60198": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
-	"CVE-2026-60202": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
+	"CVE-2026-60199": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, Coverage: &model.ValidationCoverage{ProductIdentity: true, NegativePath: true}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
+	"CVE-2026-60291": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, Coverage: &model.ValidationCoverage{ProductIdentity: true, NegativePath: true}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
+	"CVE-2026-60292": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, Coverage: &model.ValidationCoverage{ProductIdentity: true, NegativePath: true}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
+	"CVE-2026-60200": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, Coverage: &model.ValidationCoverage{ProductIdentity: true, NegativePath: true}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
+	"CVE-2026-60294": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, Coverage: &model.ValidationCoverage{ProductIdentity: true, NegativePath: true}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
+	"CVE-2026-60198": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, Coverage: &model.ValidationCoverage{ProductIdentity: true, NegativePath: true}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
+	"CVE-2026-60202": {Tier: model.ValidationLive, TestedVersions: []string{"12.2.1.3"}, TestedStates: []string{"version_not_affected_only"}, Coverage: &model.ValidationCoverage{ProductIdentity: true, NegativePath: true}, EvidenceRefs: []string{"docs/regression-baseline.md#weblogic-t3-multi-protocol-cve-2023-21839--cpu-2026-07"}},
 
 	"MISCONFIG-JBOSSWILDFLY-UNAUTH-MGMT": {
-		Tier:                model.ValidationLive,
-		TestedVersions:      []string{"38.0.0.Final", "41.0.1.Final"},
-		TestedStates:        []string{"management_auth_required", "management_auth_removed", "app_port_404_then_9990", "welcome_page_only"},
+		Tier:           model.ValidationLive,
+		TestedVersions: []string{"38.0.0.Final", "41.0.1.Final"},
+		TestedStates:   []string{"management_auth_required", "management_auth_removed", "app_port_404_then_9990", "welcome_page_only"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			NegativePath:    true,
+			PositivePath:    true,
+		},
 		EvidenceRefs:        []string{"docs/regression-baseline.md#jbosswildfly-management-interface-two-state-real-validated", "docs/jboss-wildfly-attack-surface.md"},
 		LastValidatedCommit: "fab3383",
 	},
 	"MISCONFIG-JENKINS-ANON-SCRIPT-CONSOLE": {
-		Tier:                model.ValidationLive,
-		TestedVersions:      []string{"2.426.2", "2.568.3"},
-		TestedStates:        []string{"secure_default", "anonymous_script_console", "login_redirect_protected"},
+		Tier:           model.ValidationLive,
+		TestedVersions: []string{"2.426.2", "2.568.3"},
+		TestedStates:   []string{"secure_default", "anonymous_script_console", "login_redirect_protected"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			NegativePath:    true,
+			PositivePath:    true,
+		},
 		EvidenceRefs:        []string{"docs/regression-baseline.md#jenkins-two-lines-four-state-real-validated"},
 		LastValidatedCommit: "fab3383",
 	},
 	"CVE-2024-23897": {
-		Tier:                model.ValidationLive,
-		TestedVersions:      []string{"2.426.2", "2.568.3"},
-		TestedStates:        []string{"affected_cli_reachable", "fixed_version"},
+		Tier:           model.ValidationLive,
+		TestedVersions: []string{"2.426.2", "2.568.3"},
+		TestedStates:   []string{"affected_cli_reachable", "fixed_version"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			PositivePath:    true,
+			FixedPath:       true,
+		},
 		EvidenceRefs:        []string{"docs/regression-baseline.md#jenkins-two-lines-four-state-real-validated"},
 		LastValidatedCommit: "fab3383",
+	},
+
+	// GitLab: real 16.6.0 tested. CVE-2023-7028 is the affected version anchor
+	// (positive path confirmed live); the fixed boundary is unit-test-only, not
+	// real-machine patched. CVE-2023-2825 is version-only against a version we
+	// never actually ran (16.0.0), so fixture tier is more honest.
+	"CVE-2023-7028": {
+		Tier:           model.ValidationLive,
+		TestedVersions: []string{"16.6.0"},
+		TestedStates:   []string{"product_identity", "password_reset_reachable"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			PositivePath:    true,
+		},
+		EvidenceRefs:        []string{"docs/gitlab-attack-surface.md"},
+		LastValidatedCommit: "749b531",
+	},
+	"CVE-2023-2825": {
+		Tier:        model.ValidationFixture,
+		EvidenceRefs: []string{"docs/gitlab-attack-surface.md"},
+	},
+
+	// ActiveMQ: four real binaries run this round — 5.16.6, 5.17.5, 5.18.2
+	// (vulnerable, OpenWire live) and 5.17.6 (fixed, OpenWire still live) — see
+	// docs/activemq-attack-surface.md. NegativePath is deliberately false: the
+	// fixed-version state is FixedPath, not NegativePath (that would be
+	// "affected version but OpenWire genuinely absent/disabled", a state we
+	// have not tested against a real instance).
+	"CVE-2023-46604": {
+		Tier:           model.ValidationLive,
+		TestedVersions: []string{"5.16.6", "5.17.5", "5.17.6", "5.18.2"},
+		TestedStates:   []string{"affected_version_openwire_live", "fixed_version_openwire_live"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			PositivePath:    true,
+			FixedPath:       true,
+		},
+		EvidenceRefs:        []string{"docs/activemq-attack-surface.md"},
+		LastValidatedCommit: "fd4c01a",
 	},
 
 	// Device/mock lines: unit- and FP-corpus-validated only. Fingerprints are

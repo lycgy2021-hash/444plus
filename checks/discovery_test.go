@@ -1,0 +1,488 @@
+package checks
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"gopoc/internal/httpx"
+	"gopoc/internal/model"
+	"gopoc/internal/policy"
+	"gopoc/internal/registry"
+)
+
+// TestDiscoveryRoutesEveryBuiltinProduct ensures every checker registered in
+// Builtin() has a corresponding routing hint in Discover(). If a checker is
+// registered but Discover() never routes to its product, the checker will never
+// run, even against a real instance — a silent false negative.
+func TestDiscoveryRoutesEveryBuiltinProduct(t *testing.T) {
+	p, err := policy.New(model.ModePassive, nil)
+	if err != nil {
+		t.Fatalf("policy.New failed: %v", err)
+	}
+	opts := httpx.Defaults()
+	opts.Rate = 0
+	opts.Timeout = 300 * time.Millisecond
+	client, err := httpx.New(opts, p)
+	if err != nil {
+		t.Fatalf("httpx.New failed: %v", err)
+	}
+	t.Cleanup(client.Close)
+
+	r, err := Builtin(client, model.ModePassive, model.CanaryConfig{})
+	if err != nil {
+		t.Fatalf("Builtin failed: %v", err)
+	}
+
+	checkers, err := r.Select(registry.Filter{})
+	if err != nil {
+		t.Fatalf("Select all checkers failed: %v", err)
+	}
+
+	registered := make(map[string]bool)
+	for _, c := range checkers {
+		product := c.Metadata().Product
+		registered[product] = true
+	}
+
+	// Test discovery routing for each registered product with minimal signals.
+	// verifiedElsewhere: this product has no HTTP-observable signal at all (a raw
+	// TCP protocol on a fixed port, e.g. ActiveMQ's OpenWire), so the generic
+	// httptest.NewServer fixture below can't exercise its route — a real fixture
+	// would need to bind the exact product port, which risks flaky port
+	// conflicts in CI. Its entry only satisfies the reverse-completeness check
+	// below; the actual routing is covered by its own dedicated test (see
+	// TestActiveMQDiscoverySignal), same as TestGitLabDiscoverySignals and
+	// TestJBossWildFlyDiscoverySignals already do for their products.
+	testCases := map[string]struct {
+		header            string
+		body              string
+		want              string
+		verifiedElsewhere bool
+	}{
+		"apache": {header: "Server: Apache/2.4.50", body: "", want: "apache"},
+		"nginx": {header: "Server: nginx/1.0", body: "", want: "nginx"},
+		"nginx-ui": {header: "Request-Id: test-id", body: "", want: "nginx-ui"},
+		"ingress-nginx": {header: "Server: nginx", body: "ingress-nginx", want: "ingress-nginx"},
+		"tomcat": {header: "Server: Coyote/1.1", body: "", want: "tomcat"},
+		"jenkins": {header: "X-Jenkins: 2.420", body: "", want: "jenkins"},
+		"gitlab": {header: "X-Gitlab-Meta: eyJ0eXBlIjoiQUNDRVNTIiwid2Vic2l0ZSI6ImpjIn0", body: "", want: "gitlab"},
+		"jbosswildfly": {header: "", body: "JBoss Application Server", want: "jbosswildfly"},
+		"sharepoint": {header: "MicrosoftSharePointTeamServices: 1", body: "", want: "sharepoint"},
+		"weblogic": {header: "", body: "WebLogic Server", want: "weblogic"},
+		"netscaler": {header: "", body: "NetScaler Gateway", want: "netscaler"},
+		"fortinet": {header: "", body: "FortiGate", want: "fortinet"},
+		"oracle-proxy": {header: "Server: Oracle-HTTP-Server/2.0", body: "", want: "oracle-proxy"},
+		"activemq": {want: "activemq", verifiedElsewhere: true},
+	}
+
+	for product, tc := range testCases {
+		if !registered[product] || tc.verifiedElsewhere {
+			continue
+		}
+
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if tc.header != "" {
+				parts := splitHeader(tc.header)
+				w.Header().Set(parts[0], parts[1])
+			}
+			if tc.body != "" {
+				w.Write([]byte(tc.body))
+			}
+		}))
+		defer s.Close()
+
+		target, err := model.ParseTarget(s.URL)
+		if err != nil {
+			t.Fatalf("ParseTarget failed: %v", err)
+		}
+		disc := Discover(context.Background(), client, target)
+
+		if !disc.Products[tc.want] {
+			t.Errorf("product %q not routed by discovery (signal: %q / %q)", product, tc.header, tc.body)
+		}
+	}
+
+	// Reverse check: every registered product must have a discovery routing fixture.
+	// If a new checker is added to Builtin() but forgot in testCases, this catches it.
+	for product := range registered {
+		if _, ok := testCases[product]; !ok {
+			t.Errorf("registered product %q has no discovery routing fixture", product)
+		}
+	}
+}
+
+// TestGitLabDiscoverySignals verifies that GitLab's X-Gitlab-Meta header alone
+// routes to gitlab (coarse routing), but that the checker itself enforces
+// ≥2-signal product identity (precise verification).
+func TestGitLabDiscoverySignals(t *testing.T) {
+	p, err := policy.New(model.ModePassive, nil)
+	if err != nil {
+		t.Fatalf("policy.New failed: %v", err)
+	}
+	opts := httpx.Defaults()
+	opts.Rate = 0
+	opts.Timeout = 300 * time.Millisecond
+	client, err := httpx.New(opts, p)
+	if err != nil {
+		t.Fatalf("httpx.New failed: %v", err)
+	}
+	t.Cleanup(client.Close)
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Gitlab-Meta", "eyJ0eXBlIjoiQUNDRVNTIn0")
+	}))
+	defer s.Close()
+
+	target, err := model.ParseTarget(s.URL)
+	if err != nil {
+		t.Fatalf("ParseTarget failed: %v", err)
+	}
+	disc := Discover(context.Background(), client, target)
+
+	if !disc.Products["gitlab"] {
+		t.Error("X-Gitlab-Meta header alone should route to gitlab in discovery")
+	}
+}
+
+// TestJBossWildFlyDiscoverySignals verifies JBoss/WildFly body markers route
+// to jbosswildfly in discovery.
+func TestJBossWildFlyDiscoverySignals(t *testing.T) {
+	p, err := policy.New(model.ModePassive, nil)
+	if err != nil {
+		t.Fatalf("policy.New failed: %v", err)
+	}
+	opts := httpx.Defaults()
+	opts.Rate = 0
+	opts.Timeout = 300 * time.Millisecond
+	client, err := httpx.New(opts, p)
+	if err != nil {
+		t.Fatalf("httpx.New failed: %v", err)
+	}
+	t.Cleanup(client.Close)
+
+	for _, body := range []string{"JBoss Application Server", "WildFly Application Server", "Hibernate Validator"} {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		}))
+		defer s.Close()
+
+		target, err := model.ParseTarget(s.URL)
+		if err != nil {
+			t.Fatalf("ParseTarget failed: %v", err)
+		}
+		disc := Discover(context.Background(), client, target)
+
+		if !disc.Products["jbosswildfly"] {
+			t.Errorf("body marker %q should route to jbosswildfly in discovery", body)
+		}
+	}
+}
+
+// TestJBossManagementPortDiscovery verifies that standard JBoss/WildFly management
+// ports (9990, 9993) are recognized even when main application page has no JBoss markers.
+// This ensures discovery routes to checkers for independent management interface probing.
+func TestJBossManagementPortDiscovery(t *testing.T) {
+	p, err := policy.New(model.ModePassive, nil)
+	if err != nil {
+		t.Fatalf("policy.New failed: %v", err)
+	}
+	opts := httpx.Defaults()
+	opts.Rate = 0
+	opts.Timeout = 300 * time.Millisecond
+	client, err := httpx.New(opts, p)
+	if err != nil {
+		t.Fatalf("httpx.New failed: %v", err)
+	}
+	t.Cleanup(client.Close)
+
+	// Test both standard management ports (9990 and 9993)
+	for _, port := range []int{9990, 9993} {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Simulate business application with no JBoss markers
+			w.Header().Set("Server", "Apache/2.4.50")
+			w.Write([]byte("User application content"))
+		}))
+		defer s.Close()
+
+		target, err := model.ParseTarget(s.URL)
+		if err != nil {
+			t.Fatalf("ParseTarget failed: %v", err)
+		}
+		// Override port to simulated management port
+		target.Port = port
+
+		disc := Discover(context.Background(), client, target)
+
+		if !disc.Products["jbosswildfly"] {
+			t.Errorf("port %d should route to jbosswildfly in discovery even without body markers", port)
+		}
+	}
+}
+
+// TestGitLabHeaderStrippedFallback verifies that when X-Gitlab-Meta header is stripped
+// by proxy, discovery can still route via /users/sign_in page content detection.
+func TestGitLabHeaderStrippedFallback(t *testing.T) {
+	p, err := policy.New(model.ModePassive, nil)
+	if err != nil {
+		t.Fatalf("policy.New failed: %v", err)
+	}
+	opts := httpx.Defaults()
+	opts.Rate = 0
+	opts.Timeout = 300 * time.Millisecond
+	client, err := httpx.New(opts, p)
+	if err != nil {
+		t.Fatalf("httpx.New failed: %v", err)
+	}
+	t.Cleanup(client.Close)
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate proxy that strips X-Gitlab-Meta header
+		// Root path has mention of sign_in
+		if r.RequestURI == "/" {
+			w.Write([]byte(`<div><a href="/users/sign_in">Sign in</a></div>`))
+		} else if r.RequestURI == "/users/sign_in" {
+			// Actual sign-in page with GitLab content
+			w.Write([]byte(`<html><title>GitLab Sign In</title><body>Welcome to GitLab</body></html>`))
+		} else {
+			w.WriteHeader(404)
+		}
+	}))
+	defer s.Close()
+
+	target, err := model.ParseTarget(s.URL)
+	if err != nil {
+		t.Fatalf("ParseTarget failed: %v", err)
+	}
+
+	disc := Discover(context.Background(), client, target)
+
+	if !disc.Products["gitlab"] {
+		t.Error("GitLab should be routed when /users/sign_in contains gitlab marker (header stripped)")
+	}
+}
+
+// portKeyedProbe is a fake httpx.Probe that returns a plain business page on the
+// app port and a caller-supplied response to GET /management per sibling port.
+// It lets the discovery tests simulate the real topology (app on 8080, management
+// on 9990) without binding real sockets, so they assert routing, not just "a
+// probe was attempted".
+type portKeyedProbe struct {
+	mgmt map[int]httpx.Response // response to GET /management, keyed by port
+}
+
+func canonHeaders(h map[string]string) map[string]string {
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		out[http.CanonicalHeaderKey(k)] = v
+	}
+	return out
+}
+
+func (p portKeyedProbe) Get(_ context.Context, target model.Target, path string) (httpx.Response, error) {
+	if path == "/management" {
+		if r, ok := p.mgmt[target.Port]; ok {
+			return r, nil
+		}
+		return httpx.Response{StatusCode: 404, Headers: map[string]string{}}, nil
+	}
+	// App port: an ordinary business page with no JBoss/WildFly markers.
+	return httpx.Response{StatusCode: 200, Headers: canonHeaders(map[string]string{"Server": "Apache/2.4.50"}), Body: []byte("My Business Application")}, nil
+}
+func (p portKeyedProbe) Fingerprint(context.Context, model.Target) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) Post(context.Context, model.Target, string, string, []byte) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) Options(context.Context, model.Target, string) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) TCP(context.Context, model.Target, []byte, int) ([]byte, error) {
+	return nil, nil
+}
+
+// TestDiscoveryJBossAppPortFindsSiblingManagement is the real end-to-end regression
+// for the core FN: app on 8080 with zero JBoss markers, management on sibling 9990.
+// Discovery MUST route jbosswildfly so the checker gets a chance to run. Using a
+// fake probe keyed by port, this fails if the preflight is removed — unlike the
+// earlier "HTTPRequests >= 2" gate, which was always green.
+func TestDiscoveryJBossAppPortFindsSiblingManagement(t *testing.T) {
+	target, err := model.ParseTarget("http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("ParseTarget failed: %v", err)
+	}
+	probe := portKeyedProbe{mgmt: map[int]httpx.Response{
+		9990: {StatusCode: 401, Headers: canonHeaders(map[string]string{"WWW-Authenticate": `Digest realm="ManagementRealm"`})},
+	}}
+
+	disc := Discover(context.Background(), probe, target)
+
+	if !disc.Products["jbosswildfly"] {
+		t.Fatal("app:8080 with no markers + management:9990 must route jbosswildfly via sibling preflight")
+	}
+	// Two baseline GETs (root + 404) plus the sibling /management probe(s).
+	if disc.HTTPRequests <= 2 {
+		t.Errorf("sibling management preflight was not accounted for: HTTPRequests=%d", disc.HTTPRequests)
+	}
+}
+
+// TestDiscoveryJBossPreflightIgnoresPlain401 locks in the ManagementRealm-only
+// rule: a sibling 9990 that returns a generic 401 (an unrelated Basic/Digest
+// login, no ManagementRealm) must NOT route jbosswildfly. This is what keeps
+// preflight from dragging the checker onto every service with an auth-gated 9990.
+func TestDiscoveryJBossPreflightIgnoresPlain401(t *testing.T) {
+	target, err := model.ParseTarget("http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("ParseTarget failed: %v", err)
+	}
+	probe := portKeyedProbe{mgmt: map[int]httpx.Response{
+		9990: {StatusCode: 401, Headers: canonHeaders(map[string]string{"WWW-Authenticate": `Basic realm="Login"`})},
+		9993: {StatusCode: 401, Headers: canonHeaders(map[string]string{"WWW-Authenticate": `Basic realm="Login"`})},
+	}}
+
+	disc := Discover(context.Background(), probe, target)
+
+	if disc.Products["jbosswildfly"] {
+		t.Error("a generic 401 (no ManagementRealm) on 9990/9993 must not route jbosswildfly")
+	}
+}
+
+// TestGitLabDiscoveryHeaderStrippedRedirect end-to-end regression test:
+// when reverse proxy strips X-Gitlab-Meta header AND root responds with 302
+// Location: /users/sign_in (no body content), discovery must still route gitlab
+// to enable checker to probe /users/sign_in + /-/manifest.json.
+func TestGitLabDiscoveryHeaderStrippedRedirect(t *testing.T) {
+	p, err := policy.New(model.ModePassive, nil)
+	if err != nil {
+		t.Fatalf("policy.New failed: %v", err)
+	}
+	opts := httpx.Defaults()
+	opts.Rate = 0
+	opts.Timeout = 300 * time.Millisecond
+	client, err := httpx.New(opts, p)
+	if err != nil {
+		t.Fatalf("httpx.New failed: %v", err)
+	}
+	t.Cleanup(client.Close)
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.RequestURI == "/" {
+			// Proxy strips X-Gitlab-Meta, root redirects to sign-in with empty body
+			w.Header().Set("Location", "/users/sign_in")
+			w.WriteHeader(302)
+			// Empty body to simulate pure redirect without body hints
+		} else if r.RequestURI == "/users/sign_in" {
+			// Actual GitLab sign-in page
+			w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head><title>Sign In to GitLab</title></head>
+<body>
+<h1>Welcome to GitLab</h1>
+<form action="/login" method="POST">
+  <input name="email" placeholder="Email">
+  <input name="password" type="password">
+</form>
+</body>
+</html>`))
+		} else if r.RequestURI == "/-/manifest.json" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"name": "GitLab", "short_name": "GitLab", "start_url": "/"}`))
+		} else {
+			w.WriteHeader(404)
+		}
+	}))
+	defer s.Close()
+
+	target, err := model.ParseTarget(s.URL)
+	if err != nil {
+		t.Fatalf("ParseTarget failed: %v", err)
+	}
+
+	disc := Discover(context.Background(), client, target)
+
+	if !disc.Products["gitlab"] {
+		t.Error("GitLab should be routed when root redirects to /users/sign_in (header stripped, body empty)")
+	}
+}
+
+// rawTCPProbe implements httpx.Probe with a canned TCP reply, for products like
+// ActiveMQ's OpenWire that have no HTTP-observable signal at all — Get/Fingerprint
+// are irrelevant to their routing rule, so they return bare 404s.
+type rawTCPProbe struct {
+	tcpResp []byte
+	tcpErr  error
+}
+
+func (p rawTCPProbe) TCP(context.Context, model.Target, []byte, int) ([]byte, error) {
+	return p.tcpResp, p.tcpErr
+}
+func (p rawTCPProbe) Get(context.Context, model.Target, string) (httpx.Response, error) {
+	return httpx.Response{StatusCode: 404, Headers: map[string]string{}}, nil
+}
+func (p rawTCPProbe) Fingerprint(context.Context, model.Target) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p rawTCPProbe) Post(context.Context, model.Target, string, string, []byte) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p rawTCPProbe) Options(context.Context, model.Target, string) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+
+// TestActiveMQDiscoverySignal is the real end-to-end regression for ActiveMQ's
+// routing rule: unlike every other product here, OpenWire has zero HTTP signal,
+// so target.Port == 61616 is the ONLY routing hint. This fails if that rule is
+// ever removed or the port constant drifts — unlike a fixture-less testCases
+// entry, which would stay silently green.
+func TestActiveMQDiscoverySignal(t *testing.T) {
+	// A real WireFormatInfo frame shape (magic + protocol-version int + a
+	// ProviderVersion property), matching what four real ActiveMQ binaries sent
+	// in docs/activemq-attack-surface.md.
+	frame := append([]byte{0, 0, 0, 0, 0x01}, []byte("ActiveMQ")...)
+	frame = append(frame, 0, 0, 0, 0x0c)
+	frame = append(frame, []byte("ProviderVersion")...)
+	frame = append(frame, 0, 6)
+	frame = append(frame, []byte("5.17.5")...)
+
+	target, err := model.ParseTarget("http://127.0.0.1:61616")
+	if err != nil {
+		t.Fatalf("ParseTarget failed: %v", err)
+	}
+	disc := Discover(context.Background(), rawTCPProbe{tcpResp: frame}, target)
+	if !disc.Products["activemq"] {
+		t.Error("target.Port == 61616 with a real OpenWire handshake must route activemq")
+	}
+
+	// Negative: the same port, but the bytes are not OpenWire at all.
+	discNeg := Discover(context.Background(), rawTCPProbe{tcpResp: []byte("not activemq at all")}, target)
+	if discNeg.Products["activemq"] {
+		t.Error("non-OpenWire bytes on :61616 must not route activemq")
+	}
+
+	// Negative: OpenWire's default port, but nothing is actually listening.
+	discErr := Discover(context.Background(), rawTCPProbe{tcpErr: context.DeadlineExceeded}, target)
+	if discErr.Products["activemq"] {
+		t.Error("a TCP error on :61616 must not route activemq")
+	}
+
+	// Off the default port with the exact same real frame: must NOT route,
+	// since port is the only signal we have (documented limitation, same as
+	// WebLogic's target.Port == 7001 rule).
+	otherPort, _ := model.ParseTarget("http://127.0.0.1:8080")
+	discOffPort := Discover(context.Background(), rawTCPProbe{tcpResp: frame}, otherPort)
+	if discOffPort.Products["activemq"] {
+		t.Error("OpenWire on a non-default port must not route without an HTTP hint — this is a documented gap, not a fixed rule")
+	}
+}
+
+func splitHeader(s string) [2]string {
+	for i, c := range s {
+		if c == ':' {
+			return [2]string{s[:i], s[i+2:]}
+		}
+	}
+	return [2]string{s, ""}
+}

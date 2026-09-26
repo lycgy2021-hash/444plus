@@ -100,6 +100,21 @@ const (
 	ValidationLive ValidationTier = "live"
 )
 
+// ValidationCoverage is an orthogonal dimension of Validation that distinguishes
+// "live environment reality" (Tier: when and where tested) from "verdict path
+// coverage" (Coverage: which verdict transitions were observed). A live-tier
+// checker might test only the PositivePath (vulnerable state) without exercising
+// FixedPath (patched state), or might only spot-check ProductIdentity rather than
+// systematically testing all three fingerprint signals. Coverage fields are
+// independently true/false depending on what the checker's test actually covered,
+// separate from whether testing happened on a real target.
+type ValidationCoverage struct {
+	ProductIdentity bool `json:"product_identity,omitempty"` // Was product detection/fingerprint tested?
+	NegativePath    bool `json:"negative_path,omitempty"`    // Was the secure/not-vulnerable state tested?
+	PositivePath    bool `json:"positive_path,omitempty"`    // Was the vulnerable/misconfigured state tested?
+	FixedPath       bool `json:"fixed_path,omitempty"`       // Was the patched/fixed state tested?
+}
+
 // Validation is a checker's validation record. It travels with Metadata so a
 // report can show it next to a verdict, and so a later pass can compare
 // LastValidatedCommit against the checker's own file history to tell a still-
@@ -117,6 +132,10 @@ type Validation struct {
 	// exactly the gap that let two real jbosswildfly bugs survive one
 	// session's "four-state acceptance" untouched.
 	TestedStates []string `json:"tested_states,omitempty"`
+	// Coverage tracks which verdict paths were actually tested, orthogonal to
+	// whether testing happened on real targets. A live-tier checker might have
+	// PositivePath: true but FixedPath: false, or any other combination.
+	Coverage *ValidationCoverage `json:"coverage,omitempty"`
 	// EvidenceRefs point at the write-up, e.g.
 	// "docs/regression-baseline.md#jenkins-two-lines-four-state-real-validated".
 	EvidenceRefs []string `json:"evidence_refs,omitempty"`

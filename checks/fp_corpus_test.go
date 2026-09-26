@@ -305,7 +305,13 @@ func TestVersionMalformedNoElevation(t *testing.T) {
 // A non-WebLogic TCP service must not be mistaken for T3 just because it returns
 // a banner to our handshake.
 func TestFalsePositiveCorpusTCP(t *testing.T) {
-	banners := []string{"220 ProFTPD ready\r\n", "SSH-2.0-OpenSSH_8.9\r\n", "* OK IMAP4 ready\r\n", "GARBAGE HELO not-a-prefix\r\n"}
+	banners := []string{
+		"220 ProFTPD ready\r\n", "SSH-2.0-OpenSSH_8.9\r\n", "* OK IMAP4 ready\r\n", "GARBAGE HELO not-a-prefix\r\n",
+		// Contains the literal ActiveMQ magic substring, but NOT at the exact
+		// offset (5 bytes in) a real OpenWire WireFormatInfo frame puts it —
+		// this must not fool the exact-offset check into a false ActiveMQ hit.
+		"Welcome, this is ActiveMQ-branded but not the real broker protocol\r\n",
+	}
 	for _, banner := range banners {
 		t.Run(banner[:6], func(t *testing.T) {
 			ln, err := net.Listen("tcp", "127.0.0.1:0")

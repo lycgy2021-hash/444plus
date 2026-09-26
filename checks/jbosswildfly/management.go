@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopoc/internal/httpx"
 	"gopoc/internal/model"
@@ -13,11 +14,32 @@ import (
 // and legacy JBoss AS 7/EAP 6.
 const managementPath = "/management"
 
-// managementPorts are the conventional ports for the HTTP management
-// interface, tried on the scanned host in addition to the target's own port.
-// Confirmed default on a live WildFly image: app HTTP on 8080, management on
-// 9990 — a separate listener, not multiplexed onto the app port.
-var managementPorts = []int{9990, 9993}
+// discoveryBudget bounds the TOTAL wall-clock cost of the sibling-management
+// preflight that Discover() runs against ordinary web targets. Management ports
+// that are firewalled with DROP (not RST) would otherwise each cost a full
+// httpx timeout; capping the whole preflight keeps low-noise discovery cheap.
+const discoveryBudget = 1 * time.Second
+
+// managementEndpoint is one conventional management listener: its port and the
+// scheme that listener speaks. This is the single source of truth for "where and
+// how the WildFly/JBoss management interface is reached" — the checker and
+// discovery both build their candidates from it, so a scheme fix here reaches
+// both and they can never disagree on, say, whether 9993 is HTTPS.
+type managementEndpoint struct {
+	Port   int
+	Scheme string
+}
+
+// managementEndpoints are the conventional management listeners, tried on the
+// scanned host in addition to the target's own port. Confirmed default on a live
+// WildFly image: app HTTP on 8080, management on 9990 — a separate listener, not
+// multiplexed onto the app port. 9990 is the plain-HTTP management port; 9993 is
+// its TLS counterpart, so it must be probed as https or the TLS listener sees a
+// plaintext request and the real management interface is missed.
+var managementEndpoints = []managementEndpoint{
+	{Port: 9990, Scheme: "http"},
+	{Port: 9993, Scheme: "https"},
+}
 
 // managementProbe is the result of probing one candidate host:port for the
 // management API.
@@ -28,20 +50,30 @@ type managementProbe struct {
 }
 
 // candidateManagementTargets returns target plus one Target per conventional
-// management port on the same host, deduplicated by port. Reusing the scanned
-// target's own host keeps every candidate inside the caller's policy scope
-// (checked per-request by httpx.Client against the same host).
+// management endpoint on the same host, each carrying the endpoint's own scheme
+// (9990=http, 9993=https). Dedup is by full origin (scheme+host+port), not port
+// alone: when the input already sits on a management port but with the wrong
+// scheme (e.g. http://host:9993), we still add the correctly-schemed candidate
+// (https://host:9993) rather than letting the input's scheme suppress it — the
+// input scheme is a scan-entry fact, not the product's protocol fact. Reusing
+// the scanned target's own host keeps every candidate inside the caller's policy
+// scope (checked per-request by httpx.Client against the same host).
 func candidateManagementTargets(target model.Target) []model.Target {
-	seen := map[int]bool{target.Port: true}
-	out := []model.Target{target}
-	for _, port := range managementPorts {
-		if seen[port] {
-			continue
+	var out []model.Target
+	seen := map[string]bool{}
+	add := func(t model.Target) {
+		if seen[t.Origin()] {
+			return
 		}
-		seen[port] = true
+		seen[t.Origin()] = true
+		out = append(out, t)
+	}
+	add(target)
+	for _, ep := range managementEndpoints {
 		cand := target
-		cand.Port = port
-		out = append(out, cand)
+		cand.Port = ep.Port
+		cand.Scheme = ep.Scheme
+		add(cand)
 	}
 	return out
 }
@@ -122,4 +154,42 @@ func unauthenticatedData(r httpx.Response) bool {
 		return false
 	}
 	return strings.Contains(body, `"management-major-version"`) || strings.Contains(body, `"outcome"`)
+}
+
+// ManagementDiscoveryHint is the low-cost routing hint Discover() uses when an
+// ordinary web target shows no JBoss/WildFly markers on its own port: it probes
+// the conventional management ports on the SAME host and reports whether one
+// answers with a definitive management signal. It reuses the checker's own
+// requiresAuth / unauthenticatedData predicates — the single source of truth for
+// "this is the WildFly management interface" — so discovery never routes on a
+// weaker rule (e.g. any 401) than the checker verifies with, and the two can
+// never drift apart. The whole preflight shares one short deadline so a
+// DROP-firewalled port cannot stall discovery, and every probe (success, miss,
+// or policy-blocked error) is returned as an Observation so the caller can both
+// account for the request and tell "no management here" apart from "policy
+// blocked the probe". Returns whether a management interface was seen and the
+// per-probe observations (also the exact count of HTTP requests made).
+func ManagementDiscoveryHint(ctx context.Context, client httpx.Probe, target model.Target) (bool, []model.Observation) {
+	ctx, cancel := context.WithTimeout(ctx, discoveryBudget)
+	defer cancel()
+
+	var obs []model.Observation
+	hit := false
+	for _, cand := range candidateManagementTargets(target) {
+		if cand.Port == target.Port {
+			continue // the caller has already fetched the app port itself
+		}
+		r, err := client.Get(ctx, cand, managementPath)
+		o := r.Observation("discover_management", err)
+		o.URL = cand.Origin() + managementPath
+		obs = append(obs, o)
+		if err != nil {
+			continue
+		}
+		if requiresAuth(r) || unauthenticatedData(r) {
+			hit = true
+			break
+		}
+	}
+	return hit, obs
 }

@@ -3,8 +3,10 @@
 package checks
 
 import (
+	"gopoc/checks/activemq"
 	"gopoc/checks/apache"
 	"gopoc/checks/fortinet"
+	"gopoc/checks/gitlab"
 	"gopoc/checks/ingressnginx"
 	"gopoc/checks/jbosswildfly"
 	"gopoc/checks/jenkins"
@@ -36,6 +38,8 @@ func Builtin(client httpx.Probe, mode model.Mode, canary model.CanaryConfig) (*r
 		netscaler.NewCVE20257775(client), netscaler.NewCVE20256543(client),
 		jbosswildfly.NewUnauthenticatedManagement(client),
 		jenkins.NewAnonScriptConsole(client), jenkins.NewCVE202423897(client),
+		gitlab.NewCVE20237028(client), gitlab.NewCVE20232825(client),
+		activemq.NewCVE202346604(client),
 	} {
 		if err := r.Register(withValidation(c)); err != nil {
 			return nil, err

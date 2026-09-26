@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"strings"
 
+	"gopoc/checks/activemq/protocol"
+	"gopoc/checks/jbosswildfly"
 	"gopoc/internal/httpx"
 	"gopoc/internal/model"
 )
@@ -23,7 +25,10 @@ type Discovery struct {
 }
 
 // Discover probes the target and returns candidate products. It makes at most
-// two HTTP GETs and, only when the response hints WebLogic, one T3 handshake.
+// two baseline HTTP GETs (root + 404), then conditional HTTP GETs: up to two for
+// the JBoss sibling-management preflight (9990/9993, sharing one short deadline),
+// and up to one for the GitLab sign_in fallback. Only when the response hints
+// WebLogic, one T3 handshake.
 func Discover(ctx context.Context, client httpx.Probe, target model.Target) Discovery {
 	d := Discovery{Products: map[string]bool{}}
 	add := func(p string) { d.Products[p] = true }
@@ -75,6 +80,66 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 	if hasHeader("X-Jenkins") || hasHeader("X-Hudson") {
 		add("jenkins")
 	}
+	// GitLab emits X-Gitlab-Meta on every response; the checkers require ≥2
+	// independent signals (header + body/manifest), so this is a routing hint only.
+	if hasHeader("X-Gitlab-Meta") {
+		add("gitlab")
+	}
+	// Fallback: when X-Gitlab-Meta is stripped by proxy, probe for GitLab's sign-in page.
+	// This catches cases where: (1) body hints at /users/sign_in, or (2) Location redirects to it,
+	// or (3) page mentions GitLab. The checker verifies via body + manifest.
+	if !hasHeader("X-Gitlab-Meta") {
+		shouldProbeSignIn := false
+		// Case 1: body mentions sign_in or GitLab
+		if strings.Contains(body, "/users/sign_in") || strings.Contains(body, "new_user") || strings.Contains(body, "gitlab") {
+			shouldProbeSignIn = true
+		}
+		// Case 2: Location header redirects to /users/sign_in (typical GitLab pattern)
+		if root.Location != "" && strings.Contains(strings.ToLower(root.Location), "/users/sign_in") {
+			shouldProbeSignIn = true
+		}
+		if notFound.Location != "" && strings.Contains(strings.ToLower(notFound.Location), "/users/sign_in") {
+			shouldProbeSignIn = true
+		}
+
+		if shouldProbeSignIn {
+			signInResp, err := client.Get(ctx, target, "/users/sign_in")
+			if err == nil && signInResp.StatusCode >= 200 && signInResp.StatusCode < 300 && strings.Contains(strings.ToLower(string(signInResp.Body)), "gitlab") {
+				d.HTTPRequests++
+				add("gitlab")
+			}
+		}
+	}
+	// JBoss/WildFly Management Interface signals. /management probe happens in the
+	// checker itself; this is purely a routing hint based on product name/structure.
+	if strings.Contains(body, "jboss") || strings.Contains(body, "wildfly") || strings.Contains(body, "hibernate validator") {
+		add("jbosswildfly")
+	}
+	// Management interface typically on 9990 (http) or 9993 (https), even if main app
+	// has no JBoss markers. This routes checkers to explore independent management endpoint.
+	if target.Port == 9990 || target.Port == 9993 {
+		add("jbosswildfly")
+	}
+	// Preflight: when the app port shows no JBoss/WildFly markers, the real
+	// management interface may still be a sibling listener on the same host
+	// (the common topology: business app on 8080, management on 9990/9993).
+	// Delegate to the checker's own management-discovery hint so discovery and
+	// the checker share one definition of "this is the management interface"
+	// (a ManagementRealm auth challenge or unauthenticated DMR data — never just
+	// any 401). Only do this for standard app ports, and the hint self-bounds its
+	// total latency, so ordinary web targets stay cheap even behind a DROP
+	// firewall. Every probe is accounted for, including policy-blocked ones.
+	isStandardAppPort := target.Port == 80 || target.Port == 443 ||
+		(target.Port >= 8000 && target.Port <= 8999)
+	if !strings.Contains(body, "jboss") && !strings.Contains(body, "wildfly") &&
+		target.Port != 9990 && target.Port != 9993 && isStandardAppPort {
+		hit, obs := jbosswildfly.ManagementDiscoveryHint(ctx, client, target)
+		d.HTTPRequests += len(obs)
+		d.Observations = append(d.Observations, obs...)
+		if hit {
+			add("jbosswildfly")
+		}
+	}
 	if hasHeader("MicrosoftSharePointTeamServices") || hasHeader("X-SharePointHealthScore") || strings.Contains(body, "/_layouts/15/") {
 		add("sharepoint")
 	}
@@ -101,6 +166,21 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 			add("weblogic")
 		}
 		d.Observations = append(d.Observations, obs)
+	}
+	// OpenWire has no HTTP-observable signal at all (it's a raw binary protocol,
+	// never fronted by an HTTP proxy) — unlike every other product here, the
+	// default port is the ONLY routing hint available. Delegate to the same
+	// protocol.OpenWire the checker uses, so discovery and the checker share one
+	// magic-byte/version parser and can never disagree on what counts as
+	// ActiveMQ. The probe writes nothing (server-speaks-first), so this is as
+	// cheap and safe as the passive read the checker itself performs.
+	if target.Port == 61616 {
+		identified, _, obs := protocol.OpenWire(ctx, client, target)
+		d.TCPRequests++
+		d.Observations = append(d.Observations, obs)
+		if identified {
+			add("activemq")
+		}
 	}
 	return d
 }
