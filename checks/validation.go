@@ -147,7 +147,8 @@ var validationRecords = map[string]model.Validation{
 			PositivePath:    true,
 			FixedPath:       true,
 		},
-		EvidenceRefs: []string{"docs/activemq-attack-surface.md"},
+		EvidenceRefs:        []string{"docs/activemq-attack-surface.md"},
+		LastValidatedCommit: "fd4c01a",
 	},
 
 	// Device/mock lines: unit- and FP-corpus-validated only. Fingerprints are
