@@ -806,6 +806,62 @@ the guarantees hold under test:
     real-network-verified recovery — the first time this session's audit has
     verified these boundaries hold under actual network I/O rather than only
     against fakes built to cooperate.
+  - **Three runtime-hardening fixes, requested before S10-E5 is pointed at any
+    real external target (E5 PASS itself did not depend on them):**
+    1. **HTTP body size cap, confirmed by test rather than only asserted in a
+       doc comment.** `HTTPCollector` already read the response body through
+       `io.LimitReader(resp.Body, maxHTTPBodyBytes+1)` and rejected anything
+       over the cap — a malicious or malfunctioning target returning an
+       unbounded body could otherwise exhaust memory before
+       `HTTPStateProjector` ever got to hash it.
+       `TestHTTPCollectorRejectsOversizedBody` drives a fixture endpoint that
+       writes past the cap and checks `Collect` fails outright, never
+       succeeding with a silently truncated body.
+    2. **`MaxWallTime` now bounds the ACTIVE network call, not just the gap
+       between `Baseline`/`Step` calls.** The existing preflight check
+       (`time.Since(startTime) > MaxWallTime`) only runs BETWEEN calls — a
+       single request that simply never returns (a hung connection, a target
+       that accepts a socket and never responds) would defeat it entirely,
+       since nothing would ever reach the next preflight to notice. Fixed:
+       `Baseline` and `Step` both derive a `context.WithDeadline` from the
+       session's absolute wall-clock budget (`e.startTime +
+       budget.MaxWallTime`, set once at `Baseline`, never renewed per call)
+       and pass it to every real-I/O call they make
+       (`collectAndProjectLocked`, `Executor.Execute`) — the same
+       cooperative-cancellation caveat `recoveryTimeout` already documents
+       applies here too (a real implementation must itself be
+       context-aware). Recovery deliberately keeps its OWN separate
+       `recoveryTimeout` deadline — this does not change that; the two
+       remain independent, matching `recoveryMeter`'s own independence from
+       `explorationMeter`. `TestExplorerMaxWallTimeCancelsHangingRealRequest`
+       drives a fixture endpoint that hangs for 5 seconds against a 50ms
+       `MaxWallTime` and checks `Baseline` fails within ~2 seconds, not after
+       waiting out the server's full delay.
+    3. **`research/http_profile.go`'s `HTTPProfile` binds one
+       `ExplorationScope` to exactly one HTTP origin.** `HTTPCollector` and
+       `HTTPExecutor` were previously constructed independently, each taking
+       its own `baseURL` — nothing stopped a caller from building them
+       against two DIFFERENT origins and wiring both, plus an unrelated
+       scope, into the same `Explorer` (e.g. `scopeHash = target-A` while
+       `HTTPExecutor.baseURL = target-B`). `ExplorationScope`'s fields are
+       deliberately abstract identifiers with no URL to literally validate
+       an origin against — S10's frozen contract never gave them one — so
+       the fix is structural: `NewHTTPProfile(scope, baseURL, path,
+       actions)` is the ONE place a scope and an HTTP origin are ever
+       paired, building both the `Collector` and the `Executor` from the
+       SAME `baseURL` argument inside one constructor call, so they can
+       never silently diverge. `TestNewHTTPProfileBuildsCollectorAndExecutorFromSameOrigin`
+       pins the shape; the end-to-end test now wires through
+       `profile.Scope()`/`profile.Collector()`/`profile.Executor()` rather
+       than three independently constructed values.
+  - **Design discipline to hold, not a fix:** `HTTPExecutor`'s
+    `RegistryKey -> path` catalog must stay CODE-LEVEL FIXED for the
+    lifetime of this design — never a value read from configuration, an
+    environment variable, or (worst of all) something a candidate or LLM
+    output could influence. `ActionID`'s meaning must never be reinterpreted
+    after a policy has already authorized it; the whole chain
+    (`ActionID` → an immutable executable catalog → a fixed `GET` path)
+    depends on that staying true.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
 

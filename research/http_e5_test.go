@@ -37,8 +37,25 @@ func newHTTPFixtureServer(t *testing.T) *httptest.Server {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/huge", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		chunk := make([]byte, 64*1024)
+		for written := 0; written < maxHTTPBodyBytes+1024; written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	})
 	mux.HandleFunc("/redirect", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "http://example.invalid/elsewhere", http.StatusFound)
+	})
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(5 * time.Second):
+		case <-r.Context().Done():
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
@@ -55,11 +72,12 @@ func newHTTPFixtureServer(t *testing.T) *httptest.Server {
 func TestS10E5RealHTTPExplorationEndToEnd(t *testing.T) {
 	ts := newHTTPFixtureServer(t)
 
-	collector, err := NewHTTPCollector(ts.URL, "/state")
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor, err := NewHTTPExecutor(ts.URL, map[string]string{
+	scope := ExplorationScope{TargetID: "e5-fixture", BuildID: "b1", SessionID: "s1", Protocol: "http", HarnessID: "h1"}
+	// NewHTTPProfile binds this scope to ts.URL once, building both the
+	// Collector and the Executor from the SAME origin — see http_profile.go
+	// for why that matters (a Collector for one target and an Executor for
+	// a different one can never end up wired into the same Explorer).
+	profile, err := NewHTTPProfile(scope, ts.URL, "/state", map[string]string{
 		"get-root":   "/",
 		"get-health": "/health",
 	})
@@ -79,11 +97,11 @@ func TestS10E5RealHTTPExplorationEndToEnd(t *testing.T) {
 		MaxVisitsPerState: 10, MaxBranching: 1, MaxWallTime: 30 * time.Second,
 	}
 	exp, err := NewExplorer(
-		ExplorationScope{TargetID: "e5-fixture", BuildID: "b1", SessionID: "s1", Protocol: "http", HarnessID: "h1"},
-		collector,
+		profile.Scope(),
+		profile.Collector(),
 		stateauth.HTTPFixtureRegistry(),
 		policy,
-		executor,
+		profile.Executor(),
 		budget,
 		actionauth.RecoveryPlanRef{RegistryKey: "reset"},
 		5*time.Second,
@@ -166,6 +184,25 @@ func TestHTTPCollectorNeverFollowsRedirects(t *testing.T) {
 	}
 }
 
+// TestHTTPCollectorRejectsOversizedBody is the direct regression test for
+// the audit's body-size-cap ask: a target that returns more than
+// maxHTTPBodyBytes must make Collect fail, never silently truncate the body
+// into a misleading Fact, and never let an unbounded read exhaust memory. A
+// LimitReader-based cap was already part of the original HTTPCollector
+// implementation — this test exists so that guarantee is proven, not merely
+// asserted in a doc comment.
+func TestHTTPCollectorRejectsOversizedBody(t *testing.T) {
+	ts := newHTTPFixtureServer(t)
+	collector, err := NewHTTPCollector(ts.URL, "/huge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := ContextWithRequestMeter(context.Background(), newBoundedRequestMeter(10))
+	if _, err := collector.Collect(ctx, ExplorationScope{TargetID: "e5-fixture"}); err == nil {
+		t.Fatal("a response body over maxHTTPBodyBytes must make Collect fail, never succeed with a truncated body")
+	}
+}
+
 // TestHTTPExecutorRefusesUnregisteredAction proves HTTPExecutor's fixed
 // action map really is the only thing it will ever run — a BoundAction for
 // a key it wasn't constructed with (which should be structurally
@@ -213,4 +250,46 @@ func mustMarshalHTTPArtifact(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+// TestExplorerMaxWallTimeCancelsHangingRealRequest is the direct regression
+// test for the audit's wall-time-enforcement ask: Explorer's MaxWallTime
+// must bound the ACTIVE network call, not merely be checked between calls.
+// The fixture's "/slow" endpoint hangs for 5 seconds (or until its own
+// request context is cancelled); against a 50ms MaxWallTime, Baseline must
+// fail promptly — via the context deadline explorer.go now derives — not
+// after waiting out the server's full delay.
+func TestExplorerMaxWallTimeCancelsHangingRealRequest(t *testing.T) {
+	ts := newHTTPFixtureServer(t)
+	scope := ExplorationScope{TargetID: "e5-fixture"}
+	profile, err := NewHTTPProfile(scope, ts.URL, "/slow", map[string]string{"get-root": "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpReq := actionauth.StateRequirements{ProjectorID: stateauth.HTTPStateProjector{}.ID()}
+	policy := actionauth.NewActionPolicy(
+		actionauth.NewRegistry(actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root"}, Requirements: httpReq}),
+		actionauth.NewRecoveryRegistry("reset"),
+	)
+	budget := ExplorationBudget{
+		MaxStates: 10, MaxTransitions: 10, MaxDepth: 10, MaxRequests: 50,
+		MaxVisitsPerState: 10, MaxBranching: 1, MaxWallTime: 50 * time.Millisecond,
+	}
+	exp, err := NewExplorer(
+		profile.Scope(), profile.Collector(), stateauth.HTTPFixtureRegistry(), policy, profile.Executor(),
+		budget, actionauth.RecoveryPlanRef{RegistryKey: "reset"}, 5*time.Second, 20,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err = exp.Baseline(context.Background())
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Baseline against a hanging endpoint must fail once MaxWallTime elapses")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Baseline took %v, want it cut short by MaxWallTime=50ms, well before the server's 5s delay", elapsed)
+	}
 }

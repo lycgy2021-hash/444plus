@@ -131,6 +131,28 @@ import (
 // single *stateauth.BoundRegistry — registry and projector bound together,
 // by stateauth itself, with no parameter through which Explorer's own caller
 // could ask for a different pairing.
+//
+// WALL-TIME ENFORCEMENT closes a gap found once S10-E5 made real network
+// I/O possible: preflightBudgetLocked's MaxWallTime check only runs BETWEEN
+// calls to Baseline/Step — it says "too much time has already passed
+// before this next call", never "this specific network call must give up
+// by such-and-such a time". A single request that simply never returns
+// (a hung connection, a target that accepts a socket and never responds)
+// would defeat that check entirely: nothing would ever get to the next
+// preflight to notice the budget was blown. Fixed: Baseline and Step both
+// derive a context.WithDeadline from the session's absolute wall-clock
+// budget (e.startTime + budget.MaxWallTime — set once, at Baseline, never
+// renewed per call) and pass THAT to every real-I/O call they make
+// (collectAndProjectLocked, Executor.Execute) — a hanging Collector or
+// Executor implementation now has its ctx cancelled once the session's own
+// wall-clock budget is exhausted, exactly like recoveryTimeout already
+// does for recovery specifically (recovery deliberately keeps its OWN
+// separate deadline mechanism, per its own "emergency allowance" design —
+// this does not change that). The same COOPERATIVE-cancellation caveat
+// recoveryTimeout's own doc states applies here too: Explorer can only
+// provide the deadline; a real implementation must itself be
+// context-aware (e.g. via http.NewRequestWithContext) for it to actually
+// interrupt anything.
 type Explorer struct {
 	mu sync.Mutex
 
@@ -296,7 +318,15 @@ func (e *Explorer) Baseline(ctx context.Context) (stateauth.Fingerprint, error) 
 		return stateauth.Fingerprint{}, errors.New("research: Baseline must be called exactly once, before the first Step or Recover")
 	}
 
-	fp, raw, err := e.collectAndProjectLocked(ctx, e.explorationMeter)
+	// MaxWallTime must bound the ACTUAL network call, not just be checked
+	// between steps — see the package doc's WALL-TIME ENFORCEMENT section.
+	// Baseline is where the session's wall-clock budget starts, so its
+	// deadline is simply "now + MaxWallTime".
+	start := time.Now()
+	deadlineCtx, cancel := context.WithDeadline(ctx, start.Add(e.budget.MaxWallTime))
+	defer cancel()
+
+	fp, raw, err := e.collectAndProjectLocked(deadlineCtx, e.explorationMeter)
 	if err != nil {
 		// Any collection/projection failure — including a scope mismatch — is
 		// a permanent stop, never a retryable condition: see the package doc
@@ -308,7 +338,7 @@ func (e *Explorer) Baseline(ctx context.Context) (stateauth.Fingerprint, error) 
 	e.current = fp
 	e.currentRaw = raw
 	e.started = true
-	e.startTime = time.Now()
+	e.startTime = start
 	e.visits[fp.StateFingerprintHash()]++
 	return fp, nil
 }
@@ -357,10 +387,18 @@ func (e *Explorer) Step(ctx context.Context) (StateTransition, error) {
 		return StateTransition{}, err
 	}
 
+	// MaxWallTime must bound the ACTUAL network calls this Step makes, not
+	// just be checked before starting one — see the package doc's
+	// WALL-TIME ENFORCEMENT section. The deadline is the session's absolute
+	// wall-clock budget (e.startTime + MaxWallTime), shared by all three
+	// real-I/O calls below, never renewed per call.
+	deadlineCtx, cancel := context.WithDeadline(ctx, e.startTime.Add(e.budget.MaxWallTime))
+	defer cancel()
+
 	// Fresh authorization state — NEVER e.current used as-is. This is the
 	// TOCTOU fix: Select/Bind below only ever see a Fingerprint collected
 	// this instant, not one left over from a previous Step.
-	before, beforeRaw, err := e.collectAndProjectLocked(ctx, e.explorationMeter)
+	before, beforeRaw, err := e.collectAndProjectLocked(deadlineCtx, e.explorationMeter)
 	if err != nil {
 		e.stopLocked(err)
 		return StateTransition{}, err
@@ -397,12 +435,12 @@ func (e *Explorer) Step(ctx context.Context) (StateTransition, error) {
 	}
 	e.tried[beforeHash][action.ID().RegistryKey] = true
 
-	execCtx := ContextWithRequestMeter(ctx, e.explorationMeter)
+	execCtx := ContextWithRequestMeter(deadlineCtx, e.explorationMeter)
 	if err := e.executor.Execute(execCtx, action); err != nil {
 		return StateTransition{}, fmt.Errorf("research: executing action %s: %w", action.ID().RegistryKey, err)
 	}
 
-	after, afterRaw, err := e.collectAndProjectLocked(ctx, e.explorationMeter)
+	after, afterRaw, err := e.collectAndProjectLocked(deadlineCtx, e.explorationMeter)
 	if err != nil {
 		// Any collection/projection failure after an action — including a
 		// scope mismatch (the target dropped the connection, a load balancer
