@@ -87,7 +87,7 @@ func TestS10E5RealHTTPExplorationEndToEnd(t *testing.T) {
 	}
 	httpReq := actionauth.StateRequirements{ProjectorID: stateauth.HTTPStateProjector{}.ID()}
 	policy := actionauth.NewActionPolicy(
-		actionauth.NewRegistry(
+		mustActionRegistry(t,
 			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/")}, Requirements: httpReq},
 			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-health", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/health")}, Requirements: httpReq},
 		),
@@ -217,7 +217,7 @@ func TestHTTPExecutorRefusesUnregisteredAction(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := actionauth.NewActionPolicy(
-		actionauth.NewRegistry(actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root"}, Requirements: actionauth.StateRequirements{ProjectorID: "http-v1"}}),
+		mustActionRegistry(t, actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root"}, Requirements: actionauth.StateRequirements{ProjectorID: "http-v1"}}),
 		actionauth.NewRecoveryRegistry(),
 	)
 	// A BoundAction can only ever be produced by Select against a real
@@ -264,7 +264,7 @@ func TestHTTPExecutorRefusesSpecIDMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := actionauth.NewActionPolicy(
-		actionauth.NewRegistry(actionauth.Registration{
+		mustActionRegistry(t, actionauth.Registration{
 			Action:       actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly, SpecID: "a-spec-id-that-does-not-match-this-executors-own-path"},
 			Requirements: actionauth.StateRequirements{ProjectorID: "http-v1"},
 		}),
@@ -312,7 +312,7 @@ func TestExplorerMaxWallTimeCancelsHangingRealRequest(t *testing.T) {
 	}
 	httpReq := actionauth.StateRequirements{ProjectorID: stateauth.HTTPStateProjector{}.ID()}
 	policy := actionauth.NewActionPolicy(
-		actionauth.NewRegistry(actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root"}, Requirements: httpReq}),
+		mustActionRegistry(t, actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root"}, Requirements: httpReq}),
 		actionauth.NewRecoveryRegistry("reset"),
 	)
 	budget := ExplorationBudget{

@@ -150,11 +150,25 @@ func rawLenReq() actionauth.StateRequirements {
 	return actionauth.StateRequirements{ProjectorID: rawLenProjectorID()}
 }
 
+// mustReg builds an actionauth.Registry from a fixed, known-duplicate-free
+// literal list and panics if NewRegistry ever rejects it — used only by
+// package-level test fixtures below that have no *testing.T of their own to
+// call t.Fatal on. A rejection here would mean one of THIS FILE's own
+// hardcoded registrations regressed into a duplicate Key, never a real
+// runtime condition.
+func mustReg(regs ...actionauth.Registration) *actionauth.Registry {
+	reg, err := actionauth.NewRegistry(regs...)
+	if err != nil {
+		panic(err)
+	}
+	return reg
+}
+
 // testPolicy returns a policy with one always-applicable action ("probe")
 // and one registered recovery ("reset").
 func testPolicy() *actionauth.ActionPolicy {
 	return actionauth.NewActionPolicy(
-		actionauth.NewRegistry(actionauth.Registration{Action: actionauth.RegisteredAction{Key: "probe", Safety: actionauth.ActionStrictReadOnly}, Requirements: rawLenReq()}),
+		mustReg(actionauth.Registration{Action: actionauth.RegisteredAction{Key: "probe", Safety: actionauth.ActionStrictReadOnly}, Requirements: rawLenReq()}),
 		actionauth.NewRecoveryRegistry("reset"),
 	)
 }
@@ -166,7 +180,7 @@ func testPolicy() *actionauth.ActionPolicy {
 // single-action registry cannot be revisited more than once).
 func testPolicyTwoActions() *actionauth.ActionPolicy {
 	return actionauth.NewActionPolicy(
-		actionauth.NewRegistry(
+		mustReg(
 			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "action-a"}, Requirements: rawLenReq()},
 			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "action-b"}, Requirements: rawLenReq()},
 		),
@@ -301,7 +315,7 @@ func TestExplorerStepReturnsNoApplicableActionWithoutSideEffectOrStop(t *testing
 	// "unreachable" requires a ProjectorID no RawLenProjector fingerprint will
 	// ever carry, so it never matches — deterministically, without a closure.
 	policy := actionauth.NewActionPolicy(
-		actionauth.NewRegistry(actionauth.Registration{Action: actionauth.RegisteredAction{Key: "unreachable"}, Requirements: actionauth.StateRequirements{ProjectorID: "some-other-projector"}}),
+		mustActionRegistry(t, actionauth.Registration{Action: actionauth.RegisteredAction{Key: "unreachable"}, Requirements: actionauth.StateRequirements{ProjectorID: "some-other-projector"}}),
 		actionauth.NewRecoveryRegistry("reset"),
 	)
 	exp := newTestExplorer(t, testScope(), collector, policy, executor, generousBudget())

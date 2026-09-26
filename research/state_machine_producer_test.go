@@ -71,7 +71,7 @@ func e6Fingerprint(t *testing.T, status int, body string) stateauth.Fingerprint 
 // StateFingerprintHash, exactly as a real Explorer session would.
 func e6BoundActionForKey(t *testing.T, actionKey, scopeHash string, fp stateauth.Fingerprint) actionauth.BoundAction {
 	t.Helper()
-	registry := actionauth.NewRegistry(actionauth.Registration{
+	registry := mustActionRegistry(t, actionauth.Registration{
 		Action:       actionauth.RegisteredAction{Key: actionKey},
 		Requirements: actionauth.StateRequirements{ProjectorID: fp.ProjectorID()},
 	})
@@ -137,6 +137,20 @@ func e6MustRegistry(t *testing.T, rules ...TransitionRule) *TransitionRuleRegist
 	reg, err := NewTransitionRuleRegistry(rules...)
 	if err != nil {
 		t.Fatalf("NewTransitionRuleRegistry: %v", err)
+	}
+	return reg
+}
+
+// mustActionRegistry builds an actionauth.Registry and fails the test
+// immediately if NewRegistry rejects it (e.g. a duplicate Action.Key) — the
+// same "happy path assumes successful construction" discipline as
+// e6MustRegistry above, for the actionauth-level registry every S10 test in
+// this package builds.
+func mustActionRegistry(t *testing.T, regs ...actionauth.Registration) *actionauth.Registry {
+	t.Helper()
+	reg, err := actionauth.NewRegistry(regs...)
+	if err != nil {
+		t.Fatalf("actionauth.NewRegistry: %v", err)
 	}
 	return reg
 }

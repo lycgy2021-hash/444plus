@@ -86,7 +86,7 @@ func e7ReplayTarget() ReplayTarget {
 // action-authority check must go through a policy built this way — never
 // one Replay invents for itself.
 func e7DenyOnlyPolicy(projectorID stateauth.ProjectorID, safety actionauth.ActionSafety) *actionauth.ActionPolicy {
-	registry := actionauth.NewRegistry(actionauth.Registration{
+	registry := mustReg(actionauth.Registration{
 		Action:       actionauth.RegisteredAction{Key: "deny", Safety: safety, SpecID: HTTPActionSpecID("/deny")},
 		Requirements: actionauth.StateRequirements{ProjectorID: projectorID},
 	})
@@ -174,7 +174,7 @@ func e7BuildOriginalCandidate(t *testing.T, f *e7Fixture, sessionID string) (*Ca
 // policy (same PolicyID) can legitimately select a DIFFERENT action for a
 // DIFFERENT fresh baseline — never that the policy itself changed.
 func e7StatusKeyedPolicy(projectorID stateauth.ProjectorID) *actionauth.ActionPolicy {
-	registry := actionauth.NewRegistry(
+	registry := mustReg(
 		actionauth.Registration{
 			Action:       actionauth.RegisteredAction{Key: "deny", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/deny")},
 			Requirements: actionauth.StateRequirements{ProjectorID: projectorID, Facts: map[string]string{"status": "200"}},
@@ -732,7 +732,7 @@ func TestNewStateMachineReplayValidatorRejectsNilDependenciesOrInvalidBudget(t *
 	}
 	registry := e6MustRegistry(t) // empty but valid
 	projector := stateauth.HTTPFixtureRegistry()
-	policy := actionauth.NewActionPolicy(actionauth.NewRegistry(), actionauth.NewRecoveryRegistry())
+	policy := actionauth.NewActionPolicy(mustActionRegistry(t), actionauth.NewRecoveryRegistry())
 	validBudget := e7DefaultBudget()
 
 	if _, err := NewStateMachineReplayValidator(e7ReplayTarget(), nil, policy, collector, projector, executor, validBudget); err == nil {

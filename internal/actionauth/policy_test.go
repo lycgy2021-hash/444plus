@@ -27,8 +27,21 @@ func rawLenReq() StateRequirements {
 	return StateRequirements{ProjectorID: stateauth.RawLenProjector{}.ID()}
 }
 
+// mustRegistry builds a Registry from regs, failing the test immediately if
+// NewRegistry rejects it (e.g. a duplicate Action.Key) — every test in this
+// file constructs a registry it already knows to be valid, so a rejection
+// here is a test-setup bug, not something under test.
+func mustRegistry(t *testing.T, regs ...Registration) *Registry {
+	t.Helper()
+	reg, err := NewRegistry(regs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reg
+}
+
 func TestSelectPicksApplicableActionDeterministicallyBySortedKey(t *testing.T) {
-	reg := NewRegistry(
+	reg := mustRegistry(t,
 		Registration{Action: RegisteredAction{Key: "zeta"}, Requirements: rawLenReq()},
 		Registration{Action: RegisteredAction{Key: "alpha"}, Requirements: rawLenReq()},
 	)
@@ -60,7 +73,7 @@ func TestSelectPicksApplicableActionDeterministicallyBySortedKey(t *testing.T) {
 
 func TestSelectSkipsUnmatchedAndExcludedActions(t *testing.T) {
 	otherProjector := StateRequirements{ProjectorID: "some-other-projector"}
-	reg := NewRegistry(
+	reg := mustRegistry(t,
 		Registration{Action: RegisteredAction{Key: "unmatched"}, Requirements: otherProjector},
 		Registration{Action: RegisteredAction{Key: "alpha"}, Requirements: rawLenReq()},
 		Registration{Action: RegisteredAction{Key: "beta"}, Requirements: rawLenReq()},
@@ -113,7 +126,7 @@ func TestMatchesRequiresExactProjectorIDAndFactSubset(t *testing.T) {
 }
 
 func TestSelectRequiresNonEmptyScopeAndValidFingerprint(t *testing.T) {
-	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "alpha"}, Requirements: rawLenReq()})
+	reg := mustRegistry(t, Registration{Action: RegisteredAction{Key: "alpha"}, Requirements: rawLenReq()})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 
 	if _, ok := policy.Select("", fp(t, "scope-1", []byte("A")), nil); ok {
@@ -134,7 +147,7 @@ func TestSelectNeverConsultsAnAdvisorySuggestion(t *testing.T) {
 	// have to notice. Requirements being plain data (not a closure) also means
 	// there is no hidden side channel (a global, an env var, a clock) through
 	// which an external actor could influence which key applicable() returns.
-	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "safe-action"}, Requirements: rawLenReq()})
+	reg := mustRegistry(t, Registration{Action: RegisteredAction{Key: "safe-action"}, Requirements: rawLenReq()})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 	state := fp(t, "scope-1", []byte("A"))
 	a, ok := policy.Select("scope-1", state, nil)
@@ -144,7 +157,7 @@ func TestSelectNeverConsultsAnAdvisorySuggestion(t *testing.T) {
 }
 
 func TestBindRecoveryRequiresRegisteredRecoveryAndNonEmptyHashes(t *testing.T) {
-	policy := NewActionPolicy(NewRegistry(), NewRecoveryRegistry("reset-session"))
+	policy := NewActionPolicy(mustRegistry(t), NewRecoveryRegistry("reset-session"))
 
 	r, ok := policy.BindRecovery(RecoveryPlanRef{RegistryKey: "reset-session"}, "scope-1", "baseline-1")
 	if !ok {
@@ -196,7 +209,7 @@ func TestRegistrationWithEmptyRequirementsFailsClosed(t *testing.T) {
 	// A Registration given with a zero-value Requirements (no ProjectorID)
 	// must match NOTHING — fail-closed — never silently default to "always
 	// applicable".
-	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "no-requirements"}})
+	reg := mustRegistry(t, Registration{Action: RegisteredAction{Key: "no-requirements"}})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 	if _, ok := policy.Select("scope-1", fp(t, "scope-1", []byte("A")), nil); ok {
 		t.Fatal("a Registration with empty Requirements must never be selected")
@@ -208,7 +221,7 @@ func TestNewRegistryDeepCopiesRequirementsAndIsUnaffectedByLaterMutation(t *test
 	regs := []Registration{
 		{Action: RegisteredAction{Key: "alpha"}, Requirements: StateRequirements{ProjectorID: "rawlen-v1", Facts: facts}},
 	}
-	reg := NewRegistry(regs...)
+	reg := mustRegistry(t, regs...)
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 	state := fp(t, "scope-1", []byte("AAAA")) // RawLenProjector -> Facts{"raw_len":"4"}
 
@@ -230,7 +243,7 @@ func TestNewRegistryDeepCopiesRequirementsAndIsUnaffectedByLaterMutation(t *test
 }
 
 func TestRegistryHasNoWayToAddAfterConstruction(t *testing.T) {
-	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "http-probe"}, Requirements: rawLenReq()})
+	reg := mustRegistry(t, Registration{Action: RegisteredAction{Key: "http-probe"}, Requirements: rawLenReq()})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 	state := fp(t, "scope-1", []byte("A"))
 	// There is no exported method on Registry that adds an entry — this test
@@ -242,6 +255,22 @@ func TestRegistryHasNoWayToAddAfterConstruction(t *testing.T) {
 	}
 }
 
+// TestNewRegistryRejectsDuplicateActionKey is the actionauth-level analogue
+// of research.NewTransitionRuleRegistry's own duplicate-RuleID rejection:
+// two Registrations sharing the same Action.Key must never resolve to
+// "whichever one happened to be last in the slice" — NewRegistry rejects
+// the ambiguity outright, rather than letting the second one silently
+// overwrite the first in the map it builds.
+func TestNewRegistryRejectsDuplicateActionKey(t *testing.T) {
+	_, err := NewRegistry(
+		Registration{Action: RegisteredAction{Key: "get-health", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()},
+		Registration{Action: RegisteredAction{Key: "get-health", Safety: ActionReversible}, Requirements: rawLenReq()},
+	)
+	if err == nil {
+		t.Fatal("NewRegistry must reject two Registrations that share the same Action.Key")
+	}
+}
+
 // --- PolicyID / Safety: S10/E7 needs these to prove a replay used the
 // SAME action-authority semantics as the original, and to read the ONE
 // trustworthy safety signal for an action — see BoundAction.Safety/
@@ -250,7 +279,7 @@ func TestRegistryHasNoWayToAddAfterConstruction(t *testing.T) {
 func TestActionPolicyIDStableForIdenticalRegistryContent(t *testing.T) {
 	build := func() *ActionPolicy {
 		return NewActionPolicy(
-			NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()}),
+			mustRegistry(t, Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()}),
 			NewRecoveryRegistry("reset"),
 		)
 	}
@@ -265,13 +294,13 @@ func TestActionPolicyIDStableForIdenticalRegistryContent(t *testing.T) {
 
 func TestActionPolicyIDChangesWhenRegistryContentChanges(t *testing.T) {
 	base := NewActionPolicy(
-		NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()}),
+		mustRegistry(t, Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()}),
 		NewRecoveryRegistry("reset"),
 	)
 	variants := []*ActionPolicy{
-		NewActionPolicy(NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionReversible}, Requirements: rawLenReq()}), NewRecoveryRegistry("reset")),                                           // different Safety
-		NewActionPolicy(NewRegistry(Registration{Action: RegisteredAction{Key: "beta", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()}), NewRecoveryRegistry("reset")),                                        // different Key
-		NewActionPolicy(NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: StateRequirements{ProjectorID: "other-projector"}}), NewRecoveryRegistry("reset")), // different ProjectorID
+		NewActionPolicy(mustRegistry(t, Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionReversible}, Requirements: rawLenReq()}), NewRecoveryRegistry("reset")),                                           // different Safety
+		NewActionPolicy(mustRegistry(t, Registration{Action: RegisteredAction{Key: "beta", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()}), NewRecoveryRegistry("reset")),                                        // different Key
+		NewActionPolicy(mustRegistry(t, Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: StateRequirements{ProjectorID: "other-projector"}}), NewRecoveryRegistry("reset")), // different ProjectorID
 	}
 	for i, v := range variants {
 		if v.PolicyID() == base.PolicyID() {
@@ -281,7 +310,7 @@ func TestActionPolicyIDChangesWhenRegistryContentChanges(t *testing.T) {
 }
 
 func TestActionPolicyIDUnaffectedByRecoveryRegistry(t *testing.T) {
-	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()})
+	reg := mustRegistry(t, Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()})
 	p1 := NewActionPolicy(reg, NewRecoveryRegistry("reset"))
 	p2 := NewActionPolicy(reg, NewRecoveryRegistry("a-completely-different-recovery-key"))
 	if p1.PolicyID() != p2.PolicyID() {
@@ -290,7 +319,7 @@ func TestActionPolicyIDUnaffectedByRecoveryRegistry(t *testing.T) {
 }
 
 func TestSelectStampsSafetyAndPolicyIDFromMatchedRegistration(t *testing.T) {
-	reg := NewRegistry(
+	reg := mustRegistry(t,
 		Registration{Action: RegisteredAction{Key: "readonly-action", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()},
 		Registration{Action: RegisteredAction{Key: "reversible-action", Safety: ActionReversible}, Requirements: StateRequirements{ProjectorID: "no-such-projector"}}, // never applicable to our fp
 	)
@@ -323,7 +352,7 @@ func TestZeroValueBoundActionHasEmptySafetyAndPolicyID(t *testing.T) {
 // RegisteredAction.SpecID and ActionPolicySemanticsVersion's own doc.
 
 func TestSelectStampsSpecIDFromMatchedRegistration(t *testing.T) {
-	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "http-probe", Safety: ActionStrictReadOnly, SpecID: "spec-abc"}, Requirements: rawLenReq()})
+	reg := mustRegistry(t, Registration{Action: RegisteredAction{Key: "http-probe", Safety: ActionStrictReadOnly, SpecID: "spec-abc"}, Requirements: rawLenReq()})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 	state := fp(t, "scope-1", []byte("A"))
 
@@ -338,11 +367,11 @@ func TestSelectStampsSpecIDFromMatchedRegistration(t *testing.T) {
 
 func TestActionPolicyIDChangesWhenSpecIDChanges(t *testing.T) {
 	base := NewActionPolicy(
-		NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly, SpecID: "spec-v1"}, Requirements: rawLenReq()}),
+		mustRegistry(t, Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly, SpecID: "spec-v1"}, Requirements: rawLenReq()}),
 		NewRecoveryRegistry("reset"),
 	)
 	changed := NewActionPolicy(
-		NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly, SpecID: "spec-v2"}, Requirements: rawLenReq()}),
+		mustRegistry(t, Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly, SpecID: "spec-v2"}, Requirements: rawLenReq()}),
 		NewRecoveryRegistry("reset"),
 	)
 	if base.PolicyID() == changed.PolicyID() {

@@ -3,6 +3,7 @@ package actionauth
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -83,13 +84,25 @@ type Registry struct {
 	entries map[string]Registration
 }
 
-// NewRegistry builds a closed registry from a fixed list of registrations.
-// Later calls cannot add to it — there is no exported method that does, on
-// purpose: dynamic registration would let anything holding a *Registry grow
-// what it authorizes at runtime, which is exactly the "authority that isn't
-// pinned down in the type/construction itself" this package exists to
-// avoid. A Registration with a zero-value Requirements (no ProjectorID)
-// matches nothing — fail-closed, never fail-open.
+// NewRegistry builds a closed registry from a fixed list of registrations,
+// or reports an error and returns nil if two registrations share the same
+// Action.Key. Later calls cannot add to it — there is no exported method
+// that does, on purpose: dynamic registration would let anything holding a
+// *Registry grow what it authorizes at runtime, which is exactly the
+// "authority that isn't pinned down in the type/construction itself" this
+// package exists to avoid. A Registration with a zero-value Requirements
+// (no ProjectorID) matches nothing — fail-closed, never fail-open.
+//
+// Rejecting a duplicate Key, rather than letting a later Registration
+// silently overwrite an earlier one in the map this function builds, is
+// the same discipline research.NewTransitionRuleRegistry already applies
+// to duplicate RuleIDs: a caller passing two registrations for the same
+// Key (by mistake, or by two independently-written registration lists
+// being concatenated) would otherwise get whichever one happened to be
+// LAST in the slice, silently — an ambiguity that should never be resolved
+// by argument order, since that would make "what this Key actually means"
+// depend on where in the list a Registration happened to appear rather
+// than a caller ever having deliberately chosen between them.
 //
 // Every Registration is rebuilt here field-by-field, and Requirements.Facts
 // is deep-copied into a fresh map — never stored by the caller's own
@@ -101,9 +114,12 @@ type Registry struct {
 // can still be edited through a live reference is not actually immutable.
 // Mutating the caller's own copies after this call has NO effect on
 // anything Select ever returns.
-func NewRegistry(regs ...Registration) *Registry {
+func NewRegistry(regs ...Registration) (*Registry, error) {
 	m := make(map[string]Registration, len(regs))
 	for _, r := range regs {
+		if _, dup := m[r.Action.Key]; dup {
+			return nil, fmt.Errorf("actionauth: duplicate RegisteredAction.Key %q", r.Action.Key)
+		}
 		m[r.Action.Key] = Registration{
 			Action: r.Action,
 			Requirements: StateRequirements{
@@ -112,7 +128,7 @@ func NewRegistry(regs ...Registration) *Registry {
 			},
 		}
 	}
-	return &Registry{entries: m}
+	return &Registry{entries: m}, nil
 }
 
 // copyFacts returns a fresh map with the same contents as facts, severing
