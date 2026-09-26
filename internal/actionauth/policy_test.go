@@ -241,3 +241,77 @@ func TestRegistryHasNoWayToAddAfterConstruction(t *testing.T) {
 		t.Fatal("an action never passed to NewRegistry must never be selectable, at any point in this registry's lifetime")
 	}
 }
+
+// --- PolicyID / Safety: S10/E7 needs these to prove a replay used the
+// SAME action-authority semantics as the original, and to read the ONE
+// trustworthy safety signal for an action — see BoundAction.Safety/
+// PolicyID's own doc.
+
+func TestActionPolicyIDStableForIdenticalRegistryContent(t *testing.T) {
+	build := func() *ActionPolicy {
+		return NewActionPolicy(
+			NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()}),
+			NewRecoveryRegistry("reset"),
+		)
+	}
+	p1, p2 := build(), build()
+	if p1.PolicyID() == "" {
+		t.Fatal("PolicyID() must not be empty for a non-empty registry")
+	}
+	if p1.PolicyID() != p2.PolicyID() {
+		t.Fatalf("two ActionPolicy values built from identically-shaped registries must share a PolicyID: %q != %q", p1.PolicyID(), p2.PolicyID())
+	}
+}
+
+func TestActionPolicyIDChangesWhenRegistryContentChanges(t *testing.T) {
+	base := NewActionPolicy(
+		NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()}),
+		NewRecoveryRegistry("reset"),
+	)
+	variants := []*ActionPolicy{
+		NewActionPolicy(NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionReversible}, Requirements: rawLenReq()}), NewRecoveryRegistry("reset")),                                           // different Safety
+		NewActionPolicy(NewRegistry(Registration{Action: RegisteredAction{Key: "beta", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()}), NewRecoveryRegistry("reset")),                                        // different Key
+		NewActionPolicy(NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: StateRequirements{ProjectorID: "other-projector"}}), NewRecoveryRegistry("reset")), // different ProjectorID
+	}
+	for i, v := range variants {
+		if v.PolicyID() == base.PolicyID() {
+			t.Errorf("variant %d (differs from base) must have a different PolicyID, got the same %q", i, v.PolicyID())
+		}
+	}
+}
+
+func TestActionPolicyIDUnaffectedByRecoveryRegistry(t *testing.T) {
+	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "alpha", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()})
+	p1 := NewActionPolicy(reg, NewRecoveryRegistry("reset"))
+	p2 := NewActionPolicy(reg, NewRecoveryRegistry("a-completely-different-recovery-key"))
+	if p1.PolicyID() != p2.PolicyID() {
+		t.Fatalf("PolicyID must depend only on the action registry, never the recovery registry: %q != %q", p1.PolicyID(), p2.PolicyID())
+	}
+}
+
+func TestSelectStampsSafetyAndPolicyIDFromMatchedRegistration(t *testing.T) {
+	reg := NewRegistry(
+		Registration{Action: RegisteredAction{Key: "readonly-action", Safety: ActionStrictReadOnly}, Requirements: rawLenReq()},
+		Registration{Action: RegisteredAction{Key: "reversible-action", Safety: ActionReversible}, Requirements: StateRequirements{ProjectorID: "no-such-projector"}}, // never applicable to our fp
+	)
+	policy := NewActionPolicy(reg, NewRecoveryRegistry())
+	state := fp(t, "scope-1", []byte("A"))
+
+	bound, ok := policy.Select("scope-1", state, nil)
+	if !ok || bound.ID().RegistryKey != "readonly-action" {
+		t.Fatalf("Select() = %+v, ok=%v, want readonly-action", bound.ID(), ok)
+	}
+	if bound.Safety() != ActionStrictReadOnly {
+		t.Fatalf("BoundAction.Safety() = %q, want %q (read from the matched Registration, not supplied by the caller)", bound.Safety(), ActionStrictReadOnly)
+	}
+	if bound.PolicyID() != policy.PolicyID() {
+		t.Fatalf("BoundAction.PolicyID() = %q, want %q (this policy's own PolicyID)", bound.PolicyID(), policy.PolicyID())
+	}
+}
+
+func TestZeroValueBoundActionHasEmptySafetyAndPolicyID(t *testing.T) {
+	var zero BoundAction
+	if zero.Safety() != "" || zero.PolicyID() != "" {
+		t.Fatalf("zero-value BoundAction: Safety()=%q PolicyID()=%q, want both empty", zero.Safety(), zero.PolicyID())
+	}
+}

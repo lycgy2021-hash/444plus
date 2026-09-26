@@ -63,7 +63,8 @@ func newE7Fixture(t *testing.T) *e7Fixture {
 	return f
 }
 
-func (f *e7Fixture) reset()               { atomic.StoreInt32(f.status, http.StatusOK) }
+func (f *e7Fixture) setStatus(code int)   { atomic.StoreInt32(f.status, int32(code)) }
+func (f *e7Fixture) reset()               { f.setStatus(http.StatusOK) }
 func (f *e7Fixture) setDenyBreaks(b bool) { atomic.StoreInt32(f.breaks, boolToInt32(b)) }
 func (f *e7Fixture) denyHitCount() int    { return int(atomic.LoadInt32(f.denyHits)) }
 
@@ -80,28 +81,26 @@ func e7ReplayTarget() ReplayTarget {
 
 // e7DenyOnlyPolicy is the TRUSTED ActionPolicy a real Explorer session for
 // this target would use: exactly one registered action ("deny"), applicable
-// to any state under the given ProjectorID. Both the original candidate's
-// own transition AND a replay validator's action-authority check must go
-// through a policy built this way — never one Replay invents for itself.
-func e7DenyOnlyPolicy(projectorID stateauth.ProjectorID) *actionauth.ActionPolicy {
+// to any state under the given ProjectorID, with the given declared safety.
+// Both the original candidate's own transition AND a replay validator's
+// action-authority check must go through a policy built this way — never
+// one Replay invents for itself.
+func e7DenyOnlyPolicy(projectorID stateauth.ProjectorID, safety actionauth.ActionSafety) *actionauth.ActionPolicy {
 	registry := actionauth.NewRegistry(actionauth.Registration{
-		Action:       actionauth.RegisteredAction{Key: "deny"},
+		Action:       actionauth.RegisteredAction{Key: "deny", Safety: safety},
 		Requirements: actionauth.StateRequirements{ProjectorID: projectorID},
 	})
 	return actionauth.NewActionPolicy(registry, actionauth.NewRecoveryRegistry())
 }
 
-// e7BuildOriginalCandidate drives ONE real transition against f (baseline
-// collect -> execute "deny" -> result collect, all real HTTP, authorized by
-// the SAME e7DenyOnlyPolicy a real Explorer session would use) and runs it
-// through the REAL E6 producer to get a genuine Candidate — exactly what a
-// real Explorer session followed by StateMachineProducer.Produce would
-// leave behind. The rule declares "deny must not change status away from
-// 200" and ReadOnlyAction: true (this fixture's "deny" has no real-world
-// consequence — see TransitionRule.ReadOnlyAction's own doc), so as long as
-// f.breaks() is on (the default), this is VIOLATED and exactly one
-// Candidate is produced.
-func e7BuildOriginalCandidate(t *testing.T, f *e7Fixture, sessionID string) (*Candidate, *TransitionRuleRegistry, *actionauth.ActionPolicy, TransitionRule) {
+// e7BuildOriginalCandidateWithSafety drives ONE real transition against f
+// (baseline collect -> execute "deny" -> result collect, all real HTTP,
+// authorized by e7DenyOnlyPolicy(safety) — the SAME policy a real Explorer
+// session would use) and runs it through the REAL E6 producer to get a
+// genuine Candidate. The rule declares "deny must not change status away
+// from 200", so as long as f.breaks() is on (the default), this is
+// VIOLATED and exactly one Candidate is produced.
+func e7BuildOriginalCandidateWithSafety(t *testing.T, f *e7Fixture, sessionID string, safety actionauth.ActionSafety) (*Candidate, *TransitionRuleRegistry, *actionauth.ActionPolicy, TransitionRule) {
 	t.Helper()
 	scope := e7ReplayTarget().Scope(sessionID)
 	collector, err := NewHTTPCollector(f.ts.URL, "/state")
@@ -120,7 +119,7 @@ func e7BuildOriginalCandidate(t *testing.T, f *e7Fixture, sessionID string) (*Ca
 	if err != nil {
 		t.Fatalf("baseline collect: %v", err)
 	}
-	policy := e7DenyOnlyPolicy(before.ProjectorID())
+	policy := e7DenyOnlyPolicy(before.ProjectorID(), safety)
 	boundAction, ok := policy.Select(scope.Hash(), before, nil)
 	if !ok {
 		t.Fatal("ActionPolicy.Select: expected a match for 'deny'")
@@ -149,7 +148,101 @@ func e7BuildOriginalCandidate(t *testing.T, f *e7Fixture, sessionID string) (*Ca
 		ProjectorID:       before.ProjectorID(),
 		Expectation:       TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "200"},
 		ExpectationSource: ExpectationSource{Kind: ExpectationSourceHumanConfig, ID: "e7-test-config"},
-		ReadOnlyAction:    true,
+	}
+	registry, err := NewTransitionRuleRegistry(rule)
+	if err != nil {
+		t.Fatalf("NewTransitionRuleRegistry: %v", err)
+	}
+	candidates := NewStateMachineProducer(registry).Produce(TransitionCase{Transition: tr, Scope: scope})
+	if len(candidates) != 1 {
+		t.Fatalf("setup: expected exactly 1 real candidate, got %d", len(candidates))
+	}
+	return candidates[0], registry, policy, rule
+}
+
+// e7BuildOriginalCandidate is the common case: "deny" declared
+// ActionStrictReadOnly, exactly as a rule author would need for it to ever
+// be replayable.
+func e7BuildOriginalCandidate(t *testing.T, f *e7Fixture, sessionID string) (*Candidate, *TransitionRuleRegistry, *actionauth.ActionPolicy, TransitionRule) {
+	return e7BuildOriginalCandidateWithSafety(t, f, sessionID, actionauth.ActionStrictReadOnly)
+}
+
+// e7StatusKeyedPolicy registers TWO actions on the SAME projector, each
+// applicable only for a specific "status" fact value: "deny" when
+// status=="200", "aaa-other-action" when status=="403". Used ONLY by the
+// E7-A action-authority tests below, where the point is that the SAME
+// policy (same PolicyID) can legitimately select a DIFFERENT action for a
+// DIFFERENT fresh baseline — never that the policy itself changed.
+func e7StatusKeyedPolicy(projectorID stateauth.ProjectorID) *actionauth.ActionPolicy {
+	registry := actionauth.NewRegistry(
+		actionauth.Registration{
+			Action:       actionauth.RegisteredAction{Key: "deny", Safety: actionauth.ActionStrictReadOnly},
+			Requirements: actionauth.StateRequirements{ProjectorID: projectorID, Facts: map[string]string{"status": "200"}},
+		},
+		actionauth.Registration{
+			Action:       actionauth.RegisteredAction{Key: "aaa-other-action", Safety: actionauth.ActionStrictReadOnly},
+			Requirements: actionauth.StateRequirements{ProjectorID: projectorID, Facts: map[string]string{"status": "403"}},
+		},
+	)
+	return actionauth.NewActionPolicy(registry, actionauth.NewRecoveryRegistry())
+}
+
+// e7BuildActionAuthorityTestCandidate is a dedicated fixture for the E7-A
+// tests: it uses ExpectFactEquals (deliberately NOT ExpectFactTransition,
+// which has its own precondition gate that would otherwise interfere with
+// testing action-authority divergence specifically) and
+// e7StatusKeyedPolicy, so the SAME PolicyID can be reused for a replay
+// attempt whose fresh baseline has a genuinely DIFFERENT "status" than the
+// original — making Select pick a different, equally-applicable action,
+// never because the policy itself changed.
+func e7BuildActionAuthorityTestCandidate(t *testing.T, f *e7Fixture, sessionID string) (*Candidate, *TransitionRuleRegistry, *actionauth.ActionPolicy, TransitionRule) {
+	t.Helper()
+	scope := e7ReplayTarget().Scope(sessionID)
+	collector, err := NewHTTPCollector(f.ts.URL, "/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewHTTPExecutor(f.ts.URL, map[string]string{"deny": "/deny", "aaa-other-action": "/deny"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projector := stateauth.HTTPFixtureRegistry()
+	meter := newBoundedRequestMeter(10)
+	ctx := context.Background()
+
+	before, beforeRaw, err := collectAndProject(ctx, collector, projector, scope, meter) // status=200
+	if err != nil {
+		t.Fatalf("baseline collect: %v", err)
+	}
+	policy := e7StatusKeyedPolicy(before.ProjectorID())
+	boundAction, ok := policy.Select(scope.Hash(), before, nil)
+	if !ok || boundAction.ID().RegistryKey != "deny" {
+		t.Fatalf("setup: expected Select to pick 'deny' for status=200, got %+v ok=%v", boundAction.ID(), ok)
+	}
+	if err := executor.Execute(ContextWithRequestMeter(ctx, meter), boundAction); err != nil {
+		t.Fatalf("execute deny: %v", err)
+	}
+	after, afterRaw, err := collectAndProject(ctx, collector, projector, scope, meter) // status=403
+	if err != nil {
+		t.Fatalf("result collect: %v", err)
+	}
+
+	now := time.Now().UTC()
+	tr := StateTransition{
+		ScopeHash:              scope.Hash(),
+		BeforeFingerprint:      before,
+		Action:                 boundAction,
+		AfterFingerprint:       after,
+		EvidenceRefs:           []string{"orig-evidence"},
+		TransitionArtifactHash: transitionArtifactHash(scope.Hash(), beforeRaw, boundAction.ID(), afterRaw, now),
+		Timestamp:              now,
+	}
+	rule := TransitionRule{
+		RuleID:            "deny-must-keep-status-200",
+		ActionID:          boundAction.ID(),
+		ProjectorID:       before.ProjectorID(),
+		Expectation:       TransitionExpectation{Kind: ExpectFactEquals, Fact: "status", AfterValue: "200"}, // violated: after=403
+		ExpectationSource: ExpectationSource{Kind: ExpectationSourceHumanConfig, ID: "e7-action-authority-test"},
 	}
 	registry, err := NewTransitionRuleRegistry(rule)
 	if err != nil {
@@ -249,7 +342,9 @@ func TestE7UnknownRuleIDRejected(t *testing.T) {
 // TestE7ActionMismatchRejected: the validator's OWN registry has since
 // diverged from the one that produced the candidate — same RuleID, but a
 // DIFFERENT ActionID. This is what "the candidate's bound identity vs. the
-// resolved rule" actually checks; Refs plays no part in it.
+// resolved rule" actually checks; Refs plays no part in it. The SAME policy
+// is reused, so this isolates the TransitionRuleRegistry divergence
+// specifically, never a PolicyID mismatch.
 func TestE7ActionMismatchRejected(t *testing.T) {
 	f := newE7Fixture(t)
 	c, _, policy, rule := e7BuildOriginalCandidate(t, f, "original-session")
@@ -286,17 +381,42 @@ func TestE7TargetMismatchRejected(t *testing.T) {
 	}
 }
 
-// TestE7NonReadOnlyActionRejected (E7-C): a rule not attested ReadOnlyAction
-// is refused outright — v1 implements no verified-recovery flow.
+// TestE7PolicyMismatchRejected (E7-E): this validator's OWN ActionPolicy
+// has a DIFFERENT canonical registry content — and therefore a different
+// PolicyID — than the one the candidate's action was originally bound
+// under, even though it registers the exact same "deny" key. This is
+// checked BEFORE any I/O: denyHitCount must stay at exactly 1 (the
+// original run only).
+func TestE7PolicyMismatchRejected(t *testing.T) {
+	f := newE7Fixture(t)
+	c, registry, _, _ := e7BuildOriginalCandidate(t, f, "original-session")
+	f.reset()
+
+	// Same Key, but a DIFFERENT declared Safety -> a different PolicyID.
+	differentPolicy := e7DenyOnlyPolicy(stateauth.HTTPStateProjector{}.ID(), actionauth.ActionReversible)
+
+	v := e7NewValidator(t, f, registry, differentPolicy, e7ReplayTarget(), e7DefaultBudget())
+	if _, err := v.Replay(context.Background(), c, "replay-session"); err != ErrReplayPolicyMismatch {
+		t.Fatalf("Replay against a validator whose ActionPolicy has diverged: err = %v, want %v", err, ErrReplayPolicyMismatch)
+	}
+	if got := f.denyHitCount(); got != 1 {
+		t.Fatalf("denyHitCount after a PolicyID mismatch = %d, want 1 (only the original run) — this check must happen before any I/O", got)
+	}
+}
+
+// TestE7NonReadOnlyActionRejected (E7-D): the action's Safety, as declared
+// on the SAME (matching-PolicyID) trusted policy both the original
+// candidate and this replay validator use, is ActionReversible — not
+// ActionStrictReadOnly. v1 implements no verified-recovery flow, so Replay
+// refuses outright, reading Safety from the FRESH BoundAction Select
+// itself produced — never from anything a TransitionRule declares.
 func TestE7NonReadOnlyActionRejected(t *testing.T) {
 	f := newE7Fixture(t)
-	c, _, policy, rule := e7BuildOriginalCandidate(t, f, "original-session")
-	notReadOnlyRule := rule
-	notReadOnlyRule.ReadOnlyAction = false
-	registry := e6MustRegistry(t, notReadOnlyRule)
+	c, registry, policy, _ := e7BuildOriginalCandidateWithSafety(t, f, "original-session", actionauth.ActionReversible)
+	f.reset()
 	v := e7NewValidator(t, f, registry, policy, e7ReplayTarget(), e7DefaultBudget())
 	if _, err := v.Replay(context.Background(), c, "replay-session"); err != ErrReplayActionNotReadOnly {
-		t.Fatalf("Replay against a non-ReadOnlyAction rule: err = %v, want %v", err, ErrReplayActionNotReadOnly)
+		t.Fatalf("Replay against an ActionReversible (not ActionStrictReadOnly) action: err = %v, want %v", err, ErrReplayActionNotReadOnly)
 	}
 }
 
@@ -329,6 +449,7 @@ func TestE7RefsMutationDoesNotAffectReplayResolution(t *testing.T) {
 	c.Refs["projector_id"] = "not-the-real-projector"
 	c.Refs["replay_target_hash"] = "not-the-real-target-hash"
 	c.Refs["case_artifact_hash"] = "not-the-real-case-hash"
+	c.Refs["policy_id"] = "not-the-real-policy-id"
 
 	f.reset() // genuinely fresh baseline
 	v := e7NewValidator(t, f, registry, policy, e7ReplayTarget(), e7DefaultBudget())
@@ -392,24 +513,17 @@ func TestE7SatisfiedProducesNoSignal(t *testing.T) {
 // --- E7-A: action authority stays with ActionPolicy, never the Rule --------
 
 // TestE7ActionPolicySelectsDifferentActionProducesNoSignal is the core E7-A
-// guarantee: even though the resolved rule names "deny", if the TRUSTED
-// ActionPolicy given to this validator would select a DIFFERENT action for
-// the fresh baseline (here, "aaa-other-action", which sorts first and is
-// equally applicable), Replay must never fall back to forcing "deny" — it
-// reports OutcomeNoSignal and executes NOTHING.
+// guarantee: the SAME trusted policy (SAME PolicyID as the one that
+// authorized the original action) is reused for replay, but the fresh
+// baseline's OWN facts (status is still 403, left over from the original
+// run — deliberately NOT reset) make it select "aaa-other-action" instead
+// of "deny". Replay must never fall back to forcing "deny" — it reports
+// OutcomeNoSignal and executes NOTHING.
 func TestE7ActionPolicySelectsDifferentActionProducesNoSignal(t *testing.T) {
 	f := newE7Fixture(t)
-	c, registry, _, _ := e7BuildOriginalCandidate(t, f, "original-session")
-	f.reset() // satisfy the precondition so we actually reach the action-authority step
+	c, registry, policy, _ := e7BuildActionAuthorityTestCandidate(t, f, "original-session") // leaves f.status at 403
 
-	projectorID := stateauth.HTTPStateProjector{}.ID()
-	multiActionRegistry := actionauth.NewRegistry(
-		actionauth.Registration{Action: actionauth.RegisteredAction{Key: "aaa-other-action"}, Requirements: actionauth.StateRequirements{ProjectorID: projectorID}},
-		actionauth.Registration{Action: actionauth.RegisteredAction{Key: "deny"}, Requirements: actionauth.StateRequirements{ProjectorID: projectorID}},
-	)
-	divergedPolicy := actionauth.NewActionPolicy(multiActionRegistry, actionauth.NewRecoveryRegistry())
-
-	v := e7NewValidator(t, f, registry, divergedPolicy, e7ReplayTarget(), e7DefaultBudget())
+	v := e7NewValidator(t, f, registry, policy, e7ReplayTarget(), e7DefaultBudget())
 	res, err := v.Replay(context.Background(), c, "replay-session")
 	if err != nil {
 		t.Fatalf("Replay (policy selects a different action) returned an error: %v", err)
@@ -422,16 +536,16 @@ func TestE7ActionPolicySelectsDifferentActionProducesNoSignal(t *testing.T) {
 	}
 }
 
-// TestE7ActionPolicySelectFailsProducesNoSignal: the trusted ActionPolicy
-// has nothing applicable at all for the fresh baseline (an empty registry)
-// — Replay must not fall back to the rule's own ActionID.
+// TestE7ActionPolicySelectFailsProducesNoSignal: the SAME trusted policy
+// (SAME PolicyID) has nothing applicable for a fresh baseline whose status
+// matches NEITHER of its two Facts-gated registrations — Replay must not
+// fall back to the rule's own ActionID.
 func TestE7ActionPolicySelectFailsProducesNoSignal(t *testing.T) {
 	f := newE7Fixture(t)
-	c, registry, _, _ := e7BuildOriginalCandidate(t, f, "original-session")
-	f.reset()
+	c, registry, policy, _ := e7BuildActionAuthorityTestCandidate(t, f, "original-session")
+	f.setStatus(http.StatusInternalServerError) // matches neither "200" nor "403"
 
-	emptyPolicy := actionauth.NewActionPolicy(actionauth.NewRegistry(), actionauth.NewRecoveryRegistry())
-	v := e7NewValidator(t, f, registry, emptyPolicy, e7ReplayTarget(), e7DefaultBudget())
+	v := e7NewValidator(t, f, registry, policy, e7ReplayTarget(), e7DefaultBudget())
 	res, err := v.Replay(context.Background(), c, "replay-session")
 	if err != nil {
 		t.Fatalf("Replay (policy has nothing applicable) returned an error: %v", err)
@@ -452,8 +566,9 @@ func TestE7ActionPolicySelectFailsProducesNoSignal(t *testing.T) {
 // through the SAME trusted ActionPolicy, re-executes, and re-collects — and
 // the rule is violated again. It also proves the replay's OWN case
 // artifact hash is a DIFFERENT value from the original Candidate's
-// case_artifact_hash, and that the Candidate is NEVER promoted by Replay
-// itself.
+// case_artifact_hash, that the evidence carries the full identity chain
+// (rule_id/policy_id/action_safety alongside fresh fingerprints), and that
+// the Candidate is NEVER promoted by Replay itself.
 func TestE7ViolatedProducesReproducedWithIndependentEvidence(t *testing.T) {
 	f := newE7Fixture(t)
 	c, registry, policy, rule := e7BuildOriginalCandidate(t, f, "original-session")
@@ -470,25 +585,52 @@ func TestE7ViolatedProducesReproducedWithIndependentEvidence(t *testing.T) {
 	if res.Validator != "state_machine_replay_v1" {
 		t.Fatalf("ValidationResult.Validator = %q, want %q", res.Validator, "state_machine_replay_v1")
 	}
+	if len(res.Evidence) == 0 {
+		t.Fatal("OutcomeReproduced must carry non-empty Evidence, not just a rationale string")
+	}
 
-	var summary *Observation
+	var beforeObs, afterObs, summary *Observation
 	for i := range res.Evidence {
-		if res.Evidence[i].Kind == "replay_summary" {
+		switch res.Evidence[i].Kind {
+		case "replay_before_fingerprint":
+			beforeObs = &res.Evidence[i]
+		case "replay_after_fingerprint":
+			afterObs = &res.Evidence[i]
+		case "replay_summary":
 			summary = &res.Evidence[i]
 		}
+	}
+	if beforeObs == nil || afterObs == nil {
+		t.Fatal("OutcomeReproduced Evidence must include both a fresh before- and after-fingerprint observation")
+	}
+	if _, ok := artifactRef(*beforeObs, "state_fingerprint_hash"); !ok {
+		t.Fatal("replay_before_fingerprint carries no state_fingerprint_hash")
 	}
 	if summary == nil {
 		t.Fatal("ValidationResult.Evidence has no replay_summary observation")
 	}
-	replayRuleID, _ := artifactRef(*summary, "rule_id")
-	if replayRuleID != rule.RuleID {
-		t.Fatalf("replay_summary rule_id = %q, want %q", replayRuleID, rule.RuleID)
+	binding, _ := c.StateMachineBinding()
+	for _, check := range []struct{ kind, want string }{
+		{"rule_id", rule.RuleID},
+		{"projector_id", string(rule.ProjectorID)},
+		{"action_registry_key", rule.ActionID.RegistryKey},
+		{"policy_id", binding.PolicyID()},
+		{"action_safety", string(actionauth.ActionStrictReadOnly)},
+		{"assessment", string(TransitionViolated)},
+	} {
+		got, ok := artifactRef(*summary, check.kind)
+		if !ok || got != check.want {
+			t.Fatalf("replay_summary[%s] = %q (ok=%v), want %q", check.kind, got, ok, check.want)
+		}
+	}
+	requestCount, ok := artifactRef(*summary, "request_count")
+	if !ok || requestCount == "" {
+		t.Fatal("replay_summary has no request_count")
 	}
 	replayCaseHash, ok := artifactRef(*summary, "replay_case_artifact_hash")
 	if !ok || replayCaseHash == "" {
 		t.Fatal("replay_summary has no replay_case_artifact_hash")
 	}
-	binding, _ := c.StateMachineBinding()
 	if replayCaseHash == binding.CaseArtifactHash() {
 		t.Fatalf("replay_case_artifact_hash must NEVER equal the original Candidate's own case_artifact_hash (different Transition, different Scope) — got %q for both", replayCaseHash)
 	}

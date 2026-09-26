@@ -1167,21 +1167,70 @@ the guarantees hold under test:
     that produced the candidate — a realistic scenario Refs mutation never
     was.
   - **Third regression, same audit: no post-replay recovery semantics were
-    specified for an action that might not truly be side-effect-free.**
-    v1 implements no verified-recovery flow (`Execute → collect →
-    BoundRecovery → ExecuteRecovery → collect → stateauth.Recovered()`), so
-    replaying a rule whose action needed one could leave a real target
-    parked in a changed state purely to reproduce a hypothesis. Fixed, via
-    the simpler of the two options the audit offered: `TransitionRule`
-    gained `ReadOnlyAction bool` — the rule AUTHOR's own explicit attestation
-    that the action needs no compensating recovery. `Replay` refuses
-    outright (`ErrReplayActionNotReadOnly`) unless it is exactly `true`
-    (`TestE7NonReadOnlyActionRejected`); `NewTransitionRuleRegistry` does
-    NOT require it (E6's own producer judges transitions regardless of
-    whether the action was read-only — only E7's `Replay` checks it). A
-    future version that wants to replay actions genuinely needing recovery
-    must implement and prove that flow first, as its own explicit,
-    separately reviewed design.
+    specified for an action that might not truly be side-effect-free** —
+    first fixed by giving `TransitionRule` a `ReadOnlyAction bool` field,
+    the rule AUTHOR's own attestation. **Fourth regression, found on a THIRD
+    audit round: that field put the safety attestation in the wrong
+    authority.** S10's whole design already separates "what to expect"
+    (`TransitionRuleRegistry`) from "what may execute, and how safely"
+    (`actionauth`'s Registry/`ActionPolicy`) — `TransitionRule.ReadOnlyAction`
+    let RULE authority vouch for ACTION safety, meaning a rule author could
+    in principle write `TransitionRule{ActionID: <an action with real side
+    effects>, ReadOnlyAction: true}` and have `Replay` take their word for
+    it. Fixed: **`ReadOnlyAction` is REMOVED from `TransitionRule` entirely**
+    (not merely deprecated). `internal/actionauth` gained the authority
+    instead: a new `ActionSafety` type (`ActionStrictReadOnly`/
+    `ActionReversible`) replaces the old, NEVER-actually-checked
+    `RegisteredAction.Reversible bool` (exactly the "unenforced field is
+    worse than no field" lesson this codebase already learned once);
+    `Registration`/`RegisteredAction` declare it once, at registry-build
+    time; `ActionPolicy.Select` stamps the MATCHED registration's own
+    `Safety` onto the `BoundAction` it returns
+    (`BoundAction.Safety()`) — read from the SAME immutable registry that
+    decided the action was applicable at all, never supplied by a caller of
+    `Select` or by anything a `TransitionRule` declares about itself.
+    `Replay` now checks `boundAction.Safety() ==
+    actionauth.ActionStrictReadOnly` on the FRESH `BoundAction` its own
+    trusted `v.policy.Select` just produced (`ErrReplayActionNotReadOnly`
+    unchanged as the error, `TestE7NonReadOnlyActionRejected` rebuilt around
+    a policy whose "deny" registration declares `ActionReversible` instead).
+  - **Fifth regression, same third audit round: "the policy's own selection
+    happens to equal `rule.ActionID`" (E7-A, above) is necessary but not
+    sufficient — two DIFFERENT `ActionPolicy` instances (one permissive, one
+    strict) could still agree on an `ActionID` for the same state by pure
+    coincidence, which would let a caller wire a weaker policy into a
+    replay validator without `Replay` ever noticing.** Fixed:
+    `ActionPolicy` gained `PolicyID()` — a deterministic identity computed
+    once, at construction, over its own registry's ENTIRE canonical content
+    (every registered action's Key, `Safety`, and `StateRequirements`,
+    sorted) — and `BoundAction.PolicyID()`, stamped by `Select` from that
+    same value. `StateMachineBinding` (E6) gained a `policyID` field,
+    recorded from `rc.Transition.Action.PolicyID()` at `Produce` time (also
+    added to `Refs["policy_id"]` for human audit, and to
+    `transitionCaseArtifactHash` alongside a new `action_safety` line —
+    both purely additive to the already-lossless hash). `Replay` now checks
+    `v.policy.PolicyID() == binding.PolicyID()`
+    (`ErrReplayPolicyMismatch`) BEFORE any I/O, alongside the other identity
+    checks — not merely "same ActionID selected", but "the same
+    action-authority semantics selected it".
+    `TestE7PolicyMismatchRejected` proves the rejection (and that it costs
+    no real request — the fixture's own action-hit counter stays
+    unchanged); `internal/actionauth/policy_test.go` gained five focused
+    unit tests at the primitive's own level
+    (`TestActionPolicyIDStableForIdenticalRegistryContent`,
+    `TestActionPolicyIDChangesWhenRegistryContentChanges`,
+    `TestActionPolicyIDUnaffectedByRecoveryRegistry`,
+    `TestSelectStampsSafetyAndPolicyIDFromMatchedRegistration`,
+    `TestZeroValueBoundActionHasEmptySafetyAndPolicyID`) before ever relying
+    on it from `research`. The E7-A action-authority tests
+    (`TestE7ActionPolicySelectsDifferentActionProducesNoSignal`/
+    `TestE7ActionPolicySelectFailsProducesNoSignal`) needed rebuilding too,
+    now that ANY registry content difference also changes `PolicyID`:
+    both use one SHARED, unchanged policy with two `status`-fact-gated
+    registrations (`deny` when `status=="200"`, `aaa-other-action` when
+    `status=="403"`), so the SAME `PolicyID` genuinely selects a different
+    (or no) action purely because the FRESH baseline's own facts differ
+    from the original's — never because the policy itself changed.
   - **Fresh session, same target, never a substituted one.** `ReplayTarget`
     (`TargetID`/`BuildID`/`Protocol`/`HarnessID`, no `SessionID`) is fixed at
     a validator's construction; each `Replay` call takes a caller-supplied
@@ -1234,19 +1283,26 @@ the guarantees hold under test:
     `shouldPromote`/`Promote` pipeline (S5's `Engine.Validate` already owns
     that decision generically) is future work, not required to prove this
     stage's own contract.
-  - **19-item freeze-gate battery** (`research/state_machine_replay_test.go`):
-    a non-`OriginStateMachine` Candidate, a missing/malformed binding, a
-    `rule_id` unregistered in this validator's own registry, a diverged
-    action/projector identity, a mismatched target, a non-`ReadOnlyAction`
-    rule, and an empty `sessionID` are all rejected before any I/O; Refs
-    corruption is proven irrelevant to resolution; a policy that selects a
-    different (or no) action never falls back to the rule's own ActionID; a
-    real fresh baseline that doesn't satisfy `fact_transition`'s precondition
-    produces `no_signal` without ever executing the action; a real fresh
-    replay that satisfies the rule produces `no_signal`; a real fresh replay
-    that violates the rule again produces `reproduced`, with a
-    `replay_case_artifact_hash` provably distinct from the original
-    Candidate's own `CaseArtifactHash()` and a Candidate left at exactly
+  - **20-item freeze-gate battery** (`research/state_machine_replay_test.go`),
+    plus 5 focused unit tests on the `PolicyID`/`Safety` primitive itself in
+    `internal/actionauth/policy_test.go`: a non-`OriginStateMachine`
+    Candidate, a missing/malformed binding, a `rule_id` unregistered in
+    this validator's own registry, a diverged action/projector identity, a
+    mismatched target, a mismatched `PolicyID`, an action whose FRESH
+    `Safety` is not `ActionStrictReadOnly`, and an empty `sessionID` are all
+    rejected before any I/O; Refs corruption (now including `policy_id`) is
+    proven irrelevant to resolution; a SHARED, unchanged policy that
+    genuinely selects a different (or no) action for a different fresh
+    baseline never falls back to the rule's own `ActionID`; a real fresh
+    baseline that doesn't satisfy `fact_transition`'s precondition produces
+    `no_signal` without ever executing the action; a real fresh replay that
+    satisfies the rule produces `no_signal`; a real fresh replay that
+    violates the rule again produces `reproduced`, with Evidence proven to
+    carry fresh before/after fingerprints plus a `replay_summary` whose
+    `rule_id`/`projector_id`/`action_registry_key`/`policy_id`/
+    `action_safety`/`assessment`/`request_count` all match expectations,
+    a `replay_case_artifact_hash` provably distinct from the original
+    Candidate's own `CaseArtifactHash()`, and a Candidate left at exactly
     `Hypothesis`; the pure outcome-mapping table is proven for all four
     assessments plus an unrecognized one; a real request-budget exhaustion
     and a real wall-time timeout both fail as errors; and construction
@@ -1256,11 +1312,14 @@ the guarantees hold under test:
     real HTTP) rather than a hand-built Candidate.
   - **v1 explicitly does NOT do:** state preparation to satisfy a
     precondition, trusting `Candidate.Refs` for any authority decision,
-    letting a rule's own `ActionID` substitute for `ActionPolicy`'s
-    authority, replaying an action not attested `ReadOnlyAction`, replaying
-    against the same recorded session, LLM judgment of what counts as
-    reproduction, any new exploration capability, or Promoting a Candidate
-    itself. None of these have any code path in
+    letting a rule's own `ActionID` (or any field a `TransitionRule`
+    declares about itself) substitute for `actionauth`'s authority over
+    what may execute or how safely, replaying an action whose FRESH
+    `Safety` is not `ActionStrictReadOnly`, replaying under a differently-
+    identified `ActionPolicy` than the one that originally authorized the
+    action, replaying against the same recorded session, LLM judgment of
+    what counts as reproduction, any new exploration capability, or
+    Promoting a Candidate itself. None of these have any code path in
     `research/state_machine_replay.go` today.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.

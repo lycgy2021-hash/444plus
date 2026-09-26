@@ -1,7 +1,10 @@
 package actionauth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
+	"strings"
 
 	"gopoc/internal/stateauth"
 )
@@ -146,6 +149,42 @@ func (r *Registry) applicable(fp stateauth.Fingerprint) []string {
 	return keys
 }
 
+// canonicalHash is a pure, deterministic identity for r's own immutable
+// content — every registered action's Key, its Safety, and its
+// Requirements (ProjectorID plus every Facts key/value, sorted), in a
+// fixed canonical order. Two Registry values built from identically-shaped
+// registration lists always hash the same; any change to what is
+// registered, its safety class, or its requirements changes it. This is
+// what ActionPolicy.PolicyID exposes — see that method's own doc for why
+// it exists.
+func (r *Registry) canonicalHash() string {
+	if r == nil {
+		return ""
+	}
+	keys := make([]string, 0, len(r.entries))
+	for k := range r.entries {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		reg := r.entries[k]
+		b.WriteString("action=" + k + "\n")
+		b.WriteString("safety=" + string(reg.Action.Safety) + "\n")
+		b.WriteString("projector=" + string(reg.Requirements.ProjectorID) + "\n")
+		factKeys := make([]string, 0, len(reg.Requirements.Facts))
+		for fk := range reg.Requirements.Facts {
+			factKeys = append(factKeys, fk)
+		}
+		sort.Strings(factKeys)
+		for _, fk := range factKeys {
+			b.WriteString("fact:" + fk + "=" + reg.Requirements.Facts[fk] + "\n")
+		}
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
 // RecoveryRegistry is the recovery analogue of Registry: a closed, fixed set
 // of registered recovery procedure keys. It carries no Reversible-style
 // metadata of its own — a recovery IS the reversal, not a thing that has one
@@ -193,6 +232,9 @@ func (r *RecoveryRegistry) has(key string) bool {
 type ActionPolicy struct {
 	registry         *Registry
 	recoveryRegistry *RecoveryRegistry
+	// policyID is computed once, at construction, from registry's own
+	// canonicalHash — see PolicyID's own doc.
+	policyID string
 }
 
 // NewActionPolicy constructs a policy backed by a fixed action registry and a
@@ -200,17 +242,38 @@ type ActionPolicy struct {
 // here (Registry/RecoveryRegistry have no way to grow after construction);
 // ActionPolicy adds no further mutability of its own.
 func NewActionPolicy(registry *Registry, recoveryRegistry *RecoveryRegistry) *ActionPolicy {
-	return &ActionPolicy{registry: registry, recoveryRegistry: recoveryRegistry}
+	return &ActionPolicy{registry: registry, recoveryRegistry: recoveryRegistry, policyID: registry.canonicalHash()}
+}
+
+// PolicyID returns a deterministic identity for THIS policy's own action
+// registry content (every registered action's Key/Safety/StateRequirements
+// — never the recovery registry, which is orthogonal to "what may execute
+// and how safely"). It exists so a caller holding a BoundAction produced by
+// SOME ActionPolicy can prove it came from a policy with the SAME
+// authorized content as another — e.g. S10/E7's replay validator proving
+// its own configured ActionPolicy is the same one (by canonical content,
+// not merely "someone wired the same pointer through") that authorized a
+// Candidate's original action, rather than trusting "same ActionID" alone,
+// which two DIFFERENT policies (one permissive, one strict) could still
+// agree on by coincidence. Computed once, at construction; two policies
+// built from identically-shaped registries always share a PolicyID.
+func (p *ActionPolicy) PolicyID() string {
+	if p == nil {
+		return ""
+	}
+	return p.policyID
 }
 
 // Select deterministically picks exactly one registered action whose
 // StateRequirements match fp AND whose key is not already in exclude, and
-// returns it bound to scopeHash and fp's own StateFingerprintHash. ok is
-// false if no such action exists — either nothing in the registry matches
-// this state, or everything that does has already been excluded (e.g.
-// already tried from this exact state). The returned ActionID always
-// carries an empty VariantID — v1 selects among registered actions only,
-// never among a registered action's own parameter variants.
+// returns it bound to scopeHash and fp's own StateFingerprintHash — stamped
+// with that action's own registered Safety and this policy's own PolicyID,
+// read directly from the matched Registration/Registry, never supplied by
+// the caller. ok is false if no such action exists — either nothing in the
+// registry matches this state, or everything that does has already been
+// excluded (e.g. already tried from this exact state). The returned
+// ActionID always carries an empty VariantID — v1 selects among registered
+// actions only, never among a registered action's own parameter variants.
 func (p *ActionPolicy) Select(scopeHash string, fp stateauth.Fingerprint, exclude map[string]bool) (BoundAction, bool) {
 	stateFingerprintHash := fp.StateFingerprintHash()
 	if p == nil || scopeHash == "" || stateFingerprintHash == "" {
@@ -220,7 +283,14 @@ func (p *ActionPolicy) Select(scopeHash string, fp stateauth.Fingerprint, exclud
 		if exclude != nil && exclude[key] {
 			continue
 		}
-		return BoundAction{id: ActionID{RegistryKey: key}, scopeHash: scopeHash, authorizedStateHash: stateFingerprintHash}, true
+		reg := p.registry.entries[key]
+		return BoundAction{
+			id:                  ActionID{RegistryKey: key},
+			scopeHash:           scopeHash,
+			authorizedStateHash: stateFingerprintHash,
+			safety:              reg.Action.Safety,
+			policyID:            p.policyID,
+		}, true
 	}
 	return BoundAction{}, false
 }

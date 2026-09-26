@@ -87,8 +87,8 @@ func TestS10E5RealHTTPExplorationEndToEnd(t *testing.T) {
 	httpReq := actionauth.StateRequirements{ProjectorID: stateauth.HTTPStateProjector{}.ID()}
 	policy := actionauth.NewActionPolicy(
 		actionauth.NewRegistry(
-			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root", Reversible: true}, Requirements: httpReq},
-			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-health", Reversible: true}, Requirements: httpReq},
+			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly}, Requirements: httpReq},
+			actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-health", Safety: actionauth.ActionStrictReadOnly}, Requirements: httpReq},
 		),
 		actionauth.NewRecoveryRegistry("reset"),
 	)

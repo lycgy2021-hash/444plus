@@ -68,13 +68,31 @@ import (
 // never a substituted target (Replay rejects a Candidate whose
 // binding.ReplayTargetHash() does not match v.target.Hash()).
 //
-// STRICT READ-ONLY ACTIONS ONLY. v1 implements no verified-recovery flow
-// (Execute -> collect -> BoundRecovery -> ExecuteRecovery -> collect ->
-// stateauth.Recovered()), so it refuses to replay any rule whose
-// TransitionRule.ReadOnlyAction is not explicitly true
-// (ErrReplayActionNotReadOnly) — see that field's own doc. A future version
-// that wants to replay actions needing real recovery must implement and
-// prove that flow first, as its own explicit, separately reviewed design.
+// STRICT READ-ONLY ACTIONS ONLY, DECLARED BY ACTION AUTHORITY, NEVER BY THE
+// RULE. v1 implements no verified-recovery flow (Execute -> collect ->
+// BoundRecovery -> ExecuteRecovery -> collect -> stateauth.Recovered()), so
+// it refuses to replay any action whose FRESH actionauth.BoundAction.Safety()
+// is not exactly actionauth.ActionStrictReadOnly (ErrReplayActionNotReadOnly)
+// — read from the SAME trusted registry v.policy.Select just consulted,
+// never from a field a TransitionRule declares about itself (an earlier
+// version of this file trusted rule.ReadOnlyAction directly, which would
+// have let Rule authority vouch for Action safety — see
+// actionauth.RegisteredAction.Safety's own doc for why that boundary
+// matters). A future version that wants to replay actions needing real
+// recovery must implement and prove that flow first, as its own explicit,
+// separately reviewed design.
+//
+// SAME ACTION-AUTHORITY SEMANTICS, NOT JUST THE SAME ActionID BY
+// COINCIDENCE. "The policy's own selection happens to equal rule.ActionID"
+// (above) is necessary but not sufficient: TWO DIFFERENT ActionPolicy
+// instances — one permissive, one strict — could still agree on an ActionID
+// for the same state by coincidence, which would let a caller wire a
+// weaker policy into a replay validator without Replay ever noticing. Fixed
+// by requiring v.policy.PolicyID() (a deterministic identity over the
+// policy's own immutable registry content — see that method's own doc) to
+// equal binding.PolicyID() (the PolicyID the ORIGINAL action was bound
+// under) BEFORE Replay ever calls Select — a pure, no-I/O check, exactly
+// like the other identity checks below (ErrReplayPolicyMismatch).
 //
 // NO STATE PREPARATION. If ExpectFactTransition's own precondition
 // (before.Facts[Fact] == BeforeValue) does not hold against the FRESH
@@ -158,7 +176,8 @@ var (
 	ErrReplayActionMismatch    = errors.New("research: candidate's bound action identity does not match the resolved rule's ActionID")
 	ErrReplayProjectorMismatch = errors.New("research: candidate's bound projector identity does not match the resolved rule's ProjectorID")
 	ErrReplayTargetMismatch    = errors.New("research: candidate's ReplayTargetHash does not match this validator's own ReplayTarget")
-	ErrReplayActionNotReadOnly = errors.New("research: the resolved rule's action is not declared ReadOnlyAction — v1 replays only strict read-only actions")
+	ErrReplayPolicyMismatch    = errors.New("research: this validator's ActionPolicy has a different PolicyID than the one the candidate's action was originally bound under")
+	ErrReplayActionNotReadOnly = errors.New("research: the freshly selected action's own registered Safety is not actionauth.ActionStrictReadOnly — v1 replays only strict read-only actions")
 	ErrReplaySessionIDRequired = errors.New("research: replay requires a non-empty, freshly chosen sessionID")
 )
 
@@ -171,11 +190,14 @@ var (
 //
 //	c is not OriginStateMachine, has no binding/unknown RuleID, its bound
 //	action/projector identity disagrees with the resolved rule, its
-//	ReplayTargetHash disagrees with this validator's own target, or the
-//	resolved rule is not ReadOnlyAction                -> error (never attempted)
+//	ReplayTargetHash disagrees with this validator's own target, or
+//	v.policy's PolicyID disagrees with the candidate's own binding
+//	                                                     -> error (never attempted, no I/O)
 //	v.policy.Select (against the FRESH baseline) returns
 //	nothing applicable, or an action OTHER than
 //	rule.ActionID                                       -> OutcomeNoSignal (never executes rule.ActionID anyway)
+//	the freshly selected BoundAction's own Safety is not
+//	actionauth.ActionStrictReadOnly                     -> error (v1 refuses to execute it at all)
 //	fresh baseline does not satisfy a fact_transition
 //	rule's own precondition                             -> OutcomeNoSignal (no execute)
 //	fresh replay: rule satisfied, or not_applicable      -> OutcomeNoSignal
@@ -208,8 +230,14 @@ func (v *StateMachineReplayValidator) Replay(ctx context.Context, c *Candidate, 
 	if binding.ReplayTargetHash() != v.target.Hash() {
 		return ValidationResult{}, ErrReplayTargetMismatch
 	}
-	if !rule.ReadOnlyAction {
-		return ValidationResult{}, ErrReplayActionNotReadOnly
+	// SAME action-authority semantics, not merely the same ActionID by
+	// coincidence — see this file's own top-of-file doc. A pure, no-I/O
+	// check: v.policy.PolicyID() is fixed at construction, so this is
+	// checked once here rather than re-derived from every later Select
+	// call (which, from this SAME policy instance, could never disagree
+	// with it anyway).
+	if v.policy.PolicyID() != binding.PolicyID() {
+		return ValidationResult{}, ErrReplayPolicyMismatch
 	}
 	if sessionID == "" {
 		return ValidationResult{}, ErrReplaySessionIDRequired
@@ -254,6 +282,13 @@ func (v *StateMachineReplayValidator) Replay(ctx context.Context, c *Candidate, 
 			Outcome:   OutcomeNoSignal,
 			Evidence:  []Observation{replayFingerprintObservation("replay_baseline_action_not_currently_authorized", before)},
 		}, nil
+	}
+	// STRICT READ-ONLY ONLY, from the FRESH BoundAction's own Safety — read
+	// from the SAME trusted registry Select just consulted, never from
+	// anything a TransitionRule declares about itself. v1 implements no
+	// verified-recovery flow, so anything else is refused outright.
+	if boundAction.Safety() != actionauth.ActionStrictReadOnly {
+		return ValidationResult{}, ErrReplayActionNotReadOnly
 	}
 
 	execCtx := ContextWithRequestMeter(deadlineCtx, meter)
@@ -365,6 +400,8 @@ func replaySummaryObservation(v *StateMachineReplayValidator, scope ExplorationS
 		{Kind: "projector_id", Ref: string(rule.ProjectorID)},
 		{Kind: "action_registry_key", Ref: action.ID().RegistryKey},
 		{Kind: "action_variant_id", Ref: action.ID().VariantID},
+		{Kind: "policy_id", Ref: action.PolicyID()},
+		{Kind: "action_safety", Ref: string(action.Safety())},
 		{Kind: "assessment", Ref: string(TransitionViolated)},
 		{Kind: "request_count", Ref: strconv.Itoa(meter.Used())},
 		// replay_case_artifact_hash is THIS replay's own artifact hash —

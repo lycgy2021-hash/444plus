@@ -40,8 +40,8 @@ func TestBoundTypesAreZeroValueOnly(t *testing.T) {
 func TestAdvisoryTypesAreFreelyConstructible(t *testing.T) {
 	id := ActionID{RegistryKey: "http-probe", VariantID: "v1"}
 	ref := RecoveryPlanRef{RegistryKey: "reset-session"}
-	reg := RegisteredAction{Key: "http-probe", Reversible: true}
-	if id.RegistryKey == "" || ref.RegistryKey == "" || !reg.Reversible {
+	reg := RegisteredAction{Key: "http-probe", Safety: ActionStrictReadOnly}
+	if id.RegistryKey == "" || ref.RegistryKey == "" || reg.Safety != ActionStrictReadOnly {
 		t.Fatalf("advisory types should construct plainly: %+v %+v %+v", id, ref, reg)
 	}
 }

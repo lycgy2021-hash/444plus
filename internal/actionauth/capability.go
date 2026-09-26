@@ -29,14 +29,38 @@ type ActionID struct {
 	VariantID string
 }
 
-// RegisteredAction is registry metadata: what a RegistryKey actually resolves
-// to, including whether it is safe to run automatically. Reversible is
-// declared once by this package's own (not yet implemented) registration
-// code — nothing outside actionauth can populate one and have it mean
-// anything, since there is no registry yet to look one up in.
+// ActionSafety classifies what a registered action's own author attests
+// about running it — a CLOSED set, declared once by the registering code
+// (never by anything downstream: never a TransitionRule, never a
+// candidate, never a caller of Select). This is the SOLE authority for
+// "is it safe to execute this action" — see BoundAction.Safety's own doc
+// for why nothing built from a TransitionRule (S10/E6) may substitute for
+// it.
+type ActionSafety string
+
+const (
+	// ActionStrictReadOnly: the action has no observable side effect at
+	// all — the only class S10/E7's replay validator v1 will ever execute
+	// without a verified-recovery flow.
+	ActionStrictReadOnly ActionSafety = "strict_read_only"
+	// ActionReversible: the action may have a side effect, but one a
+	// registered recovery procedure can undo. No code path in this
+	// codebase today executes a Reversible action without also running
+	// its recovery — see RegisteredAction's own doc.
+	ActionReversible ActionSafety = "reversible"
+)
+
+// RegisteredAction is registry metadata: what a RegistryKey actually
+// resolves to, including whether it is safe to run automatically. Safety
+// is declared ONCE, here, by whoever builds the Registry this action lives
+// in — never by a downstream consumer of ActionPolicy.Select's output, and
+// never inferred from anything else. The empty ActionSafety ("", Go's zero
+// value for an unset field) reads as "no safety class declared" and is
+// never treated as safe by anything that checks it — the same fail-closed
+// discipline as an unset StateRequirements.ProjectorID matching nothing.
 type RegisteredAction struct {
-	Key        string
-	Reversible bool
+	Key    string
+	Safety ActionSafety
 }
 
 // BoundAction is the ONLY value an Executor may run. Its identity is
@@ -78,12 +102,36 @@ type BoundAction struct {
 	// observed at the moment of binding.
 	scopeHash           string
 	authorizedStateHash string
+	// safety and policyID are stamped by ActionPolicy.Select FROM the
+	// matched Registration/Registry — never supplied by a caller of
+	// Select, and never derived from anything a downstream S10/E6
+	// TransitionRule declares. See Safety's and PolicyID's own doc.
+	safety   ActionSafety
+	policyID string
 }
 
 // ID returns the action identity this capability was bound to. Safe to expose:
 // an ActionID alone grants nothing (see ActionID's doc); the authorization proof
 // is ValidFor, not the identity.
 func (a BoundAction) ID() ActionID { return a.id }
+
+// Safety returns the ActionSafety this BoundAction's own matched
+// Registration declared, exactly as ActionPolicy.Select found it in the
+// registry at the moment of binding. This is the ONLY safety signal a
+// caller (e.g. S10/E7's replay validator) may trust: it comes from the
+// SAME immutable Registry that decided this action was applicable at all
+// — never from anything a TransitionRule (S10/E6, a different package,
+// with a different authority: "what to expect", not "what is safe to
+// run") declares about itself. The zero-value BoundAction returns "".
+func (a BoundAction) Safety() ActionSafety { return a.safety }
+
+// PolicyID returns a deterministic identity for the ActionPolicy that
+// produced this BoundAction — see ActionPolicy.PolicyID's own doc. Two
+// BoundAction values from two DIFFERENT ActionPolicy instances built from
+// identically-shaped registries share a PolicyID; a value built from a
+// registry with different content never does. The zero-value BoundAction
+// returns "".
+func (a BoundAction) PolicyID() string { return a.policyID }
 
 // ValidFor reports whether this BoundAction was authorized for EXACTLY this
 // scope and state fingerprint. A future Executor MUST call this immediately

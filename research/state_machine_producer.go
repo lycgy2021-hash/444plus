@@ -117,23 +117,18 @@ type TransitionRule struct {
 	Expectation       TransitionExpectation
 	ExpectationSource ExpectationSource
 
-	// ReadOnlyAction is the rule AUTHOR's own explicit attestation that
-	// ActionID's action needs no compensating recovery — either because it
-	// has no observable side effect at all, or because any side effect it
-	// does have has been reviewed and is acceptable to leave in place. S10/
-	// E7's replay validator v1 REFUSES to replay any rule for which this is
-	// not exactly true (ErrReplayActionNotReadOnly): v1 implements no
-	// verified-recovery flow (Execute -> collect -> BoundRecovery ->
-	// ExecuteRecovery -> collect -> stateauth.Recovered()), so replaying a
-	// rule that needed one would risk leaving a real target parked in a
-	// changed state purely to reproduce a hypothesis. A future version that
-	// wants to replay actions needing real recovery must implement and
-	// prove that flow FIRST, as its own explicit, separately reviewed
-	// design — never by silently trusting this flag beyond what it
-	// declares. NewTransitionRuleRegistry does NOT require this to be true
-	// — E6's own producer judges transitions regardless of whether the
-	// action was read-only; only E7's Replay method checks it.
-	ReadOnlyAction bool
+	// Deliberately NO safety/read-only field here. "Is it safe to execute
+	// this action" is Action authority's question, never Rule authority's
+	// — see actionauth.RegisteredAction.Safety and BoundAction.Safety's own
+	// doc. An earlier version of this file DID add a ReadOnlyAction bool
+	// here, letting a rule author attest an action's safety directly —
+	// which meant TransitionRuleRegistry (whose job is defining what a
+	// transition is judged AGAINST) could effectively also vouch for
+	// whether an action may execute, even for an action that in fact had
+	// side effects. Removed rather than left unenforced: S10/E7's replay
+	// validator now reads Safety from the FRESH actionauth.BoundAction its
+	// own trusted ActionPolicy.Select produces, never from anything a
+	// TransitionRule declares about itself.
 }
 
 // StateMachineBinding is the immutable, tamper-proof identity a
@@ -149,6 +144,14 @@ type StateMachineBinding struct {
 	projectorID      stateauth.ProjectorID
 	replayTargetHash string
 	caseArtifactHash string
+	// policyID is the actionauth.ActionPolicy.PolicyID() the ORIGINAL
+	// action was bound under — see BoundAction.PolicyID's own doc. S10/E7's
+	// replay validator cross-checks this against its OWN configured
+	// policy's PolicyID before ever calling Select, so "the same ActionID
+	// got selected" can never be mistaken for "the same action-authority
+	// semantics authorized it" — two DIFFERENT policies (one permissive,
+	// one strict) could otherwise agree on an ActionID by coincidence.
+	policyID string
 }
 
 func (b StateMachineBinding) RuleID() string                     { return b.ruleID }
@@ -156,6 +159,7 @@ func (b StateMachineBinding) ActionID() actionauth.ActionID      { return b.acti
 func (b StateMachineBinding) ProjectorID() stateauth.ProjectorID { return b.projectorID }
 func (b StateMachineBinding) ReplayTargetHash() string           { return b.replayTargetHash }
 func (b StateMachineBinding) CaseArtifactHash() string           { return b.caseArtifactHash }
+func (b StateMachineBinding) PolicyID() string                   { return b.policyID }
 
 // ReplayTarget identifies WHAT is being explored/replayed against: the same
 // target/build/protocol/harness dimensions as ExplorationScope, but
@@ -629,6 +633,7 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 	origin := Origin{Kind: OriginStateMachine, ID: rc.Transition.ScopeHash}
 	prov := newProvenance(string(OriginStateMachine), rc.Transition.ScopeHash, "state_machine", artifactHash)
 	action := rc.Transition.Action.ID()
+	policyID := rc.Transition.Action.PolicyID()
 
 	var candidates []*Candidate
 	for _, a := range anomalies {
@@ -652,6 +657,7 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 			projectorID:      rc.Rule.ProjectorID,
 			replayTargetHash: replayTargetOf(rc.Scope).Hash(),
 			caseArtifactHash: artifactHash,
+			policyID:         policyID,
 		}
 		cand.Refs = map[string]string{
 			"transition_artifact_hash": rc.Transition.TransitionArtifactHash,
@@ -662,13 +668,15 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 			"expectation_kind":         string(rc.Rule.Expectation.Kind),
 			"action_registry_key":      action.RegistryKey,
 			"action_variant_id":        action.VariantID,
-			// projector_id and replay_target_hash exist for S10/E7's replay
-			// validator: it cross-checks these against the ActionID/ProjectorID
-			// of whatever rule it resolves from Refs["rule_id"] itself, and
-			// against its OWN configured ReplayTarget — never trusting these
-			// Candidate-carried copies as authoritative on their own.
+			// projector_id, replay_target_hash, and policy_id exist for
+			// S10/E7's replay validator: it cross-checks these against
+			// what its own trusted registry/policy/target actually
+			// resolve — never trusting these Candidate-carried copies (or
+			// the ones on Refs at all) as authoritative on their own. The
+			// AUTHORITATIVE copies live on StateMachineBinding, above.
 			"projector_id":       string(rc.Rule.ProjectorID),
 			"replay_target_hash": replayTargetOf(rc.Scope).Hash(),
+			"policy_id":          policyID,
 		}
 		candidates = append(candidates, cand)
 	}
@@ -705,6 +713,8 @@ func transitionCaseArtifactHash(rc resolvedTransitionCase) string {
 	b.WriteString("before=" + canonicalTransitionFingerprint(t.BeforeFingerprint) + "\n")
 	b.WriteString("action_registry_key=" + t.Action.ID().RegistryKey + "\n")
 	b.WriteString("action_variant_id=" + t.Action.ID().VariantID + "\n")
+	b.WriteString("action_policy_id=" + t.Action.PolicyID() + "\n")
+	b.WriteString("action_safety=" + string(t.Action.Safety()) + "\n")
 	b.WriteString("after=" + canonicalTransitionFingerprint(t.AfterFingerprint) + "\n")
 	b.WriteString("evidence_refs=" + strings.Join(t.EvidenceRefs, ",") + "\n")
 	b.WriteString("transition_artifact_hash=" + t.TransitionArtifactHash + "\n")

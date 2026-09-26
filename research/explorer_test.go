@@ -154,7 +154,7 @@ func rawLenReq() actionauth.StateRequirements {
 // and one registered recovery ("reset").
 func testPolicy() *actionauth.ActionPolicy {
 	return actionauth.NewActionPolicy(
-		actionauth.NewRegistry(actionauth.Registration{Action: actionauth.RegisteredAction{Key: "probe", Reversible: true}, Requirements: rawLenReq()}),
+		actionauth.NewRegistry(actionauth.Registration{Action: actionauth.RegisteredAction{Key: "probe", Safety: actionauth.ActionStrictReadOnly}, Requirements: rawLenReq()}),
 		actionauth.NewRecoveryRegistry("reset"),
 	)
 }
