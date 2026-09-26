@@ -49,12 +49,13 @@ func rung(s State) int {
 type OriginKind string
 
 const (
-	OriginAI          OriginKind = "ai"
-	OriginFuzz        OriginKind = "fuzz"
-	OriginDiff        OriginKind = "diff"
-	OriginSourceAudit OriginKind = "source_audit"
-	OriginPassive     OriginKind = "passive"
-	OriginHuman       OriginKind = "human"
+	OriginAI           OriginKind = "ai"
+	OriginFuzz         OriginKind = "fuzz"
+	OriginDiff         OriginKind = "diff"
+	OriginDifferential OriginKind = "differential"
+	OriginSourceAudit  OriginKind = "source_audit"
+	OriginPassive      OriginKind = "passive"
+	OriginHuman        OriginKind = "human"
 )
 
 // Origin records where a candidate came from. Kind is the producer type; ID is

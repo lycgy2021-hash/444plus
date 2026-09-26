@@ -157,6 +157,32 @@ Fuzz candidates flow into the **same** Registry → Validator → Engine spine; 
 no fuzz validator registered they stay `hypothesis` (no auto-promotion, no
 exploitability judgment).
 
+**S9 v1 — `research/differential.go`** — the differential producer, the third
+research source (runtime differences). It is a deterministic PRODUCER (not a
+prober): it consumes a `DifferentialCase` — the responses to the SAME semantic
+request under different encoding/normalization/boundary/protocol variants,
+collected elsewhere — compares them canonically, filters run-noise, and classifies
+disagreements into `status_differential`, `header_differential`,
+`body_shape_differential`, `accept_reject_differential`, `normalization_differential`,
+`boundary_differential`. Boundaries:
+- **Noise filtered.** Volatile headers (Date/Set-Cookie/X-Request-Id/ETag/
+  Content-Length/…) are dropped; header comparison is on the stable key set; body
+  is compared as a *shape* (normalized content-type + length bucket), so timestamp/
+  cookie/nonce churn and small size jitter never manufacture an anomaly.
+- **Semantics drive the type.** Encoding/protocol variants are expected equivalent
+  → a difference is reported per dimension; a normalization variant that differs
+  at all → `normalization_differential`; a boundary variant whose accept/reject or
+  status flips → `boundary_differential`.
+- **Consistent provenance.** `Provenance.RawInputHash` = the canonical serialized
+  case hash (over the stable, noise-filtered view) — the producer's raw input
+  artifact, order- and volatile-independent — same meaning as the diff/fuzz
+  producers. Structured `Refs` carry intent/anomaly_type/variants/case_hash.
+- **Narrow v1.** Only the six differences above; no attack-input generation, no
+  live probing in the producer.
+
+Differential candidates flow into the same spine and stay `hypothesis` until a
+validator reproduces the difference safely.
+
 Nothing here touches the 28 checkers or the engine; `go build/vet/test ./...`
 (and `-race`) stays green.
 
@@ -189,8 +215,16 @@ the guarantees hold under test:
   GroupArtifactHash` (raw producer artifact, not the derived identity),
   `MembersDigest` full-set commitment, structured refs, conservative classifier).
   No AI fuzz-input generation, no auto-exploitability. Contract frozen.
-- **Deferred:** `S7` large-scale source audit, `S9` differential engine, `S10`
-  state-machine explorer — not until S6/S8 are stable.
+- **S9 (differential engine): v1 landed** (deterministic `DifferentialProducer`;
+  status/header/body-shape/accept-reject/normalization/boundary anomalies, noise
+  filtered, canonical case-hash provenance). Next: S9 audit, then freeze.
+- **Deferred:** `S10` state-machine explorer (after S9), then `S7` large-scale
+  source audit — the local-model signal-to-noise on a whole repo is lower than the
+  diff/fuzz/differential sources already built.
+
+Three independent unknown-issue sources now feed the plane: **patch difference
+(S6), crash behavior (S8), runtime differential (S9)** — all deterministic
+producers on the one `Producer → Candidate → Validator → Engine` spine.
 
 Every source is a new `Origin.Kind` feeding the one spine
 `Producer → Candidate → Registered Validator → ValidationResult → Engine → state`.
