@@ -37,20 +37,33 @@ type Provenance struct {
 	ProducerID   string    `json:"producer_id,omitempty"`
 	Tool         string    `json:"tool,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
-	// InputHash is the SHA-256 (hex) of the exact input that produced this — the
-	// diff blob, the crash input, the evidence bundle that was analyzed.
-	InputHash string `json:"input_hash,omitempty"`
+	// RawInputHash is the byte-for-byte SHA-256 (hex) of the ORIGINAL input that
+	// produced this — the raw diff blob, the raw crash input, the exact bytes sent
+	// to a model — taken BEFORE any parser/normalization step. Hashing the raw
+	// input (not a normalized form) is deliberate: newline/encoding/parser
+	// preprocessing must not break evidence traceability.
+	RawInputHash string `json:"raw_input_hash,omitempty"`
 }
 
-// InputHash returns the hex SHA-256 of b, for stamping Provenance.InputHash.
-func InputHash(b []byte) string {
+// RawInputHash returns the hex SHA-256 of b, for stamping Provenance.RawInputHash
+// over raw input bytes.
+func RawInputHash(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
 
 // newProvenance stamps a provenance record at the current time.
-func newProvenance(kind, id, tool, inputHash string) Provenance {
-	return Provenance{ProducerKind: kind, ProducerID: id, Tool: tool, Timestamp: time.Now().UTC(), InputHash: inputHash}
+func newProvenance(kind, id, tool, rawInputHash string) Provenance {
+	return Provenance{ProducerKind: kind, ProducerID: id, Tool: tool, Timestamp: time.Now().UTC(), RawInputHash: rawInputHash}
+}
+
+// Hash returns the content hash (hex SHA-256 of the observation's canonical JSON)
+// used to reference this fact tamper-evidently from a candidate's history: a
+// later substitution of the evidence changes the hash and breaks the reference.
+func (o Observation) Hash() string {
+	b, _ := json.Marshal(o)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // NetworkAction records what a probe did to the target. The research plane
@@ -132,9 +145,15 @@ type Evidence struct {
 	// Notes are short, factual context lines authored by the research plane (not
 	// model output).
 	Notes []string `json:"notes,omitempty"`
-	// Provenance records where this evidence bundle came from (immutable).
-	Provenance Provenance `json:"provenance"`
+	// provenance is unexported so it cannot be rewritten by another package after
+	// construction; read it through Provenance(), which returns a copy. It is set
+	// by a producer/constructor (e.g. FromModelEvidence) and intentionally left
+	// out of the JSON sent to a model.
+	provenance Provenance
 }
+
+// Provenance returns a copy of the evidence's immutable origin record.
+func (e Evidence) Provenance() Provenance { return e.provenance }
 
 // FromModelEvidence derives research Evidence from a detection-plane
 // model.Evidence WITHOUT changing it — the adapter that bridges the frozen base
@@ -147,7 +166,7 @@ func FromModelEvidence(target, source string, ev model.Evidence) Evidence {
 	// Provenance ties this bundle to the exact detection evidence it was built
 	// from; the hash is over the marshaled model.Evidence.
 	raw, _ := json.Marshal(ev)
-	out.Provenance = newProvenance("detection", source, "detection", InputHash(raw))
+	out.provenance = newProvenance("detection", source, "detection", RawInputHash(raw))
 	if ev.Version != "" {
 		out.Product = ProductFact{Version: ev.Version}
 	}

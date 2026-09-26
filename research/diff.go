@@ -16,8 +16,11 @@ import (
 // dangerous API, or a new reject/error path — into hypothesis Candidates tagged
 // Origin{Kind: "diff"}. It proves the spine is producer-agnostic: these
 // candidates flow into the same Registry → Validator → Engine path as AI ones,
-// with no second pipeline. v1 is pattern-based on purpose; an AI diff pass
-// (ai.TaskDiffAnalysis, later) can enrich the same candidates, never replace this.
+// with no second pipeline. v1 is pattern-based on purpose, but the patterns match
+// code SHAPE (a call, a comparison, an if-guard, a status response), not bare
+// keywords, and comment/blank lines are skipped — so a security word in prose or
+// a log line does not manufacture a candidate. An AI diff pass (later) can enrich
+// these same candidates, never replace this deterministic classification.
 type DiffProducer struct {
 	newID func() string
 }
@@ -35,80 +38,143 @@ func (p *DiffProducer) WithIDFunc(fn func() string) *DiffProducer {
 // Security-relevant change categories. Each is a candidate_type; a later diff
 // validator can decide how to test one.
 const (
-	CatBoundsCheck       = "added_bounds_check"
-	CatAuthCheck         = "added_auth_check"
-	CatCanonicalization  = "added_canonicalization"
-	CatTypeValidation    = "added_type_validation"
-	CatLengthValidation  = "added_length_validation"
-	CatDangerousAPIRepl  = "dangerous_api_replaced"
-	CatRejectPath        = "added_reject_path"
+	CatBoundsCheck      = "added_bounds_check"
+	CatAuthCheck        = "added_auth_check"
+	CatCanonicalization = "added_canonicalization"
+	CatTypeValidation   = "added_type_validation"
+	CatLengthValidation = "added_length_validation"
+	CatDangerousAPIRepl = "dangerous_api_replaced"
+	CatRejectPath       = "added_reject_path"
 )
 
-// classifier patterns run against a single changed line. Ordered by priority so a
-// line is assigned at most one category (the most specific first).
+// addedClassifiers run against a changed line's CODE (marker + leading whitespace
+// stripped, comments skipped). Ordered by priority so a line is assigned at most
+// one category (most specific first). Every pattern requires a code shape — a
+// call `(`, a comparison operator, an `if` guard, or an HTTP status response —
+// not a lone keyword, which is what kept the old auth/length/reject/normalize
+// patterns from over-matching prose.
 var addedClassifiers = []struct {
 	cat string
-	re  *regexp.Regexp
+	res []*regexp.Regexp
 }{
-	{CatAuthCheck, regexp.MustCompile(`(?i)authori[sz]|authenticat|permission|is_?admin|require_?auth|access[ _]denied|forbidden|unauthori[sz]ed|check_?auth|has_?role|\bacl\b|403\b|401\b`)},
-	{CatCanonicalization, regexp.MustCompile(`(?i)canonical|normali[sz]e|realpath|filepath\.Clean|path\.Clean|os\.path\.realpath|decodeuri|unescape|resolve_?path`)},
-	{CatLengthValidation, regexp.MustCompile(`(?i)max_?length|too long|exceeds|length limit|> *max\b|len limit`)},
-	{CatBoundsCheck, regexp.MustCompile(`(?i)\bif\b.*(<=|>=|<|>).*(len|size|length|count|cap|bound|index|offset)`)},
-	{CatTypeValidation, regexp.MustCompile(`(?i)instanceof|isinstance\(|reflect\.TypeOf|\btypeof\b|schema\.validate|validate_?type`)},
-	{CatRejectPath, regexp.MustCompile(`(?i)\bthrow\b|\braise\b|return [^\n]*err|reject\(|\babort\(|\bpanic\(|http\.Error|StatusForbidden|StatusUnauthorized|BadRequest|WriteHeader\((?:400|401|403|404|409|422|500)`)},
+	{CatAuthCheck, []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\b(authori[sz]e|authenticate|require_?auth|check_?auth|check_?permission|ensure_?auth|has_?role|has_?permission|is_?admin)\s*\(`),
+		regexp.MustCompile(`(?i)\bif\b.{0,80}\b(permission|role|auth|admin|forbidden|unauthori[sz]ed|access[ _]denied)\b`),
+		regexp.MustCompile(`(?i)(status\s*forbidden|status\s*unauthorized|writeheader\(\s*40[13]\b|http\.error\([^)]*(forbidden|unauthor)|res\.status\(\s*40[13]\b|sendstatus\(\s*40[13]\b|abort\(\s*40[13]\b)`),
+	}},
+	{CatCanonicalization, []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(filepath\.clean\(|[^a-z]path\.clean\(|^path\.clean\(|realpath\(|os\.path\.realpath\(|\.normali[sz]e\(|canonicali[sz]e\(|canonical_?path\(|decodeuricomponent\(|securejoin\()`),
+	}},
+	{CatLengthValidation, []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(max_?length\b|maxlen\b|\blen\([^)]*\)\s*(>=|>|<)|\.length\s*(>=|>|<)|\.size\(\)\s*(>=|>|<)|length limit|size limit)`),
+	}},
+	{CatBoundsCheck, []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\bif\b.{0,80}(<=|>=|<|>).{0,40}\b(len|size|length|cap|bound|index|offset)`),
+		regexp.MustCompile(`(?i)\bif\b.{0,80}\b(len|size|length|cap|bound|index|offset).{0,40}(<=|>=|<|>)`),
+	}},
+	{CatTypeValidation, []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(\binstanceof\b|isinstance\(|reflect\.typeof\(|\btypeof\s|\.\(type\)|schema\.validate\(|validate_?type\()`),
+	}},
+	{CatRejectPath, []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(\bthrow\s|\braise\s|\bpanic\(|[^a-z]reject\(|\babort\(|http\.error\(|writeheader\(\s*(4\d\d|5\d\d)\b|status\s*(forbidden|unauthorized|badrequest|conflict)|bad_?request)`),
+	}},
 }
 
-// dangerousAPI matches a removed line whose disappearance is itself the signal —
-// a risky sink being replaced.
-var dangerousAPI = regexp.MustCompile(`(?i)system\(|\bexec\(|\beval\(|os/exec|Runtime\.exec|subprocess\.|popen\(|pickle\.loads|yaml\.load\(|ObjectInputStream|innerHTML|dangerouslySetInnerHTML|Deserialize`)
+// dangerousAPI matches a REMOVED line whose disappearance is the signal — a risky
+// sink in call/assignment form. Requiring the call/assignment shape (not a bare
+// word) avoids matching a mention of "eval" in a comment.
+var dangerousAPI = regexp.MustCompile(`(?i)(system\(|\bexec\(|\beval\(|os/exec|runtime\.exec\(|subprocess\.(call|run|popen)\(|popen\(|pickle\.loads\(|yaml\.load\(|objectinputstream|\.innerhtml\s*=|dangerouslysetinnerhtml|unserialize\(|[^a-z]deserialize\()`)
 
-type diffChange struct {
-	category string
-	line     string
+// commentPrefixes start a line that is a comment, not code, so it is skipped
+// before classification. Bare "*" is intentionally NOT here (it would skip C
+// pointer lines); a block-comment continuation is prose and fails the code-shape
+// patterns anyway.
+var commentPrefixes = []string{"//", "/*", "#", "<!--", `"""`, "'''"}
+
+func isCommentOrBlank(code string) bool {
+	if code == "" {
+		return true
+	}
+	for _, p := range commentPrefixes {
+		if strings.HasPrefix(code, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripMarker removes a diff line's leading +/- marker and surrounding
+// whitespace, yielding the underlying code so patterns anchor on code, not "+".
+func stripMarker(line string) string {
+	if line == "" {
+		return ""
+	}
+	return strings.TrimSpace(line[1:])
 }
 
 // Produce parses a unified diff and returns hypothesis candidates, one per
 // (file, category). ref labels the diff (e.g. a commit range) for provenance and
-// origin. It never executes anything — it only reads text.
+// origin. It never executes anything — it only reads text. Provenance.RawInputHash
+// is the byte-for-byte SHA-256 of the diff exactly as given.
 func (p *DiffProducer) Produce(diff []byte, ref string) []*Candidate {
-	prov := newProvenance(string(OriginDiff), ref, "git-diff", InputHash(diff))
+	prov := newProvenance(string(OriginDiff), ref, "git-diff", RawInputHash(diff))
 	origin := Origin{Kind: OriginDiff, ID: ref}
 
-	// perFile[file][category] = sample changed lines.
+	// perFile[file][category] = a few sample changed lines.
 	perFile := map[string]map[string][]string{}
-	record := func(file, cat, line string) {
+	record := func(file, cat, code string) {
 		if file == "" {
 			file = "(unknown)"
 		}
 		if perFile[file] == nil {
 			perFile[file] = map[string][]string{}
 		}
-		if len(perFile[file][cat]) < 3 { // keep a few samples, not the whole hunk
-			perFile[file][cat] = append(perFile[file][cat], strings.TrimSpace(line))
+		if len(perFile[file][cat]) < 3 {
+			perFile[file][cat] = append(perFile[file][cat], code)
 		}
 	}
 
 	curFile := ""
+	// Hunk-scoped state for the dangerous-API PAIR rule: only a removed dangerous
+	// API AND an added line in the SAME hunk counts as a replacement.
+	hunkRemovedDangerous := ""
+	hunkHasAdd := false
+	finalizeHunk := func() {
+		if hunkRemovedDangerous != "" && hunkHasAdd {
+			record(curFile, CatDangerousAPIRepl, hunkRemovedDangerous)
+		}
+		hunkRemovedDangerous, hunkHasAdd = "", false
+	}
+
 	sc := bufio.NewScanner(bytes.NewReader(diff))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
 		switch {
 		case strings.HasPrefix(line, "+++ "):
+			finalizeHunk()
 			curFile = parseDiffPath(line[4:])
-			continue
-		case strings.HasPrefix(line, "--- "), strings.HasPrefix(line, "diff --git"), strings.HasPrefix(line, "@@"), strings.HasPrefix(line, "index "):
-			continue
+		case strings.HasPrefix(line, "@@"):
+			finalizeHunk()
+		case strings.HasPrefix(line, "--- "), strings.HasPrefix(line, "diff --git"), strings.HasPrefix(line, "index "):
+			// header lines: ignore
 		case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "--"):
-			if dangerousAPI.MatchString(line) {
-				record(curFile, CatDangerousAPIRepl, line)
+			code := stripMarker(line)
+			if !isCommentOrBlank(code) && dangerousAPI.MatchString(code) {
+				hunkRemovedDangerous = code
 			}
 		case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "++"):
-			if cat := classifyAdded(line); cat != "" {
-				record(curFile, cat, line)
+			code := stripMarker(line)
+			if isCommentOrBlank(code) {
+				continue
+			}
+			hunkHasAdd = true
+			if cat := classifyAdded(code); cat != "" {
+				record(curFile, cat, code)
 			}
 		}
 	}
+	finalizeHunk()
 
 	var candidates []*Candidate
 	for _, file := range sortedKeys(perFile) {
@@ -123,10 +189,12 @@ func (p *DiffProducer) Produce(diff []byte, ref string) []*Candidate {
 	return candidates
 }
 
-func classifyAdded(line string) string {
+func classifyAdded(code string) string {
 	for _, c := range addedClassifiers {
-		if c.re.MatchString(line) {
-			return c.cat
+		for _, re := range c.res {
+			if re.MatchString(code) {
+				return c.cat
+			}
 		}
 	}
 	return ""

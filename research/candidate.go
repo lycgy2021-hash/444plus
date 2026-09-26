@@ -1,6 +1,7 @@
 package research
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -91,11 +92,15 @@ type Candidate struct {
 	RequiredEvidence []string      `json:"required_evidence,omitempty"`
 	Evidence         []Observation `json:"evidence,omitempty"`
 	CreatedAt        time.Time     `json:"created_at"`
-	// Provenance is the immutable origin record set at birth: which producer, which
-	// exact input (InputHash). Combined with History (append-only, each step naming
-	// its validator + evidence), it gives the full lineage of any conclusion.
-	Provenance Provenance   `json:"provenance"`
-	History    []Transition `json:"history,omitempty"`
+	History          []Transition  `json:"history,omitempty"`
+
+	// provenance is the immutable origin record set once at birth: which producer,
+	// which exact raw input (RawInputHash). It is unexported so no other package
+	// can rewrite where a candidate came from; read it via Provenance() (a copy)
+	// and it is included in JSON through MarshalJSON. Combined with History
+	// (append-only, each step naming its validator + content-hashed evidence), it
+	// gives the full, tamper-evident lineage of any conclusion.
+	provenance Provenance
 
 	// mu guards the read-modify-write in Promote so concurrent promotions cannot
 	// skip a rung (one wins hypothesis→reproducible; the rest see the advanced
@@ -117,8 +122,22 @@ func NewHypothesis(id, candidateType, title, target, rationale string, origin Or
 		Origin:           origin,
 		RequiredEvidence: required,
 		CreatedAt:        time.Now().UTC(),
-		Provenance:       prov,
+		provenance:       prov,
 	}
+}
+
+// Provenance returns a copy of the candidate's immutable origin record. Callers
+// cannot mutate the candidate's provenance through the returned value.
+func (c *Candidate) Provenance() Provenance { return c.provenance }
+
+// MarshalJSON includes the unexported, immutable provenance in the candidate's
+// JSON (the sync.Mutex and the raw provenance field are otherwise skipped).
+func (c *Candidate) MarshalJSON() ([]byte, error) {
+	type alias Candidate
+	return json.Marshal(&struct {
+		*alias
+		Provenance Provenance `json:"provenance"`
+	}{alias: (*alias)(c), Provenance: c.provenance})
 }
 
 // ErrIllegalTransition is returned when a promotion would skip a rung, go
@@ -152,6 +171,15 @@ func (c *Candidate) Promote(to State, by string, evidenceRefs []string) error {
 	c.History = append(c.History, Transition{From: c.State, To: to, At: time.Now().UTC(), By: by, EvidenceRefs: evidenceRefs})
 	c.State = to
 	return nil
+}
+
+// attachEvidence retains validator-collected observations on the candidate so the
+// content-hash refs recorded in History point at evidence that is actually kept.
+// Guarded by the same mutex as Promote.
+func (c *Candidate) attachEvidence(obs []Observation) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Evidence = append(c.Evidence, obs...)
 }
 
 // FormatID renders a candidate id, e.g. FormatID(2026, 18) == "RC-2026-000018".

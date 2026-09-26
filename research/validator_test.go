@@ -62,6 +62,15 @@ func TestEnginePromotesOnReproducedWithEvidence(t *testing.T) {
 	if len(c.History) != 1 || c.History[0].By != "mock" || len(c.History[0].EvidenceRefs) == 0 {
 		t.Fatalf("promotion not recorded with validator + evidence: %+v", c.History)
 	}
+	// Addendum: evidence is retained on the candidate and each history ref is a
+	// content hash of that retained evidence, so a later swap is detectable.
+	if len(c.Evidence) != 2 {
+		t.Fatalf("validator evidence not retained on candidate: %d", len(c.Evidence))
+	}
+	wantRef := "mock:baseline_response:" + c.Evidence[0].Hash()
+	if c.History[0].EvidenceRefs[0] != wantRef {
+		t.Fatalf("evidence ref is not a content hash of retained evidence:\n got %q\nwant %q", c.History[0].EvidenceRefs[0], wantRef)
+	}
 }
 
 func TestEngineDoesNotPromoteWithoutEvidenceOrReproduction(t *testing.T) {

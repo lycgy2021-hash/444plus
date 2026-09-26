@@ -89,15 +89,21 @@ actions" entry point — a validator owns and bounds its own probes), `Outcome`
 `HTTPDifferentialValidator` is the first real validator: read-only GETs of its own
 fixed baseline/normalized paths, never anything from the candidate text.
 
-**Provenance (lineage, locked before S6/S8)** — `research/evidence.go` defines an
-immutable `Provenance{ProducerKind, ProducerID, Tool, Timestamp, InputHash}` set
-once at birth on both `Evidence` and `Candidate`. `InputHash` (SHA-256 of the
-exact input — the evidence bundle, the diff blob, the crash) ties a candidate to
-what produced it; combined with the append-only `History` (each `Promote` records
-its validator + evidence refs + time) and content-addressed evidence, the full
-lineage `diff → AI → validator → reproduced` is answerable and tamper-evident:
-where it came from, which input, which validator, and whether evidence was later
-swapped.
+**Provenance (lineage, locked before S6/S8)** — `research/evidence.go` defines
+`Provenance{ProducerKind, ProducerID, Tool, Timestamp, RawInputHash}`, held in an
+**unexported** field on both `Evidence` and `Candidate` and read only through a
+`Provenance()` getter that returns a copy — so no other package can rewrite where
+a candidate came from (real data immutability, not just an API convention;
+`Candidate.MarshalJSON` still emits it). `RawInputHash` is the **byte-for-byte**
+SHA-256 of the *original* input (the raw diff, the raw crash, the exact bytes sent
+to a model) taken *before* any parser/normalization, so newline/encoding/parser
+quirks can't break traceability. Combined with the append-only `History` (each
+`Promote` records its validator + time) and **content-hash evidence refs** — every
+ref is `validator:kind:<sha256 of the retained observation>`, and the Engine keeps
+that observation on the candidate — the full lineage `diff → AI → validator →
+reproduced` is answerable and tamper-evident: where it came from, which raw input,
+which validator, and whether any evidence was later swapped (the hash would no
+longer match).
 
 **S6 v1 — `research/diff.go`** — the first non-AI producer: a deterministic
 `DiffProducer` reads a unified git diff and classifies security-relevant ADDED

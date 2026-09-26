@@ -72,8 +72,8 @@ func TestDiffProducerClassifies(t *testing.T) {
 				if c.Origin.Kind != OriginDiff {
 					t.Errorf("origin kind = %s, want diff", c.Origin.Kind)
 				}
-				if c.Provenance.ProducerKind != "diff" || c.Provenance.InputHash != InputHash([]byte(tc.diff)) {
-					t.Errorf("provenance not stamped to the exact diff: %+v", c.Provenance)
+				if c.Provenance().ProducerKind != "diff" || c.Provenance().RawInputHash != RawInputHash([]byte(tc.diff)) {
+					t.Errorf("provenance not stamped to the exact raw diff: %+v", c.Provenance())
 				}
 			}
 			if !found {
@@ -87,6 +87,79 @@ func TestDiffProducerIgnoresNoise(t *testing.T) {
 	cands := NewDiffProducer().Produce([]byte(noiseDiff), "ref")
 	if len(cands) != 0 {
 		t.Fatalf("noise diff produced %d candidates: %+v", len(cands), cands)
+	}
+}
+
+// Audit point 2: security WORDS in prose/comments/logs must not manufacture a
+// candidate — only code shape (a call, comparison, if-guard, status response)
+// does. Audit point 3: a removed dangerous API with NO added line in the hunk is
+// a pure deletion, not a "replacement".
+func TestDiffProducerNoFalsePositives(t *testing.T) {
+	cases := map[string]string{
+		"comment_mentions_auth": `--- a/x.go
++++ b/x.go
+@@ -1,1 +1,2 @@
+ x := 1
++// TODO: add permission and authorization checks here (forbidden for now)
+`,
+		"log_line_mentions_reject": `--- a/x.go
++++ b/x.go
+@@ -1,1 +1,2 @@
+ x := 1
++log.Printf("normalize done; nothing was rejected or forbidden")
+`,
+		"plain_error_return_is_not_reject": `--- a/x.go
++++ b/x.go
+@@ -1,1 +1,2 @@
+ x := 1
++	return fmt.Errorf("could not read config: %w", err)
+`,
+		"dangerous_removed_no_add": `--- a/x.py
++++ b/x.py
+@@ -1,2 +1,1 @@
+-os.system("cleanup")
+ keep_this_line()
+`,
+	}
+	for name, diff := range cases {
+		t.Run(name, func(t *testing.T) {
+			cands := NewDiffProducer().Produce([]byte(diff), "ref")
+			if len(cands) != 0 {
+				t.Fatalf("expected no candidates, got %d: %+v", len(cands), cands)
+			}
+		})
+	}
+}
+
+// Audit point 3 positive: a removed dangerous API WITH an added replacement in
+// the same hunk is a replacement.
+func TestDiffDangerousPairRequiresReplacement(t *testing.T) {
+	cands := NewDiffProducer().Produce([]byte(dangerousDiff), "ref")
+	found := false
+	for _, c := range cands {
+		if c.Type == CatDangerousAPIRepl {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("dangerous replacement (- os.system / + subprocess.run) not detected: %+v", cands)
+	}
+}
+
+// Audit point 4: provenance is genuinely immutable — Provenance() returns a copy,
+// so mutating it cannot change the candidate's recorded origin.
+func TestProvenanceIsImmutable(t *testing.T) {
+	cands := NewDiffProducer().Produce([]byte(authDiff), "orig-ref")
+	if len(cands) == 0 {
+		t.Fatal("expected a candidate")
+	}
+	c := cands[0]
+	orig := c.Provenance().RawInputHash
+	p := c.Provenance()
+	p.RawInputHash = "tampered"
+	p.ProducerKind = "human"
+	if c.Provenance().RawInputHash != orig || c.Provenance().ProducerKind != "diff" {
+		t.Fatalf("mutating the returned Provenance changed the candidate: %+v", c.Provenance())
 	}
 }
 

@@ -61,7 +61,7 @@ func (a *Analyzer) AnalyzeFinding(ctx context.Context, ev Evidence) ([]*Candidat
 	}
 	origin := Origin{Kind: OriginAI, ID: a.provider.Name()}
 	// Provenance ties every produced candidate to the exact evidence the model saw.
-	prov := newProvenance(string(OriginAI), a.provider.Name(), a.provider.Name(), InputHash(payload))
+	prov := newProvenance(string(OriginAI), a.provider.Name(), a.provider.Name(), RawInputHash(payload))
 	var candidates []*Candidate
 	for _, p := range res.Proposals {
 		typ := strings.TrimSpace(p.CandidateType)

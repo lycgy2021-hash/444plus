@@ -104,10 +104,13 @@ func (e *Engine) Validate(ctx context.Context, target model.Target, c *Candidate
 		}
 		results = append(results, res)
 		if e.shouldPromote(c, res) {
-			refs := evidenceRefs(res)
-			// Only hypothesis→reproducible in S5. Ignore an illegal-transition
-			// error: under concurrency another caller may have already advanced it.
-			_ = c.Promote(Reproducible, res.Validator, refs)
+			// Retain the exact evidence on the candidate and reference each piece by
+			// its content hash, so the history↔evidence link is tamper-evident: a
+			// later substitution changes the hash and no longer matches. Only
+			// hypothesis→reproducible in S5. Ignore an illegal-transition error:
+			// under concurrency another caller may have already advanced it.
+			c.attachEvidence(res.Evidence)
+			_ = c.Promote(Reproducible, res.Validator, evidenceRefs(res))
 			break
 		}
 	}
@@ -154,8 +157,9 @@ func requirementsSatisfied(required []string, evidence []Observation) bool {
 	return true
 }
 
-// evidenceRefs renders stable references for the promotion record from the
-// validator's evidence, so a Transition cites exactly what justified it.
+// evidenceRefs renders content-hash references for the promotion record: each ref
+// is validator:kind:<observation content hash>, so a Transition cites exactly the
+// bytes that justified it and any later substitution is detectable.
 func evidenceRefs(res ValidationResult) []string {
 	refs := make([]string, 0, len(res.Evidence))
 	for i, o := range res.Evidence {
@@ -163,11 +167,7 @@ func evidenceRefs(res ValidationResult) []string {
 		if kind == "" {
 			kind = fmt.Sprintf("evidence-%d", i+1)
 		}
-		if o.Response.SHA256 != "" {
-			refs = append(refs, res.Validator+":"+kind+":"+o.Response.SHA256)
-		} else {
-			refs = append(refs, res.Validator+":"+kind)
-		}
+		refs = append(refs, res.Validator+":"+kind+":"+o.Hash())
 	}
 	return refs
 }
