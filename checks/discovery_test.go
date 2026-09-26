@@ -255,60 +255,89 @@ func TestGitLabHeaderStrippedFallback(t *testing.T) {
 	}
 }
 
-// TestDiscoveryJBossAppPortFindsSiblingManagement regression test for real topology:
-// app:8080 (business page, no JBoss markers) + management on sibling port.
-// When main app port has no JBoss identifiers, discovery's preflight logic probes
-// standard management ports (9990/9993) and counts all HTTP requests accurately.
+// portKeyedProbe is a fake httpx.Probe that returns a plain business page on the
+// app port and a caller-supplied response to GET /management per sibling port.
+// It lets the discovery tests simulate the real topology (app on 8080, management
+// on 9990) without binding real sockets, so they assert routing, not just "a
+// probe was attempted".
+type portKeyedProbe struct {
+	mgmt map[int]httpx.Response // response to GET /management, keyed by port
+}
+
+func canonHeaders(h map[string]string) map[string]string {
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		out[http.CanonicalHeaderKey(k)] = v
+	}
+	return out
+}
+
+func (p portKeyedProbe) Get(_ context.Context, target model.Target, path string) (httpx.Response, error) {
+	if path == "/management" {
+		if r, ok := p.mgmt[target.Port]; ok {
+			return r, nil
+		}
+		return httpx.Response{StatusCode: 404, Headers: map[string]string{}}, nil
+	}
+	// App port: an ordinary business page with no JBoss/WildFly markers.
+	return httpx.Response{StatusCode: 200, Headers: canonHeaders(map[string]string{"Server": "Apache/2.4.50"}), Body: []byte("My Business Application")}, nil
+}
+func (p portKeyedProbe) Fingerprint(context.Context, model.Target) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) Post(context.Context, model.Target, string, string, []byte) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) Options(context.Context, model.Target, string) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p portKeyedProbe) TCP(context.Context, model.Target, []byte, int) ([]byte, error) {
+	return nil, nil
+}
+
+// TestDiscoveryJBossAppPortFindsSiblingManagement is the real end-to-end regression
+// for the core FN: app on 8080 with zero JBoss markers, management on sibling 9990.
+// Discovery MUST route jbosswildfly so the checker gets a chance to run. Using a
+// fake probe keyed by port, this fails if the preflight is removed — unlike the
+// earlier "HTTPRequests >= 2" gate, which was always green.
 func TestDiscoveryJBossAppPortFindsSiblingManagement(t *testing.T) {
-	p, err := policy.New(model.ModePassive, nil)
-	if err != nil {
-		t.Fatalf("policy.New failed: %v", err)
-	}
-	opts := httpx.Defaults()
-	opts.Rate = 0
-	opts.Timeout = 300 * time.Millisecond
-	client, err := httpx.New(opts, p)
-	if err != nil {
-		t.Fatalf("httpx.New failed: %v", err)
-	}
-	t.Cleanup(client.Close)
-
-	// Simulate business app on port 8080 with no JBoss markers
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Request to / or random path on app port: just business content
-		w.Header().Set("Server", "Apache/2.4.50")
-		w.Write([]byte(`<html><body>My Business Application</body></html>`))
-	}))
-	defer s.Close()
-
-	target, err := model.ParseTarget(s.URL)
+	target, err := model.ParseTarget("http://127.0.0.1:8080")
 	if err != nil {
 		t.Fatalf("ParseTarget failed: %v", err)
 	}
+	probe := portKeyedProbe{mgmt: map[int]httpx.Response{
+		9990: {StatusCode: 401, Headers: canonHeaders(map[string]string{"WWW-Authenticate": `Digest realm="ManagementRealm"`})},
+	}}
 
-	// Test direct port-based routing for management ports
-	target.Port = 9990
-	disc := Discover(context.Background(), client, target)
+	disc := Discover(context.Background(), probe, target)
+
 	if !disc.Products["jbosswildfly"] {
-		t.Error("Discovery should route jbosswildfly when port == 9990")
+		t.Fatal("app:8080 with no markers + management:9990 must route jbosswildfly via sibling preflight")
 	}
+	// Two baseline GETs (root + 404) plus the sibling /management probe(s).
+	if disc.HTTPRequests <= 2 {
+		t.Errorf("sibling management preflight was not accounted for: HTTPRequests=%d", disc.HTTPRequests)
+	}
+}
 
-	// Test preflight probing: when port is in standard app range (8000-8999),
-	// discovery should probe sibling management ports and count those requests.
-	// Note: actual preflight attempt depends on test environment's network.
-	// At minimum, we verify port 8080 is considered a standard app port.
-	target.Port = 8080
-	baselineRequests := 2 // root + 404 are always made
+// TestDiscoveryJBossPreflightIgnoresPlain401 locks in the ManagementRealm-only
+// rule: a sibling 9990 that returns a generic 401 (an unrelated Basic/Digest
+// login, no ManagementRealm) must NOT route jbosswildfly. This is what keeps
+// preflight from dragging the checker onto every service with an auth-gated 9990.
+func TestDiscoveryJBossPreflightIgnoresPlain401(t *testing.T) {
+	target, err := model.ParseTarget("http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("ParseTarget failed: %v", err)
+	}
+	probe := portKeyedProbe{mgmt: map[int]httpx.Response{
+		9990: {StatusCode: 401, Headers: canonHeaders(map[string]string{"WWW-Authenticate": `Basic realm="Login"`})},
+		9993: {StatusCode: 401, Headers: canonHeaders(map[string]string{"WWW-Authenticate": `Basic realm="Login"`})},
+	}}
 
-	disc = Discover(context.Background(), client, target)
+	disc := Discover(context.Background(), probe, target)
 
-	// Preflight probes sibling 9990/9993 even if they fail (unreachable).
-	// HTTPRequests should be >= baseline + attempted preflight probes.
-	// With 8080 being in [8000-8999], at least some preflight attempts should occur.
-	minExpected := baselineRequests
-	if disc.HTTPRequests < minExpected {
-		t.Errorf("HTTPRequests for port 8080 should be >= %d (baseline %d + preflight attempts), got %d",
-			minExpected, baselineRequests, disc.HTTPRequests)
+	if disc.Products["jbosswildfly"] {
+		t.Error("a generic 401 (no ManagementRealm) on 9990/9993 must not route jbosswildfly")
 	}
 }
 

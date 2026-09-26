@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"strings"
 
+	"gopoc/checks/jbosswildfly"
 	"gopoc/internal/httpx"
 	"gopoc/internal/model"
 )
@@ -24,8 +25,9 @@ type Discovery struct {
 
 // Discover probes the target and returns candidate products. It makes at most
 // two baseline HTTP GETs (root + 404), then conditional HTTP GETs: up to two for
-// JBoss management preflight (9990, 9993), and up to one for GitLab sign_in fallback.
-// Only when the response hints WebLogic, one T3 handshake.
+// the JBoss sibling-management preflight (9990/9993, sharing one short deadline),
+// and up to one for the GitLab sign_in fallback. Only when the response hints
+// WebLogic, one T3 handshake.
 func Discover(ctx context.Context, client httpx.Probe, target model.Target) Discovery {
 	d := Discovery{Products: map[string]bool{}}
 	add := func(p string) { d.Products[p] = true }
@@ -117,48 +119,24 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 	if target.Port == 9990 || target.Port == 9993 {
 		add("jbosswildfly")
 	}
-	// Preflight: when app port has no JBoss markers, probe sibling management port.
-	// Real topology: app:8080 (business page) + management:9990/9993 (WildFly).
-	// Only probe standard app ports (80, 443, 8000-8999) to avoid noisy probes
-	// against unrelated services. 9990=HTTP, 9993=HTTPS (correct protocols).
-	isStandardAppPort := (target.Port == 80 || target.Port == 443 ||
-		(target.Port >= 8000 && target.Port <= 8999))
-
+	// Preflight: when the app port shows no JBoss/WildFly markers, the real
+	// management interface may still be a sibling listener on the same host
+	// (the common topology: business app on 8080, management on 9990/9993).
+	// Delegate to the checker's own management-discovery hint so discovery and
+	// the checker share one definition of "this is the management interface"
+	// (a ManagementRealm auth challenge or unauthenticated DMR data — never just
+	// any 401). Only do this for standard app ports, and the hint self-bounds its
+	// total latency, so ordinary web targets stay cheap even behind a DROP
+	// firewall. Every probe is accounted for, including policy-blocked ones.
+	isStandardAppPort := target.Port == 80 || target.Port == 443 ||
+		(target.Port >= 8000 && target.Port <= 8999)
 	if !strings.Contains(body, "jboss") && !strings.Contains(body, "wildfly") &&
 		target.Port != 9990 && target.Port != 9993 && isStandardAppPort {
-
-		candidates := []struct {
-			port   int
-			scheme string
-		}{
-			{9990, "http"},
-			{9993, "https"},
-		}
-
-		for _, candidate := range candidates {
-			mgmtTarget := target
-			mgmtTarget.Port = candidate.port
-			mgmtTarget.Scheme = candidate.scheme
-
-			mgmtResp, err := client.Get(ctx, mgmtTarget, "/management")
-			d.HTTPRequests++
-
-			if err != nil {
-				continue
-			}
-
-			// Check for management interface signatures
-			if mgmtResp.StatusCode >= 200 && mgmtResp.StatusCode < 300 {
-				body := strings.ToLower(string(mgmtResp.Body))
-				if strings.Contains(body, "managementrealm") || strings.Contains(body, "dmr") || strings.Contains(body, "wildfly") {
-					add("jbosswildfly")
-					break
-				}
-			} else if mgmtResp.StatusCode == 401 {
-				// 401 with basic auth challenge is typical for management interface
-				add("jbosswildfly")
-				break
-			}
+		hit, obs := jbosswildfly.ManagementDiscoveryHint(ctx, client, target)
+		d.HTTPRequests += len(obs)
+		d.Observations = append(d.Observations, obs...)
+		if hit {
+			add("jbosswildfly")
 		}
 	}
 	if hasHeader("MicrosoftSharePointTeamServices") || hasHeader("X-SharePointHealthScore") || strings.Contains(body, "/_layouts/15/") {

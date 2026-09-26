@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopoc/internal/httpx"
 	"gopoc/internal/model"
@@ -12,6 +13,12 @@ import (
 // managementPath is the HTTP management API root on both WildFly 8+/EAP 7+
 // and legacy JBoss AS 7/EAP 6.
 const managementPath = "/management"
+
+// discoveryBudget bounds the TOTAL wall-clock cost of the sibling-management
+// preflight that Discover() runs against ordinary web targets. Management ports
+// that are firewalled with DROP (not RST) would otherwise each cost a full
+// httpx timeout; capping the whole preflight keeps low-noise discovery cheap.
+const discoveryBudget = 1 * time.Second
 
 // managementPorts are the conventional ports for the HTTP management
 // interface, tried on the scanned host in addition to the target's own port.
@@ -122,4 +129,44 @@ func unauthenticatedData(r httpx.Response) bool {
 		return false
 	}
 	return strings.Contains(body, `"management-major-version"`) || strings.Contains(body, `"outcome"`)
+}
+
+// ManagementDiscoveryHint is the low-cost routing hint Discover() uses when an
+// ordinary web target shows no JBoss/WildFly markers on its own port: it probes
+// the conventional management ports on the SAME host and reports whether one
+// answers with a definitive management signal. It reuses the checker's own
+// requiresAuth / unauthenticatedData predicates — the single source of truth for
+// "this is the WildFly management interface" — so discovery never routes on a
+// weaker rule (e.g. any 401) than the checker verifies with, and the two can
+// never drift apart. The whole preflight shares one short deadline so a
+// DROP-firewalled port cannot stall discovery, and every probe (success, miss,
+// or policy-blocked error) is returned as an Observation so the caller can both
+// account for the request and tell "no management here" apart from "policy
+// blocked the probe". Returns whether a management interface was seen and the
+// per-probe observations (also the exact count of HTTP requests made).
+func ManagementDiscoveryHint(ctx context.Context, client httpx.Probe, target model.Target) (bool, []model.Observation) {
+	ctx, cancel := context.WithTimeout(ctx, discoveryBudget)
+	defer cancel()
+
+	var obs []model.Observation
+	hit := false
+	for _, port := range managementPorts {
+		if port == target.Port {
+			continue // the caller has already fetched the app port itself
+		}
+		cand := target
+		cand.Port = port
+		r, err := client.Get(ctx, cand, managementPath)
+		o := r.Observation("discover_management", err)
+		o.URL = cand.Origin() + managementPath
+		obs = append(obs, o)
+		if err != nil {
+			continue
+		}
+		if requiresAuth(r) || unauthenticatedData(r) {
+			hit = true
+			break
+		}
+	}
+	return hit, obs
 }
