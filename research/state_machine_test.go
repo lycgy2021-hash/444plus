@@ -3,16 +3,17 @@ package research
 import (
 	"testing"
 	"time"
+
+	"gopoc/internal/actionauth"
 )
 
 // This file tests only the PURE functions/values the S10 contract defines
 // (ExplorationScope.Hash, ExplorationBudget.Valid, Recovered,
-// StateTransition.ScopeConsistent) and the structural guarantee that BoundAction/
-// BoundRecovery cannot be given a meaningful identity from outside a (not yet
-// existing) policy constructor. There is no explorer, no registry, and no
-// execution logic to test yet — that is the point of a contract-only stage.
-// These tests exist so the contract's own value-level guarantees are pinned
-// before any implementation is built on top of them.
+// StateTransition.ScopeConsistent, StateFingerprint's immutability). There is
+// no explorer, no registry, and no execution logic to test yet — that is the
+// point of a contract-only stage. These tests exist so the contract's own
+// value-level guarantees are pinned before any implementation is built on top
+// of them.
 
 func TestExplorationScopeHashSeparatesDimensions(t *testing.T) {
 	base := ExplorationScope{TargetID: "t", BuildID: "b1", SessionID: "s1", Protocol: "http", HarnessID: "h1"}
@@ -74,53 +75,111 @@ func TestExplorationBudgetValidRequiresEveryFieldStrictlyPositive(t *testing.T) 
 	}
 }
 
-// BoundAction/BoundRecovery must never be constructible with a meaningful
-// identity from outside a (not yet existing) policy constructor. Since the
-// identity field is unexported, this package (the only place that COULD try) can
-// only ever produce a zero-value one — proving there is currently no path, even
-// in-package, to a BoundAction/BoundRecovery that resolves to a real registry
-// entry.
-func TestBoundActionAndRecoveryHaveNoRealConstructor(t *testing.T) {
-	var a BoundAction
-	if a != (BoundAction{}) {
-		t.Fatal("a BoundAction must be the zero value until an ActionPolicy exists")
+// BoundAction/BoundRecovery now live in a SEPARATE package (internal/actionauth)
+// specifically so this is enforced by the Go compiler, not by convention within
+// one package: there is no identifier this file could even write to construct
+// one with a real identity — actionauth.BoundAction{id: ...} would not compile
+// here, because `id` is unexported in actionauth and this file is in package
+// research. The only value reachable from here is the zero value.
+func TestBoundActionAndRecoveryAreOpaqueFromResearch(t *testing.T) {
+	var a actionauth.BoundAction
+	if a != (actionauth.BoundAction{}) {
+		t.Fatal("a BoundAction must be the zero value until actionauth's own ActionPolicy exists")
 	}
-	var r BoundRecovery
-	if r != (BoundRecovery{}) {
-		t.Fatal("a BoundRecovery must be the zero value until a recovery policy exists")
+	var r actionauth.BoundRecovery
+	if r != (actionauth.BoundRecovery{}) {
+		t.Fatal("a BoundRecovery must be the zero value until actionauth's own recovery policy exists")
 	}
-	// A StateTransition can therefore only ever reference a zero-value (inert)
-	// BoundAction today — there is no way, anywhere in this package, to build one
-	// that would resolve to a real registered action.
+	// A StateTransition can therefore only ever reference an inert BoundAction
+	// today — there is no way, from package research, to build one that would
+	// resolve to a real registered action.
 	tr := StateTransition{Action: a}
-	if tr.Action != (BoundAction{}) {
+	if tr.Action != (actionauth.BoundAction{}) {
 		t.Fatal("StateTransition.Action must still be inert with no policy implemented")
 	}
 }
 
-// ActionSuggestion (what AI may offer) and ActionID (what it names) are freely
-// constructible — they are advisory and grant nothing. This is the intended
-// asymmetry: advisory shapes are open, execution credentials are closed.
+// ActionSuggestion (what AI may offer) and actionauth.ActionID (what it names)
+// are freely constructible — they are advisory and grant nothing. This is the
+// intended asymmetry: advisory shapes are open, execution credentials are
+// closed (and, unlike the credentials, live in a different package on purpose).
 func TestActionSuggestionIsFreelyConstructibleAndAdvisoryOnly(t *testing.T) {
-	s := ActionSuggestion{ActionID: ActionID{RegistryKey: "http-probe", VariantID: "v1"}, Rationale: "looks worth trying"}
+	s := ActionSuggestion{ActionID: actionauth.ActionID{RegistryKey: "http-probe", VariantID: "v1"}, Rationale: "looks worth trying"}
 	if s.ActionID.RegistryKey != "http-probe" {
 		t.Fatalf("ActionSuggestion should be a plain, freely constructible value: %+v", s)
 	}
-	// Critically: there is no function anywhere in this package that turns an
-	// ActionSuggestion or a bare ActionID into a BoundAction. That absence is the
-	// guarantee — this test documents the intended asymmetry, not a runtime check
-	// (there is nothing to call that would even compile into a real BoundAction).
+	// Critically: there is no function anywhere that turns an ActionSuggestion or
+	// a bare ActionID into a BoundAction. That absence is the guarantee.
 }
 
-func TestRecoveredIsFactOnlyExactMatch(t *testing.T) {
+func TestStateFingerprintIsImmutable(t *testing.T) {
+	facts := map[string]string{"role": "user"}
+	fp := NewStateFingerprint("scope-1", "raw-hash", "fp-hash", facts)
+
+	// Mutating the caller's original map after construction must not affect the
+	// fingerprint (facts were copied in).
+	facts["role"] = "admin"
+	if fp.Facts()["role"] != "user" {
+		t.Fatalf("fingerprint must not be affected by mutating the caller's original map, got %v", fp.Facts())
+	}
+
+	// Mutating the map RETURNED by Facts() must not affect the fingerprint either
+	// (the getter returns a copy) — this is the tamper path that would have
+	// desynchronized Facts from StateFingerprintHash.
+	got := fp.Facts()
+	got["role"] = "admin"
+	got["injected"] = "true"
+	if fp.Facts()["role"] != "user" || len(fp.Facts()) != 1 {
+		t.Fatalf("Facts() must return a fresh copy each call, got %v after mutating a prior copy", fp.Facts())
+	}
+
+	if fp.ScopeHash() != "scope-1" || fp.RawStateArtifactHash() != "raw-hash" || fp.StateFingerprintHash() != "fp-hash" {
+		t.Fatalf("getters did not return constructed values: %+v", fp)
+	}
+}
+
+func TestRecoveredRequiresSameScopeAndSameFingerprint(t *testing.T) {
+	fpIn := func(scope, hash string) StateFingerprint { return NewStateFingerprint(scope, "raw", hash, nil) }
 	cases := []struct {
 		name string
 		o    RecoveryOutcome
 		want bool
 	}{
-		{"exact_match", RecoveryOutcome{BaselineFingerprint: "abc", ResultFingerprint: "abc"}, true},
-		{"mismatch", RecoveryOutcome{BaselineFingerprint: "abc", ResultFingerprint: "def"}, false},
-		{"empty_baseline_never_recovered", RecoveryOutcome{BaselineFingerprint: "", ResultFingerprint: ""}, false},
+		{
+			name: "same_scope_same_fingerprint",
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s1", "abc"), Result: fpIn("s1", "abc")},
+			want: true,
+		},
+		{
+			name: "same_scope_different_fingerprint",
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s1", "abc"), Result: fpIn("s1", "def")},
+			want: false,
+		},
+		{
+			// The critical case this round's audit exists for: two fingerprints
+			// whose hash strings happen to match, but neither actually belongs to
+			// the outcome's own declared scope (e.g. after crossing a disk/replay/
+			// worker boundary and being paired with the wrong scope). A bare string
+			// comparison of the hashes alone would wrongly call this recovered.
+			name: "matching_hash_but_wrong_scope",
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s2", "abc"), Result: fpIn("s3", "abc")},
+			want: false,
+		},
+		{
+			name: "baseline_scope_mismatch_only",
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s2", "abc"), Result: fpIn("s1", "abc")},
+			want: false,
+		},
+		{
+			name: "empty_outcome_scope",
+			o:    RecoveryOutcome{ScopeHash: "", Baseline: fpIn("", "abc"), Result: fpIn("", "abc")},
+			want: false,
+		},
+		{
+			name: "empty_baseline_hash_never_recovered",
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s1", ""), Result: fpIn("s1", "")},
+			want: false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,25 +190,27 @@ func TestRecoveredIsFactOnlyExactMatch(t *testing.T) {
 	}
 	// RecoveryOutcome has no field a recovery implementation could set to declare
 	// success directly — Recovered is the only path, and it is a pure function of
-	// the two fingerprint strings, never a stored conclusion.
+	// the recorded fingerprints (including their own scope), never a stored
+	// conclusion.
 }
 
 func TestStateTransitionScopeConsistent(t *testing.T) {
+	fp := func(scope string) StateFingerprint { return NewStateFingerprint(scope, "raw", "hash", nil) }
 	consistent := StateTransition{
 		ScopeHash:         "scope-1",
-		BeforeFingerprint: StateFingerprint{ScopeHash: "scope-1"},
-		AfterFingerprint:  StateFingerprint{ScopeHash: "scope-1"},
+		BeforeFingerprint: fp("scope-1"),
+		AfterFingerprint:  fp("scope-1"),
 	}
 	if !consistent.ScopeConsistent() {
 		t.Fatal("matching scope hashes must be consistent")
 	}
 	inconsistentBefore := consistent
-	inconsistentBefore.BeforeFingerprint.ScopeHash = "scope-2"
+	inconsistentBefore.BeforeFingerprint = fp("scope-2")
 	if inconsistentBefore.ScopeConsistent() {
 		t.Fatal("a mismatched BeforeFingerprint scope must be inconsistent")
 	}
 	inconsistentAfter := consistent
-	inconsistentAfter.AfterFingerprint.ScopeHash = "scope-2"
+	inconsistentAfter.AfterFingerprint = fp("scope-2")
 	if inconsistentAfter.ScopeConsistent() {
 		t.Fatal("a mismatched AfterFingerprint scope must be inconsistent")
 	}

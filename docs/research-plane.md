@@ -267,65 +267,91 @@ the guarantees hold under test:
   `RawInputHash = caseArtifactHash` (lossless) distinct from `comparisonHash`
   (denoised); malformed-case guards.
 - **S10 (state-machine explorer): DESIGN CONTRACT ONLY, still under audit**
-  (`research/state_machine.go`) — no explorer, no registry, no `ActionPolicy`, no
-  execution logic, no `Origin` kind yet. Eight boundaries are locked into the
-  TYPE SHAPES themselves (not left to comments alone), because a boundary a
-  later change can route around by adding one field is not a boundary:
+  (`research/state_machine.go` + `internal/actionauth/capability.go`) — no
+  explorer, no registry, no `ActionPolicy`, no execution logic, no `Origin` kind
+  yet. Nine boundaries are locked into the TYPE SHAPES themselves — and, for the
+  most important one, into a PACKAGE boundary — not left to comments alone,
+  because a boundary a later change can route around by adding one field, or one
+  file to the same package, is not a boundary:
   1. **No executable content anywhere.** `ActionID{RegistryKey, VariantID}` and
      `RecoveryPlanRef{RegistryKey}` are opaque lookups — there is no Method, URL,
-     Headers, Body, or Command field in this file. `RegisteredAction.Reversible`
+     Headers, Body, or Command field in either file. `RegisteredAction.Reversible`
      is registry metadata, declared once by the registering code — not a field
      any instance, candidate, or AI output can set.
   2. **An AI-supplied `ActionID` is never itself an execution credential** — the
      same "AI is not authority" bypass as S9's `ExpectationSource`, moved from
      judgment to execution: letting AI pick WHICH pre-registered action runs is
      functionally the same as letting it write the request, one indirection
-     removed. `ActionSuggestion{ActionID, Rationale}` is the ADVISORY shape AI
-     output may take — freely constructible, authorizes nothing. Only a
-     `BoundAction` may ever be executed, and its identity field is unexported
-     with **no constructor anywhere yet** — not in this file, not elsewhere in
-     this package — so only an inert, zero-value `BoundAction` can be produced
-     today; the future `ActionPolicy` is the sole place a constructor is ever
-     added, selecting a `BoundAction` from a registry's `AllowedActions(scope,
-     state)`, taking a suggestion at most as advisory input. Recovery gets the
-     identical split (`RecoveryPlanRef` / `BoundRecovery`).
-  3. **Raw evidence vs identity, never conflated** (the S8/S9 discipline again):
+     removed. `research.ActionSuggestion{ActionID, Rationale}` is the ADVISORY
+     shape AI output may take — freely constructible, authorizes nothing. Only a
+     `BoundAction` may ever be executed.
+  3. **The capability boundary is a PACKAGE boundary, not merely an unexported
+     field in one package.** `BoundAction`/`BoundRecovery` moved to their own
+     package, `internal/actionauth` — separate from `research` — specifically so
+     Go's compiler stops any file `research` will ever contain (a future
+     Explorer, AI-glue code, a candidate producer, all inevitably living in
+     `research`) from constructing one with a real identity. An unexported field
+     inside `research` alone would only have stopped *other* packages; it would
+     not have survived `research` itself growing an Explorer in a sibling file,
+     since Go visibility is package-scoped, not file-scoped. Today, from
+     anywhere, only the zero-value (inert, resolves to nothing) `BoundAction`/
+     `BoundRecovery` exists — no constructor exists yet, anywhere, including
+     inside `actionauth` itself. The future `ActionPolicy`, implemented IN
+     `actionauth`, is the sole place a constructor is ever added: it alone
+     selects a `BoundAction` from a registry's `AllowedActions(scope, state)`,
+     taking a `research.ActionSuggestion` at most as advisory input to weigh.
+     Recovery gets the identical split (`RecoveryPlanRef` / `BoundRecovery`).
+  4. **Raw evidence vs identity, never conflated** (the S8/S9 discipline again):
      `StateFingerprint` splits `RawStateArtifactHash` (the actual collected
      artifact, undenoised) from `StateFingerprintHash` (the denoised projection
-     state-equality is judged on) — and now carries **its own `ScopeHash`**, so a
+     state-equality is judged on) — and carries **its own `ScopeHash`**, so a
      fingerprint is self-describing wherever it travels (disk, replay, a
-     different worker) instead of depending on external context to know which
-     target/build/session/protocol/harness produced it.
+     different worker) instead of depending on external context.
+  5. **`StateFingerprint` is immutable once constructed** (mirroring
+     `Candidate`/`Evidence`'s `Provenance` privacy elsewhere in this package):
+     every field is unexported, `NewStateFingerprint` copies its `Facts` input,
+     and every getter (`ScopeHash()`/`RawStateArtifactHash()`/
+     `StateFingerprintHash()`/`Facts()`) returns a copy. This closes a real
+     tamper path: a mutable `Facts map[string]string` field could otherwise be
+     edited after construction without `StateFingerprintHash` changing to match,
+     desynchronizing "the hash of the facts" from the facts themselves.
      `StateTransition.ScopeConsistent()` recomputes (never stores) whether a
      transition's own `ScopeHash` agrees with both fingerprints it references.
-  4. **Recovery is registry-backed (boundary 2) and `RecoveryOutcome` is FACTS
+  6. **Recovery is registry-backed (boundary 3) and `RecoveryOutcome` is FACTS
      ONLY** — no `Verified`/conclusion field a recovery implementation could
-     simply set to `true`. `Recovered(o)` is the separate, pure function that
-     decides from the recorded fingerprints (v1: exact match against baseline);
+     simply set to `true`. It holds the FULL `Baseline`/`Result`
+     `StateFingerprint` (not bare hash strings), and `Recovered(o)` — the
+     separate, pure function that alone may declare success — checks BOTH that
+     baseline and result actually belong to the outcome's own declared
+     `ScopeHash` AND that their `StateFingerprintHash` values match. This proves
+     "same scope AND same state", not merely "two strings happened to be equal":
+     two fingerprints from genuinely different scopes could otherwise share a
+     hash string by coincidence, especially after crossing a disk/replay/worker
+     boundary, and a bare string comparison would wrongly call that recovered.
      `Recovered==false` means exploration STOPS, never continues on the
      assumption a rollback worked.
-  5. **`StateTransition` carries facts only** — no `Unexpected`/`Vulnerable`/
+  7. **`StateTransition` carries facts only** — no `Unexpected`/`Vulnerable`/
      `Severity`/`State` field, exactly like `Observation`/`DiffAnomaly`
-     elsewhere. `Action` is a `BoundAction` (boundary 2) — a transition can only
-     ever reference something that WAS actually authorized and executed, never a
-     bare `ActionID` or an AI's `ActionSuggestion`. Whether a transition is worth
-     a hypothesis is a future producer's judgment against an authoritative
-     `ExpectationSource` (boundary 8). `TransitionArtifactHash` is the lossless
-     record hash (the S9 `caseArtifactHash` analogue) — never the denoised
-     `StateFingerprintHash`.
-  6. **No "0 = unlimited" in `ExplorationBudget`**, unlike `ai.Budget` (where
+     elsewhere. `Action` is a `BoundAction` (boundary 2/3) — a transition can
+     only ever reference something that WAS actually authorized and executed,
+     never a bare `ActionID` or an AI's `ActionSuggestion`. Whether a transition
+     is worth a hypothesis is a future producer's judgment against an
+     authoritative `ExpectationSource` (boundary 9). `TransitionArtifactHash` is
+     the lossless record hash (the S9 `caseArtifactHash` analogue) — never the
+     denoised `StateFingerprintHash`.
+  8. **No "0 = unlimited" in `ExplorationBudget`**, unlike `ai.Budget` (where
      unlimited is a cost tradeoff for a free local model). Every one of
      `MaxStates/MaxTransitions/MaxDepth/MaxRequests/MaxVisitsPerState/
      MaxBranching/MaxWallTime` must be strictly positive or `Valid()` reports the
      whole budget invalid.
-  7. **Single-session, serial v1** — the one rule with no corresponding type,
-     since it constrains execution behavior rather than data shape: within one
-     `ExplorationScope`, at most one in-flight action at a time, so "which
-     action produced this `AfterFingerprint`" is never ambiguous. Recorded here
-     for the eventual Explorer to honor.
-  8. **No second authority system.** Whatever future producer judges a
-     `StateTransition` worth a hypothesis reuses S9's `ExpectationSource`
-     unchanged — S10 invents no parallel "who defines correct behavior".
+  9. **No second authority system, and single-session-serial v1.** Whatever
+     future producer judges a `StateTransition` worth a hypothesis reuses S9's
+     `ExpectationSource` unchanged — S10 invents no parallel "who defines
+     correct behavior". Separately (no corresponding type, since it constrains
+     execution behavior rather than data shape): within one `ExplorationScope`,
+     v1 is single-session and serial — at most one in-flight action at a time,
+     so "which action produced this `AfterFingerprint`" is never ambiguous.
+     Recorded here for the eventual Explorer to honor.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
 
