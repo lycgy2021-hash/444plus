@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"gopoc/internal/actionauth"
+	"gopoc/internal/model"
 	"gopoc/internal/stateauth"
 )
 
@@ -182,6 +184,64 @@ func NewStateMachineReplayValidator(
 // Name identifies this validator in ValidationResult.Validator and in
 // Candidate.History after a future Engine promotion.
 func (v *StateMachineReplayValidator) Name() string { return "state_machine_replay_v1" }
+
+// Supports implements research.Validator (S10/E8 — Integration Seal): a
+// pure, no-I/O check for exactly the one Origin this validator ever knows
+// how to replay. Everything about WHETHER and HOW to test the candidate
+// still lives inside Replay itself; Supports only decides whether this
+// validator is even the right one to ask — the same job Supports plays for
+// every other Validator in this package (e.g. HTTPDifferentialValidator).
+func (v *StateMachineReplayValidator) Supports(c *Candidate) bool {
+	return c != nil && c.Origin.Kind == OriginStateMachine
+}
+
+// replaySessionSeq is a process-wide counter feeding freshReplaySessionID —
+// see that function's own doc for why a counter, not a clock alone, is
+// required.
+var replaySessionSeq int64
+
+// freshReplaySessionID mints a sessionID guaranteed unique within this
+// process: a monotonic counter (via atomic.AddInt64, so concurrent
+// Engine.Validate calls across multiple candidates can never collide) plus
+// a timestamp for human readability. This is the ONLY thing Validate
+// (below) ever needs to invent — Replay's own contract already requires
+// nothing else about the session beyond "freshly chosen, never the
+// original".
+func freshReplaySessionID() string {
+	seq := atomic.AddInt64(&replaySessionSeq, 1)
+	return fmt.Sprintf("replay-%d-%d", time.Now().UTC().UnixNano(), seq)
+}
+
+// Validate implements research.Validator, wiring Replay (this file's own,
+// already-frozen S10/E7 contract) into the Engine's existing generic
+// Validate/shouldPromote/Promote pipeline (research/validator.go) — S10/E8,
+// the Integration Seal. This is deliberately NOT a new authority layer: it
+// adds nothing Replay doesn't already do, checks nothing Replay doesn't
+// already check, and grants nothing beyond what Replay's own contract
+// already grants. It exists solely because the Engine's Validator interface
+// takes (ctx, model.Target, *Candidate) while Replay takes (ctx, *Candidate,
+// sessionID) — the only translation needed is minting a fresh sessionID.
+//
+// target is deliberately UNUSED: v's own ReplayTarget (TargetID/BuildID/
+// Protocol/HarnessID), fixed at NewStateMachineReplayValidator's
+// construction, remains the SOLE authority for what is replayed against —
+// exactly as Replay's own contract requires. A caller-supplied model.Target
+// is never substituted for it, for the identical reason Replay itself never
+// lets a Candidate's own claims override v.target: accepting a caller-
+// supplied target here would silently reopen the "same target, never a
+// substituted one" guarantee S10/E7 already closed.
+//
+// Every existing Replay guarantee carries through unchanged: a rejection
+// (authority mismatch, missing binding, budget/timeout, insufficient
+// evidence) is returned as an error, which Engine.Validate treats as "this
+// validator contributed no facts" and moves on — never a promotion, exactly
+// as if Replay had been called directly. Only a genuine OutcomeReproduced,
+// with Evidence satisfying the Candidate's own RequiredEvidence, ever
+// reaches Engine.shouldPromote — and Promote itself, not this method, is
+// what actually advances Candidate.State.
+func (v *StateMachineReplayValidator) Validate(ctx context.Context, _ model.Target, c *Candidate) (ValidationResult, error) {
+	return v.Replay(ctx, c, freshReplaySessionID())
+}
 
 // Sentinel errors for Replay's precondition/authority checks — all of them
 // caller-usage or Candidate-shape errors, distinct from a runtime I/O

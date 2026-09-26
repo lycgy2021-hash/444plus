@@ -1395,27 +1395,92 @@ the guarantees hold under test:
     `assessment=violated`, and the replay's own `replay_case_artifact_hash`
     — every one of them read from the FRESH `BoundAction`/`Fingerprint`s
     this Replay attempt itself produced, never from the original
-    Candidate's own recorded copies. The next stage — wiring
-    `OutcomeReproduced` and its fresh Evidence into the Engine's existing
-    `shouldPromote`/`Promote` pipeline to complete `hypothesis → independent
-    replay → reproducible` — is deliberately NOT part of this pass; no
-    further expansion of Replay's own architecture is needed to get there.
+    Candidate's own recorded copies.
+- **actionauth constructor hardening (found while reading the frozen S10-E7
+  code end-to-end, before wiring the Engine): `actionauth.NewRegistry`
+  silently let a later `Registration` overwrite an earlier one sharing the
+  same `Action.Key`** — the one remaining place in the S10 stack that did
+  NOT already fail closed on an ambiguous duplicate, unlike
+  `research.NewTransitionRuleRegistry`'s own duplicate-`RuleID` rejection.
+  Fixed: `NewRegistry` now returns `(*Registry, error)` and rejects two
+  Registrations sharing an `Action.Key`, exactly mirroring
+  `NewTransitionRuleRegistry`'s discipline. `TestNewRegistryRejectsDuplicateActionKey`
+  proves the rejection. Every call site across `internal/actionauth` and
+  `research`'s test suite was updated to handle the new error return (via a
+  `mustRegistry`/`mustActionRegistry`/`mustReg` test helper in each affected
+  file, matching the existing `e6MustRegistry` pattern) — this changed no
+  production code path, since no non-test code in the repo called
+  `NewRegistry` directly.
+- **S10-E8 (`research/state_machine_replay.go` — `Supports`/`Validate` — and
+  `research/state_machine_seal_test.go`): the Integration Seal.** With
+  `S10-E7 = FROZEN`, the only remaining step to complete `hypothesis →
+  independent replay → reproducible` was wiring `OutcomeReproduced` and its
+  fresh Evidence into the EXISTING, already-frozen `Engine.Validate`/
+  `shouldPromote`/`Promote` pipeline (`research/validator.go`, S5 —
+  unchanged by this stage) — deliberately NOT a new authority layer, and NOT
+  a new pipeline: the Engine already promotes any `Validator` whose
+  `Validate` returns `OutcomeReproduced` with Evidence satisfying the
+  Candidate's own `RequiredEvidence`, exactly the same generic mechanism
+  every other producer (S6/S8/S9) already rides. The only gap was shape:
+  `Engine.Validate` calls `Validator.Validate(ctx, model.Target, *Candidate)`,
+  while `Replay` takes `(ctx, *Candidate, sessionID)`. Two new methods on
+  `*StateMachineReplayValidator` close that gap and nothing else:
+  - `Supports(c *Candidate) bool` — a pure, no-I/O check for exactly
+    `OriginStateMachine`, the same job `Supports` plays for every other
+    `Validator` in this package.
+  - `Validate(ctx, _ model.Target, c *Candidate) (ValidationResult, error)`
+    — mints a fresh, never-reused `sessionID` (`freshReplaySessionID`: a
+    process-wide `atomic.AddInt64` counter plus a timestamp, safe under
+    concurrent `Engine.Validate` calls) and delegates ENTIRELY to `Replay`.
+    The caller-supplied `model.Target` is deliberately unused: `v.target`
+    (fixed at construction) remains the sole authority for what is replayed
+    against, for the identical reason `Replay` itself never lets a
+    Candidate's own claims override it — accepting a caller-supplied target
+    here would silently reopen the "same target, never a substituted one"
+    guarantee S10/E7 already closed.
+
+  Every S10/E7 guarantee carries through completely unchanged: a rejection
+  (authority mismatch, missing binding, budget/timeout, insufficient
+  evidence) surfaces as an `error`, which `Engine.Validate` already treats
+  as "this validator contributed no facts" and moves on — never a
+  promotion, exactly as calling `Replay` directly would produce. Nothing in
+  `research/validator.go` was touched; nothing about WHICH rule, WHICH
+  action, `PolicyID`, `SpecID`, `ActionStrictReadOnly`, or fresh-session
+  identity was re-decided anywhere — `shouldPromote`/`Promote` never see
+  any of that, only the `Outcome` and `Evidence` `Replay` already produced.
+  `TestS10E8HypothesisReachesReproducibleThroughTheRealEngine` is the core
+  proof: a real `OriginStateMachine` Candidate, produced by the real E6
+  pipeline against a real HTTP transition, handed to a completely generic
+  `*Engine` wired with nothing but this one validator, reaches
+  `Candidate.State == Reproducible` with a `History` entry attributed to
+  `state_machine_replay_v1` and non-empty `EvidenceRefs` — proven WITHOUT
+  any S10/E7/E8-specific code inside `Engine.Validate` itself.
+  `TestS10E8DoesNotPromoteWhenReplayFindsNothing` and
+  `TestS10E8DoesNotPromoteWhenReplayIsRejectedBeforeAnyIO` prove the negative
+  half (a satisfied replay, and an authority rejection, both leave the
+  Candidate at exactly `Hypothesis`); `TestS10E8ValidatorSupportsOnlyStateMachineOrigin`
+  proves `Supports`'s own Origin check. All four pass, on the real E6→E7
+  pipeline, no mocks. **`S10-E8 = SEALED`**: `hypothesis → independent replay
+  → reproducible` is now a real, tested, end-to-end path through production
+  code, not merely a documented intent.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
-  Wiring S10-E7's `ValidationResult` into the Engine's existing promotion
-  pipeline, and any future state-preparation capability, are both deferred —
-  each needs its own explicit, separately reviewed design.
+  Any future state-preparation capability remains deferred — it needs its
+  own explicit, separately reviewed design, exactly as S10/E7's own doc
+  already states.
 
 Four independent unknown-issue sources now feed the plane: **patch difference
 (S6), crash behavior (S8), runtime differential (S9), state-machine transition
 (S10/E6)** — all deterministic producers on the one
-`Producer → Candidate → Validator → Engine` spine. S10/E6+E7 together are the
-first of the four to run a hypothesis all the way to an independently
-reproduced result: `Explorer → StateTransition → TransitionRule →
+`Producer → Candidate → Validator → Engine` spine. S10/E6+E7+E8 together are
+the first of the four to run a hypothesis all the way to an independently
+reproduced, ACTUALLY PROMOTED result, through the same generic Engine every
+other source rides: `Explorer → StateTransition → TransitionRule →
 Candidate(hypothesis) → Replay Validator(fresh session) →
-ValidationResult{reproduced}` — the AI stays a producer (or, later, an
+ValidationResult{reproduced} → Engine.shouldPromote → Promote →
+Candidate(reproducible)` — the AI stays a producer (or, later, an
 explainer positioned strictly AFTER this point), never the authority that
-decides reproduction.
+decides reproduction or promotion.
 
 Every source is a new `Origin.Kind` feeding the one spine
 `Producer → Candidate → Registered Validator → ValidationResult → Engine → state`.
