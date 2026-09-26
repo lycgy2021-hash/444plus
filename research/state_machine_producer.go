@@ -118,6 +118,42 @@ type TransitionRule struct {
 	ExpectationSource ExpectationSource
 }
 
+// ReplayTarget identifies WHAT is being explored/replayed against: the same
+// target/build/protocol/harness dimensions as ExplorationScope, but
+// DELIBERATELY WITHOUT SessionID. S10/E7's replay validator uses this to
+// prove a hypothesis holds under a genuinely INDEPENDENT session — not
+// merely "the same recorded session run twice" — while still requiring the
+// SAME real-world target/build/protocol/harness, never a substituted one.
+type ReplayTarget struct {
+	TargetID  string
+	BuildID   string
+	Protocol  string
+	HarnessID string
+}
+
+// Hash is a pure, deterministic, SESSION-INDEPENDENT identity for the
+// target. This is the value Produce records as Refs["replay_target_hash"]
+// (see transitionCaseArtifactHash and Produce below), and the value a
+// replay validator recomputes for its OWN configured target to confirm it
+// is replaying against the SAME target/build/protocol/harness the original
+// candidate came from.
+func (rt ReplayTarget) Hash() string {
+	return RawInputHash([]byte(rt.TargetID + "|" + rt.BuildID + "|" + rt.Protocol + "|" + rt.HarnessID))
+}
+
+// Scope builds the full ExplorationScope for a fresh session against rt:
+// rt's own identity fields, plus sessionID as the (deliberately fresh,
+// INDEPENDENT of the original) SessionID.
+func (rt ReplayTarget) Scope(sessionID string) ExplorationScope {
+	return ExplorationScope{TargetID: rt.TargetID, BuildID: rt.BuildID, SessionID: sessionID, Protocol: rt.Protocol, HarnessID: rt.HarnessID}
+}
+
+// replayTargetOf derives the SessionID-independent ReplayTarget identity
+// from a full ExplorationScope.
+func replayTargetOf(s ExplorationScope) ReplayTarget {
+	return ReplayTarget{TargetID: s.TargetID, BuildID: s.BuildID, Protocol: s.Protocol, HarnessID: s.HarnessID}
+}
+
 // transitionRuleKey is the exact (ActionID, ProjectorID) tuple a
 // TransitionRuleRegistry keys on. ActionID is two fields (RegistryKey,
 // VariantID), so both are part of the key — a rule for one VariantID of a
@@ -144,7 +180,8 @@ type transitionRuleKey struct {
 // incidental detail, because NewTransitionRuleRegistry refuses to build a
 // registry where a tie could ever arise.
 type TransitionRuleRegistry struct {
-	rules map[transitionRuleKey]TransitionRule
+	rules    map[transitionRuleKey]TransitionRule
+	byRuleID map[string]TransitionRule
 }
 
 // NewTransitionRuleRegistry builds a closed registry from a fixed list of
@@ -171,15 +208,14 @@ type TransitionRuleRegistry struct {
 //     rather than "whichever happened to be inserted last".
 func NewTransitionRuleRegistry(rules ...TransitionRule) (*TransitionRuleRegistry, error) {
 	m := make(map[transitionRuleKey]TransitionRule, len(rules))
-	seenRuleIDs := make(map[string]bool, len(rules))
+	byRuleID := make(map[string]TransitionRule, len(rules))
 	for _, r := range rules {
 		if r.RuleID == "" {
 			return nil, fmt.Errorf("research: TransitionRule has an empty RuleID (action=%+v, projector=%q)", r.ActionID, r.ProjectorID)
 		}
-		if seenRuleIDs[r.RuleID] {
+		if _, dup := byRuleID[r.RuleID]; dup {
 			return nil, fmt.Errorf("research: duplicate TransitionRule.RuleID %q", r.RuleID)
 		}
-		seenRuleIDs[r.RuleID] = true
 		if !r.ExpectationSource.authoritative() {
 			return nil, fmt.Errorf("research: TransitionRule %q has a non-authoritative ExpectationSource.Kind %q", r.RuleID, r.ExpectationSource.Kind)
 		}
@@ -192,8 +228,9 @@ func NewTransitionRuleRegistry(rules ...TransitionRule) (*TransitionRuleRegistry
 				r.ActionID, r.ProjectorID, existing.RuleID, r.RuleID)
 		}
 		m[key] = r
+		byRuleID[r.RuleID] = r
 	}
-	return &TransitionRuleRegistry{rules: m}, nil
+	return &TransitionRuleRegistry{rules: m, byRuleID: byRuleID}, nil
 }
 
 // valid reports whether e is a well-formed TransitionExpectation: a known
@@ -222,14 +259,38 @@ func (r *TransitionRuleRegistry) lookup(actionID actionauth.ActionID, projectorI
 	return rule, ok
 }
 
+// LookupByRuleID returns the ONE rule registered under ruleID, if any. This
+// is S10/E7's entry point into an ALREADY-TRUSTED registry: given a
+// Candidate's own Refs["rule_id"], resolve the rule it claims to come from
+// — never trusting any OTHER field the Candidate carries (its recorded
+// action/projector identity) as authoritative in itself; a caller must
+// cross-check those against the resolved rule's own ActionID/ProjectorID,
+// never use the Candidate's copies directly.
+func (r *TransitionRuleRegistry) LookupByRuleID(ruleID string) (TransitionRule, bool) {
+	if r == nil {
+		return TransitionRule{}, false
+	}
+	rule, ok := r.byRuleID[ruleID]
+	return rule, ok
+}
+
 // TransitionCase is the E6 producer's per-observation input: one observed
-// StateTransition (Explorer's own recorded output). It carries NO Expectation
-// or ExpectationSource of its own — what a transition is judged against is
+// StateTransition (Explorer's own recorded output), plus the exact
+// ExplorationScope it was collected under. It carries NO Expectation or
+// ExpectationSource of its own — what a transition is judged against is
 // resolved internally, by the producer's own TransitionRuleRegistry, from the
 // transition's actual Action and BeforeFingerprint.ProjectorID(). See
 // TransitionRule's own doc for the mismatch this closes.
+//
+// Scope is required (not merely a convenience) because StateTransition
+// itself carries only ScopeHash — an opaque, one-way hash with no
+// TargetID/BuildID/Protocol/HarnessID a later S10/E7 replay validator could
+// recover from it alone. validate() (below) verifies Scope actually IS the
+// scope that produced this ScopeHash — a caller cannot claim an arbitrary
+// Scope for a real transition and have it accepted.
 type TransitionCase struct {
 	Transition StateTransition
+	Scope      ExplorationScope
 }
 
 // resolvedTransitionCase pairs a TransitionCase with the ONE TransitionRule
@@ -239,6 +300,7 @@ type TransitionCase struct {
 // the bare TransitionCase.
 type resolvedTransitionCase struct {
 	Transition StateTransition
+	Scope      ExplorationScope
 	Rule       TransitionRule
 }
 
@@ -253,7 +315,7 @@ func (p *StateMachineProducer) resolve(c TransitionCase) (resolvedTransitionCase
 	if !ok {
 		return resolvedTransitionCase{}, false
 	}
-	return resolvedTransitionCase{Transition: c.Transition, Rule: rule}, true
+	return resolvedTransitionCase{Transition: c.Transition, Scope: c.Scope, Rule: rule}, true
 }
 
 // validate reports whether rc is well-formed and authorized enough to judge
@@ -266,17 +328,26 @@ func (p *StateMachineProducer) resolve(c TransitionCase) (resolvedTransitionCase
 // actionauth.BoundAction always fails ValidFor and so always fails here,
 // EVEN IF some rule happens to be registered under a matching ActionID), or
 // a transition whose two fingerprints were not produced by the SAME
-// projector the rule was registered against. Every one of these is ALSO
-// already enforced at registration time by NewTransitionRuleRegistry for
-// any rule that actually came from one — this re-checks them anyway,
-// independently, rather than trusting that every resolvedTransitionCase in
-// existence was necessarily built from a validated registry.
+// projector the rule was registered against, or a claimed Scope that does
+// not actually hash to the transition's own ScopeHash (closing the gap S10/
+// E7 would otherwise open: StateTransition itself carries no recoverable
+// TargetID/BuildID/Protocol/HarnessID, only an opaque ScopeHash — without
+// this check, a caller could pair a REAL transition with a FABRICATED Scope
+// and have Produce record a replay_target_hash for a target the transition
+// never actually ran against). Every one of these is ALSO already enforced
+// at registration time by NewTransitionRuleRegistry for any rule that
+// actually came from one — this re-checks them anyway, independently,
+// rather than trusting that every resolvedTransitionCase in existence was
+// necessarily built from a validated registry.
 func (rc resolvedTransitionCase) validate() bool {
 	if !rc.Rule.ExpectationSource.authoritative() {
 		return false
 	}
 	t := rc.Transition
 	if !t.ScopeConsistent() {
+		return false
+	}
+	if rc.Scope.Hash() != t.ScopeHash {
 		return false
 	}
 	if !t.Action.ValidFor(t.ScopeHash, t.BeforeFingerprint.StateFingerprintHash()) {
@@ -354,6 +425,18 @@ func (p *StateMachineProducer) Analyze(c TransitionCase) (TransitionAssessment, 
 	if !ok || !rc.validate() {
 		return TransitionInsufficientEvidence, nil
 	}
+	return analyzeExpectation(rc)
+}
+
+// analyzeExpectation dispatches to the per-Kind analyzer for an ALREADY
+// RESOLVED and ALREADY VALIDATED case. It is a package-level function (not
+// a StateMachineProducer method) specifically so S10/E7's replay validator
+// can call it directly on a FRESH resolvedTransitionCase it built itself
+// (its own fresh Fingerprints, paired with the SAME trusted TransitionRule
+// the original Candidate resolved to) — without needing a
+// StateMachineProducer instance, and without re-running resolve() against a
+// registry a second time for a rule it already has in hand.
+func analyzeExpectation(rc resolvedTransitionCase) (TransitionAssessment, []TransitionAnomaly) {
 	switch rc.Rule.Expectation.Kind {
 	case ExpectStateUnchanged:
 		return analyzeStateUnchanged(rc)
@@ -530,6 +613,13 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 			"expectation_kind":         string(rc.Rule.Expectation.Kind),
 			"action_registry_key":      action.RegistryKey,
 			"action_variant_id":        action.VariantID,
+			// projector_id and replay_target_hash exist for S10/E7's replay
+			// validator: it cross-checks these against the ActionID/ProjectorID
+			// of whatever rule it resolves from Refs["rule_id"] itself, and
+			// against its OWN configured ReplayTarget — never trusting these
+			// Candidate-carried copies as authoritative on their own.
+			"projector_id":       string(rc.Rule.ProjectorID),
+			"replay_target_hash": replayTargetOf(rc.Scope).Hash(),
 		}
 		candidates = append(candidates, cand)
 	}
@@ -558,6 +648,11 @@ func transitionCaseArtifactHash(rc resolvedTransitionCase) string {
 	var b strings.Builder
 	t := rc.Transition
 	b.WriteString("scope_hash=" + t.ScopeHash + "\n")
+	b.WriteString("scope_target_id=" + rc.Scope.TargetID + "\n")
+	b.WriteString("scope_build_id=" + rc.Scope.BuildID + "\n")
+	b.WriteString("scope_session_id=" + rc.Scope.SessionID + "\n")
+	b.WriteString("scope_protocol=" + rc.Scope.Protocol + "\n")
+	b.WriteString("scope_harness_id=" + rc.Scope.HarnessID + "\n")
 	b.WriteString("before=" + canonicalTransitionFingerprint(t.BeforeFingerprint) + "\n")
 	b.WriteString("action_registry_key=" + t.Action.ID().RegistryKey + "\n")
 	b.WriteString("action_variant_id=" + t.Action.ID().VariantID + "\n")

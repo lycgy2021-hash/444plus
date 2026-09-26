@@ -1073,15 +1073,147 @@ the guarantees hold under test:
     `RuleID`, or advancing a `Candidate` past `Hypothesis`. None of these
     have any code path in `research/state_machine_producer.go` today. A
     state-machine replay validator is explicitly deferred to a future stage.
+- **S10-E7 (`research/state_machine_replay.go`): the state-machine Replay
+  Validator — the first time an `OriginStateMachine` hypothesis is
+  independently re-tested, closing `hypothesis → reproducible` for real.**
+  Scoped exactly as specified: replay the SAME authorized rule, in a
+  genuinely FRESH session, against the SAME target — one action, no new
+  exploration capability, no state preparation, and it never Promotes.
+  - **E6 grew three small, additive fields to make E7 possible — nothing
+    about E6's own frozen behavior changed.** `StateTransition` itself
+    carries only an opaque `ScopeHash`, with no recoverable
+    `TargetID`/`BuildID`/`Protocol`/`HarnessID` a later replay validator
+    could check a target's identity against. `TransitionCase` therefore
+    grew a `Scope ExplorationScope` field (the exact scope a transition was
+    collected under), and `resolvedTransitionCase.validate()` grew ONE more
+    check: `Scope.Hash() == Transition.ScopeHash` — proving the claimed
+    Scope actually IS the one that produced this ScopeHash, so a caller
+    cannot pair a real transition with a fabricated Scope. `Produce`'s
+    `Refs` gained `projector_id` and `replay_target_hash` (the new
+    `ReplayTarget` type's own `Hash()` — `TargetID`/`BuildID`/`Protocol`/
+    `HarnessID`, DELIBERATELY WITHOUT `SessionID`), and
+    `transitionCaseArtifactHash` now covers every Scope field losslessly.
+    `TransitionRuleRegistry` gained `LookupByRuleID` (a second index,
+    populated at construction, alongside the existing `(ActionID,
+    ProjectorID)` index) — E7's actual entry point into a trusted registry.
+    All 29 existing E6 tests still pass against real fixtures rebuilt with a
+    real `ExplorationScope` (`e6ScopeHash` is now `ExplorationScope{...}.Hash()`,
+    never an arbitrary literal string) — 3 new tests
+    (`TestE6FabricatedScopeRejected`, `TestE6LookupByRuleIDResolvesRegisteredRule`,
+    `TestE6CaseArtifactHashChangesWhenScopeChanges`) plus one Refs-completeness
+    assertion cover the additions themselves. `research/explorer.go`'s
+    `collectAndProjectLocked` was also extracted into a package-level
+    `collectAndProject` (pure refactor, all Explorer tests still pass
+    unchanged) so a replay session — which has no `Explorer` instance of its
+    own — turns evidence into a `Fingerprint` through the exact SAME
+    scope-checked path, never a hand-rolled shortcut.
+  - **INDEPENDENT EVIDENCE, never old data.** `Replay` treats a Candidate's
+    `Refs` purely as "what to test" — never as evidence itself. Every fact a
+    `ValidationResult` reports comes from a FRESH `collectAndProject` call, a
+    FRESH authorized action bind, and a FRESH `Execute`, through the SAME
+    `Collector`/`stateauth.BoundRegistry`/`Executor` triple a real Explorer
+    session would use.
+  - **No reopened "caller picks ActionID" bypass.** `Replay` resolves
+    `rule := rules.LookupByRuleID(c.Refs["rule_id"])` against its OWN
+    trusted `TransitionRuleRegistry` FIRST, cross-checks the Candidate's
+    claimed `action_registry_key`/`action_variant_id`/`projector_id` against
+    THAT rule (rejecting on any mismatch — `ErrReplayActionMismatch`/
+    `ErrReplayProjectorMismatch`), and only then binds `rule.ActionID` — via
+    a throwaway, single-entry `actionauth.Registry` scoped to exactly that
+    `RegistryKey`, so `ActionPolicy.Select` is structurally incapable of
+    returning anything else. The Candidate never supplies an execution
+    credential, directly or indirectly, exactly mirroring S10-E1's original
+    "no caller-supplied ActionID" guarantee one layer further out.
+  - **Fresh session, same target, never a substituted one.** `ReplayTarget`
+    (`TargetID`/`BuildID`/`Protocol`/`HarnessID`, no `SessionID`) is fixed at
+    a validator's construction; each `Replay` call takes a caller-supplied
+    `sessionID` and builds the full `ExplorationScope` from
+    `target.Scope(sessionID)`. `Replay` rejects a Candidate whose
+    `Refs["replay_target_hash"]` does not match `v.target.Hash()`
+    (`ErrReplayTargetMismatch`) — proven by
+    `TestE7TargetMismatchRejected`; `TestE7ViolatedProducesReproducedWithIndependentEvidence`
+    proves the positive case with a session ID that is deliberately
+    DIFFERENT from the original transition's own.
+  - **No state preparation.** If `ExpectFactTransition`'s own precondition
+    does not hold against the FRESH baseline, `Replay` stops immediately
+    with `OutcomeNoSignal` — it never runs an extra action to force it to
+    hold. `TestE7PreconditionNotMetProducesNoSignalWithoutExecutingAction`
+    proves this against a REAL server: the fixture's own action-hit counter
+    stays at exactly 1 (the original run) after the replay attempt, never 2.
+  - **Outcome mapping is conservative by construction, not by convention.**
+    `replayOutcomeFor` (a pure, no-I/O function, unit-tested directly via
+    `TestE7ReplayOutcomeMapping` across all four `TransitionAssessment`
+    values plus an unrecognized one) is the ONLY place an assessment becomes
+    an `Outcome`: `satisfied`/`not_applicable` → `no_signal`; `violated` →
+    `reproduced` (the ONLY assessment that is ever a signal);
+    `insufficient_evidence`, or anything unrecognized → `Replay` returns an
+    ERROR, never silently upgrading "we don't know" into "no signal" (which
+    would misreport incomplete validation as a checked-and-clean result).
+  - **Same E5 safety boundaries, no exceptions, because it is the SAME
+    code.** `Replay` uses the SAME `Collector`/`Executor` implementations
+    (and therefore the SAME `BudgetedRoundTripper`, fail-closed-without-a-
+    meter, redirect-refusal, and body-size cap already proven in S10-E5/
+    hardening) through the SAME `collectAndProject` path — never a parallel,
+    less-audited code path. `ReplayBudget{MaxRequests, MaxWallTime}` is its
+    OWN independent budget (both fields strictly positive, the same "no
+    zero-means-unlimited" discipline as `ExplorationBudget`) — deliberately
+    with no `MaxDepth`/`MaxStates`/`MaxVisitsPerState`/`MaxBranching`, since
+    v1 replays exactly one already-authorized action, once, never branching
+    or looping. `TestE7RequestBudgetExhaustedIsError` (a full replay needs 3
+    real requests; `MaxRequests=2` must fail on the third) and
+    `TestE7WallTimeTimeoutIsError` (a real hanging endpoint, cut short well
+    under its 5s delay) prove both bounds are real against real I/O, exactly
+    like the analogous S10-E5 hardening tests. Redirect-refusal and the body
+    cap are inherited structurally (same `HTTPCollector`/`HTTPExecutor`
+    types S10-E5 already proved these for) rather than re-tested per
+    mechanism through this one more layer.
+  - **`Replay` never Promotes.** It returns a `ValidationResult` — the
+    Engine's own input — and nothing else; `Candidate.State` is asserted to
+    still be exactly `Hypothesis` immediately after a `Replay` call that
+    returned `OutcomeReproduced`
+    (`TestE7ViolatedProducesReproducedWithIndependentEvidence`). Wiring a
+    replay's `ValidationResult` into the Engine's existing
+    `shouldPromote`/`Promote` pipeline (S5's `Engine.Validate` already owns
+    that decision generically) is future work, not required to prove this
+    stage's own contract.
+  - **14-item freeze-gate battery** (`research/state_machine_replay_test.go`):
+    a non-`OriginStateMachine` Candidate, a missing/unknown `rule_id`, a
+    mismatched action/projector/target, and an empty `sessionID` are all
+    rejected before any I/O; a real fresh baseline that doesn't satisfy
+    `fact_transition`'s precondition produces `no_signal` without ever
+    executing the action; a real fresh replay that satisfies the rule
+    produces `no_signal`; a real fresh replay that violates the rule again
+    produces `reproduced`, with a `replay_case_artifact_hash` that is
+    provably distinct from the original Candidate's own `case_artifact_hash`
+    and a Candidate left at exactly `Hypothesis`; the pure outcome-mapping
+    table is proven for all four assessments plus an unrecognized one; a
+    real request-budget exhaustion and a real wall-time timeout both fail as
+    errors; and construction itself rejects a nil dependency or an invalid
+    `ReplayBudget`. All pass, every fixture built through the REAL E6
+    pipeline (a real `StateMachineProducer.Produce` against a real
+    transition observed over real HTTP) rather than a hand-built Candidate.
+  - **v1 explicitly does NOT do:** state preparation to satisfy a
+    precondition, letting a Candidate's own claimed action/projector
+    identity authorize anything directly, replaying against the same
+    recorded session, LLM judgment of what counts as reproduction, any new
+    exploration capability, or Promoting a Candidate itself. None of these
+    have any code path in `research/state_machine_replay.go` today.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
-  A state-machine replay validator for S10/E6 anomalies is also deferred —
-  E6 stops at `Candidate` by design.
+  Wiring S10-E7's `ValidationResult` into the Engine's existing promotion
+  pipeline, and any future state-preparation capability, are both deferred —
+  each needs its own explicit, separately reviewed design.
 
 Four independent unknown-issue sources now feed the plane: **patch difference
 (S6), crash behavior (S8), runtime differential (S9), state-machine transition
 (S10/E6)** — all deterministic producers on the one
-`Producer → Candidate → Validator → Engine` spine.
+`Producer → Candidate → Validator → Engine` spine. S10/E6+E7 together are the
+first of the four to run a hypothesis all the way to an independently
+reproduced result: `Explorer → StateTransition → TransitionRule →
+Candidate(hypothesis) → Replay Validator(fresh session) →
+ValidationResult{reproduced}` — the AI stays a producer (or, later, an
+explainer positioned strictly AFTER this point), never the authority that
+decides reproduction.
 
 Every source is a new `Origin.Kind` feeding the one spine
 `Producer → Candidate → Registered Validator → ValidationResult → Engine → state`.

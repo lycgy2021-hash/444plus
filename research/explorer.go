@@ -667,21 +667,37 @@ func (e *Explorer) preflightBudgetLocked() error {
 // to e.projector.Project (never a bare StateProjector value, and never a
 // registry plus a separately chosen ProjectorID — see PROJECTOR AUTHORITY).
 // meter is attached to ctx so the Collector can account for every real
-// request it actually issues.
+// request it actually issues. It is a thin wrapper over the package-level
+// collectAndProject (below), which S10/E7's replay validator also calls
+// directly — a replay session has no Explorer instance of its own (it never
+// branches, loops, or needs Explorer's other budget fields), but it must
+// turn evidence into a Fingerprint through the exact SAME scope-checked
+// path, never a hand-rolled shortcut.
 func (e *Explorer) collectAndProjectLocked(ctx context.Context, meter RequestMeter) (stateauth.Fingerprint, []byte, error) {
+	return collectAndProject(ctx, e.collector, e.projector, e.scope, meter)
+}
+
+// collectAndProject turns raw evidence into an authoritative Fingerprint for
+// scope: it calls collector.Collect, verifies the returned StateArtifact
+// actually carries scope's own hash, calls projector.Project, and verifies
+// the resulting Fingerprint does too — refusing (never silently accepting)
+// any artifact or Fingerprint that claims a different scope. meter is
+// attached to ctx so the Collector can account for every real request it
+// actually issues.
+func collectAndProject(ctx context.Context, collector Collector, projector *stateauth.BoundRegistry, scope ExplorationScope, meter RequestMeter) (stateauth.Fingerprint, []byte, error) {
 	ctx = ContextWithRequestMeter(ctx, meter)
-	artifact, err := e.collector.Collect(ctx, e.scope)
+	artifact, err := collector.Collect(ctx, scope)
 	if err != nil {
 		return stateauth.Fingerprint{}, nil, fmt.Errorf("research: collecting state: %w", err)
 	}
-	if artifact.ScopeHash != e.scope.Hash() {
+	if artifact.ScopeHash != scope.Hash() {
 		return stateauth.Fingerprint{}, nil, errors.New("research: collector returned a StateArtifact for a different scope")
 	}
-	fp, err := e.projector.Project(artifact)
+	fp, err := projector.Project(artifact)
 	if err != nil {
 		return stateauth.Fingerprint{}, nil, fmt.Errorf("research: projecting state: %w", err)
 	}
-	if fp.ScopeHash() != e.scope.Hash() {
+	if fp.ScopeHash() != scope.Hash() {
 		return stateauth.Fingerprint{}, nil, errors.New("research: projector returned a Fingerprint for a different scope")
 	}
 	return fp, artifact.Raw, nil
