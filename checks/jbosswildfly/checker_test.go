@@ -297,6 +297,28 @@ func TestProbeManagementTriesEveryCandidate(t *testing.T) {
 	}
 }
 
+// TestCandidateManagementTargetSchemes pins the scheme half of the management
+// endpoint source of truth: 9990 is plain HTTP, 9993 is its TLS counterpart.
+// Probing 9993 as http (the old behavior) hits the TLS listener with plaintext
+// and misses the real management interface, so the checker and discovery both
+// depend on this mapping being correct.
+func TestCandidateManagementTargetSchemes(t *testing.T) {
+	target, _ := model.ParseTarget("http://host:8080")
+	want := map[int]string{9990: "http", 9993: "https"}
+	seen := map[int]string{}
+	for _, cand := range candidateManagementTargets(target) {
+		if cand.Port == target.Port {
+			continue
+		}
+		seen[cand.Port] = cand.Scheme
+	}
+	for port, scheme := range want {
+		if seen[port] != scheme {
+			t.Errorf("management candidate on %d: scheme %q, want %q", port, seen[port], scheme)
+		}
+	}
+}
+
 // remotingProbe answers the jboss-remoting HTTP-upgrade handshake sent over
 // TCP, computing a correct/incorrect Sec-JbossRemoting-Accept from the actual
 // key the caller sent — exercising the real handshake logic deterministically,

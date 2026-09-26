@@ -20,11 +20,26 @@ const managementPath = "/management"
 // httpx timeout; capping the whole preflight keeps low-noise discovery cheap.
 const discoveryBudget = 1 * time.Second
 
-// managementPorts are the conventional ports for the HTTP management
-// interface, tried on the scanned host in addition to the target's own port.
-// Confirmed default on a live WildFly image: app HTTP on 8080, management on
-// 9990 — a separate listener, not multiplexed onto the app port.
-var managementPorts = []int{9990, 9993}
+// managementEndpoint is one conventional management listener: its port and the
+// scheme that listener speaks. This is the single source of truth for "where and
+// how the WildFly/JBoss management interface is reached" — the checker and
+// discovery both build their candidates from it, so a scheme fix here reaches
+// both and they can never disagree on, say, whether 9993 is HTTPS.
+type managementEndpoint struct {
+	Port   int
+	Scheme string
+}
+
+// managementEndpoints are the conventional management listeners, tried on the
+// scanned host in addition to the target's own port. Confirmed default on a live
+// WildFly image: app HTTP on 8080, management on 9990 — a separate listener, not
+// multiplexed onto the app port. 9990 is the plain-HTTP management port; 9993 is
+// its TLS counterpart, so it must be probed as https or the TLS listener sees a
+// plaintext request and the real management interface is missed.
+var managementEndpoints = []managementEndpoint{
+	{Port: 9990, Scheme: "http"},
+	{Port: 9993, Scheme: "https"},
+}
 
 // managementProbe is the result of probing one candidate host:port for the
 // management API.
@@ -35,19 +50,21 @@ type managementProbe struct {
 }
 
 // candidateManagementTargets returns target plus one Target per conventional
-// management port on the same host, deduplicated by port. Reusing the scanned
-// target's own host keeps every candidate inside the caller's policy scope
-// (checked per-request by httpx.Client against the same host).
+// management endpoint on the same host, deduplicated by port. Each sibling
+// candidate carries the endpoint's own scheme (9990=http, 9993=https). Reusing
+// the scanned target's own host keeps every candidate inside the caller's policy
+// scope (checked per-request by httpx.Client against the same host).
 func candidateManagementTargets(target model.Target) []model.Target {
 	seen := map[int]bool{target.Port: true}
 	out := []model.Target{target}
-	for _, port := range managementPorts {
-		if seen[port] {
+	for _, ep := range managementEndpoints {
+		if seen[ep.Port] {
 			continue
 		}
-		seen[port] = true
+		seen[ep.Port] = true
 		cand := target
-		cand.Port = port
+		cand.Port = ep.Port
+		cand.Scheme = ep.Scheme
 		out = append(out, cand)
 	}
 	return out
@@ -150,12 +167,10 @@ func ManagementDiscoveryHint(ctx context.Context, client httpx.Probe, target mod
 
 	var obs []model.Observation
 	hit := false
-	for _, port := range managementPorts {
-		if port == target.Port {
+	for _, cand := range candidateManagementTargets(target) {
+		if cand.Port == target.Port {
 			continue // the caller has already fetched the app port itself
 		}
-		cand := target
-		cand.Port = port
 		r, err := client.Get(ctx, cand, managementPath)
 		o := r.Observation("discover_management", err)
 		o.URL = cand.Origin() + managementPath
