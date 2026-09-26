@@ -112,6 +112,26 @@ var validationRecords = map[string]model.Validation{
 		LastValidatedCommit: "fab3383",
 	},
 
+	// GitLab: real 16.6.0 tested. CVE-2023-7028 is the affected version anchor
+	// (positive path confirmed live); the fixed boundary is unit-test-only, not
+	// real-machine patched. CVE-2023-2825 is version-only against a version we
+	// never actually ran (16.0.0), so fixture tier is more honest.
+	"CVE-2023-7028": {
+		Tier:           model.ValidationLive,
+		TestedVersions: []string{"16.6.0"},
+		TestedStates:   []string{"product_identity", "password_reset_reachable"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			PositivePath:    true,
+		},
+		EvidenceRefs:        []string{"docs/gitlab-attack-surface.md"},
+		LastValidatedCommit: "749b531",
+	},
+	"CVE-2023-2825": {
+		Tier:        model.ValidationFixture,
+		EvidenceRefs: []string{"docs/gitlab-attack-surface.md"},
+	},
+
 	// Device/mock lines: unit- and FP-corpus-validated only. Fingerprints are
 	// heuristic pending a real appliance — see CHANGELOG.md#coverage.
 	"CVE-2024-55591": {Tier: model.ValidationFixture, EvidenceRefs: []string{"CHANGELOG.md#coverage"}},
