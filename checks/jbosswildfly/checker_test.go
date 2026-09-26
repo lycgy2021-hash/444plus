@@ -297,24 +297,40 @@ func TestProbeManagementTriesEveryCandidate(t *testing.T) {
 	}
 }
 
-// TestCandidateManagementTargetSchemes pins the scheme half of the management
-// endpoint source of truth: 9990 is plain HTTP, 9993 is its TLS counterpart.
-// Probing 9993 as http (the old behavior) hits the TLS listener with plaintext
-// and misses the real management interface, so the checker and discovery both
-// depend on this mapping being correct.
+// TestCandidateManagementTargetSchemes pins the management endpoint source of
+// truth: 9990 is plain HTTP, 9993 is its TLS counterpart, and — crucially — the
+// input scheme (a scan-entry fact) never suppresses the correct product-protocol
+// candidate. If the user enters http://host:9993, we must STILL probe the real
+// https://host:9993; dedup is by origin, not port. Probing 9993 as http hits the
+// TLS listener with plaintext and misses the real management interface.
 func TestCandidateManagementTargetSchemes(t *testing.T) {
-	target, _ := model.ParseTarget("http://host:8080")
-	want := map[int]string{9990: "http", 9993: "https"}
-	seen := map[int]string{}
-	for _, cand := range candidateManagementTargets(target) {
-		if cand.Port == target.Port {
-			continue
+	origins := func(url string) map[string]bool {
+		target, err := model.ParseTarget(url)
+		if err != nil {
+			t.Fatalf("ParseTarget(%q): %v", url, err)
 		}
-		seen[cand.Port] = cand.Scheme
+		got := map[string]bool{}
+		for _, cand := range candidateManagementTargets(target) {
+			got[cand.Origin()] = true
+		}
+		return got
 	}
-	for port, scheme := range want {
-		if seen[port] != scheme {
-			t.Errorf("management candidate on %d: scheme %q, want %q", port, seen[port], scheme)
+	cases := []struct {
+		in   string
+		must []string
+	}{
+		{"http://host:8080", []string{"http://host:9990", "https://host:9993"}},
+		// Input already on a management port but WRONG scheme: correct candidate
+		// must survive dedup, not be shadowed by the input's scheme.
+		{"http://host:9993", []string{"https://host:9993", "http://host:9990"}},
+		{"https://host:9990", []string{"http://host:9990", "https://host:9993"}},
+	}
+	for _, tc := range cases {
+		got := origins(tc.in)
+		for _, want := range tc.must {
+			if !got[want] {
+				t.Errorf("candidateManagementTargets(%q): missing %q (got %v)", tc.in, want, got)
+			}
 		}
 	}
 }

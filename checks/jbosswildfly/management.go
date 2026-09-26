@@ -50,22 +50,30 @@ type managementProbe struct {
 }
 
 // candidateManagementTargets returns target plus one Target per conventional
-// management endpoint on the same host, deduplicated by port. Each sibling
-// candidate carries the endpoint's own scheme (9990=http, 9993=https). Reusing
+// management endpoint on the same host, each carrying the endpoint's own scheme
+// (9990=http, 9993=https). Dedup is by full origin (scheme+host+port), not port
+// alone: when the input already sits on a management port but with the wrong
+// scheme (e.g. http://host:9993), we still add the correctly-schemed candidate
+// (https://host:9993) rather than letting the input's scheme suppress it — the
+// input scheme is a scan-entry fact, not the product's protocol fact. Reusing
 // the scanned target's own host keeps every candidate inside the caller's policy
 // scope (checked per-request by httpx.Client against the same host).
 func candidateManagementTargets(target model.Target) []model.Target {
-	seen := map[int]bool{target.Port: true}
-	out := []model.Target{target}
-	for _, ep := range managementEndpoints {
-		if seen[ep.Port] {
-			continue
+	var out []model.Target
+	seen := map[string]bool{}
+	add := func(t model.Target) {
+		if seen[t.Origin()] {
+			return
 		}
-		seen[ep.Port] = true
+		seen[t.Origin()] = true
+		out = append(out, t)
+	}
+	add(target)
+	for _, ep := range managementEndpoints {
 		cand := target
 		cand.Port = ep.Port
 		cand.Scheme = ep.Scheme
-		out = append(out, cand)
+		add(cand)
 	}
 	return out
 }
