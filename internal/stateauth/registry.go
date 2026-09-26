@@ -5,68 +5,32 @@ import (
 	"fmt"
 )
 
-// Registry is a compile-time-only, closed set of registered StateProjector
-// implementations — the state-authority analogue of actionauth.Registry.
-// Unlike actionauth.Registry (which legitimately accepts caller-supplied
-// RegisteredAction/StateRequirements DATA — advisory, non-authoritative),
-// this Registry's constructor is UNEXPORTED: the only StateProjector values
-// it will ever hold are the concrete ones this package itself defines.
-//
-// The gap this closes: StateProjector being an exported interface means any
-// package can write a type that satisfies its method signatures. Such a type
-// can never call newFingerprint (unexported to this package), so it can
-// never forge a Fingerprint out of nothing — but nothing stops it from
-// CAPTURING and REPLAYING a Fingerprint obtained from a genuinely earlier,
-// legitimate Project call, ignoring the StateArtifact it is actually asked
-// to project on a later call:
-//
-//	type evilProjector struct{ cached Fingerprint }
-//	func (p *evilProjector) Project(a StateArtifact) (Fingerprint, error) {
-//		return p.cached, nil // ignores a entirely
-//	}
-//
-// If research held a bare StateProjector value directly (as an earlier
-// version of this package's Explorer integration did), that replay would be
-// indistinguishable from a real, fresh projection: even Explorer's own
-// "fresh-before" drift check (S10-E4d) would see a self-consistent
-// Fingerprint and never suspect it was minted for different bytes — the
-// state-authority analogue of the exact TOCTOU that fix closed for actions.
-//
-// Registry closes this the same way actionauth closes action selection:
-// research (or any other package) holds a *Registry and a ProjectorID —
-// never a StateProjector value directly — and DefaultRegistry (below) is the
-// ONLY exported way to obtain one. Its projectors are always this package's
-// own, referenced directly from Go code within this package; there is no
-// exported constructor an external package could ever hand a fake or
-// replaying projector to.
-type Registry struct {
+// registry is a compile-time-only, closed set of registered StateProjector
+// implementations. It is entirely UNEXPORTED — the only way any other
+// package can ever reach one is through a BoundRegistry (below), which also
+// fixes WHICH single ProjectorID that package is authorized to use. There is
+// no way, from outside this package, to pair an arbitrary ProjectorID with
+// an arbitrary registry — see BoundRegistry's own doc for why that matters.
+type registry struct {
 	projectors map[ProjectorID]StateProjector
 }
 
-// newRegistry is unexported: only code inside this package can ever build a
-// Registry from arbitrary StateProjector values — and today, only
-// DefaultRegistry does, with this package's own concrete projectors.
-func newRegistry(projectors ...StateProjector) *Registry {
+// newRegistry builds a closed registry from a fixed list of projectors —
+// only code inside this package can ever call it, and today, only
+// FixtureRegistry (and, in the future, other named profile constructors)
+// does, with this package's own concrete projectors.
+func newRegistry(projectors ...StateProjector) *registry {
 	m := make(map[ProjectorID]StateProjector, len(projectors))
 	for _, p := range projectors {
 		m[p.ID()] = p
 	}
-	return &Registry{projectors: m}
+	return &registry{projectors: m}
 }
 
-// DefaultRegistry returns the fixed set of projectors this package ships —
-// today, only RawLenProjector. It is the ONLY exported way to obtain a
-// *Registry: there is no exported constructor that accepts caller-supplied
-// StateProjector values, so no external package can ever get a fake or
-// replaying projector into a Registry an Explorer could reference.
-func DefaultRegistry() *Registry {
-	return newRegistry(RawLenProjector{})
-}
-
-// Project runs the registered projector for id against a — the ONLY way any
-// other package can ever turn a StateArtifact into a Fingerprint. A caller
-// holds a *Registry and a ProjectorID, never a StateProjector value.
-func (r *Registry) Project(id ProjectorID, a StateArtifact) (Fingerprint, error) {
+// project runs the registered projector for id against a. It is
+// unexported: only BoundRegistry.Project may call it, and only with the ONE
+// id that BoundRegistry itself was built with — never a caller-supplied one.
+func (r *registry) project(id ProjectorID, a StateArtifact) (Fingerprint, error) {
 	if r == nil {
 		return Fingerprint{}, errors.New("stateauth: nil registry")
 	}
@@ -75,4 +39,56 @@ func (r *Registry) Project(id ProjectorID, a StateArtifact) (Fingerprint, error)
 		return Fingerprint{}, fmt.Errorf("stateauth: no projector registered for %q", id)
 	}
 	return p.Project(a)
+}
+
+// BoundRegistry pairs a registry with the ONE ProjectorID a given profile is
+// authorized to use. A caller (research.Explorer) holds a *BoundRegistry —
+// never a bare ProjectorID string, and never the underlying registry type at
+// all — so it has no way to ask for a DIFFERENT projector than the one its
+// profile was built with, and no way to pair a projector from one profile
+// with a registry from another.
+//
+// The gap this closes: even after moving projector implementations behind
+// an unexported constructor (which stops external fake/replay injection —
+// see StateProjector's own doc), an Explorer that held a *registry PLUS a
+// caller-supplied ProjectorID could still let its caller choose WHICH
+// registered projector interprets the same raw evidence — the
+// state-authority analogue of the "caller picks ActionID" bypass S10-E1
+// closed for actions. If a registry ever holds both a minimal fixture
+// projector and a real protocol-specific one, a caller choosing the weaker
+// one could turn "authoritative state" into "whichever state semantics the
+// caller finds convenient" — e.g. mapping {"authenticated":"false"} and
+// {"authenticated":"true"} onto the identical Fingerprint via a length-only
+// projector, while a real HTTP-state projector would have told them apart.
+// BoundRegistry removes that choice entirely: a profile is built ONCE,
+// inside this package, naming both the registry and the projector together
+// — see FixtureRegistry's own doc — and nothing outside this package can
+// construct one with different contents.
+type BoundRegistry struct {
+	registry *registry
+	id       ProjectorID
+}
+
+// Project runs this BoundRegistry's one fixed projector against a. There is
+// no parameter through which a caller could ask it to use a different one.
+func (b *BoundRegistry) Project(a StateArtifact) (Fingerprint, error) {
+	if b == nil {
+		return Fingerprint{}, errors.New("stateauth: nil BoundRegistry")
+	}
+	return b.registry.project(b.id, a)
+}
+
+// FixtureRegistry returns a BoundRegistry using RawLenProjector — explicitly
+// a TEST/FIXTURE profile, never a real security-research state model (see
+// RawLenProjector's own doc: two responses of identical length can differ
+// completely, e.g. an admin=false/admin=true flip). It exists so research's
+// own tests (and future fixture-backed integration tests) have something to
+// construct an Explorer with, WITHOUT this package ever offering a
+// generically named "default" that production code might reach for out of
+// habit — there is deliberately no DefaultRegistry(). A future real profile
+// (e.g. for an HTTP target) gets its own equally explicit, equally named
+// constructor here, built the same way — never a parameter a caller fills
+// in.
+func FixtureRegistry() *BoundRegistry {
+	return &BoundRegistry{registry: newRegistry(RawLenProjector{}), id: RawLenProjector{}.ID()}
 }

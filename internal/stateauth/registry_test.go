@@ -2,9 +2,9 @@ package stateauth
 
 import "testing"
 
-func TestDefaultRegistryProjectsRawLenProjector(t *testing.T) {
-	reg := DefaultRegistry()
-	fp, err := reg.Project("rawlen-v1", StateArtifact{ScopeHash: "scope-1", Raw: []byte("hello")})
+func TestFixtureRegistryProjectsRawLenProjector(t *testing.T) {
+	reg := FixtureRegistry()
+	fp, err := reg.Project(StateArtifact{ScopeHash: "scope-1", Raw: []byte("hello")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -19,35 +19,44 @@ func TestDefaultRegistryProjectsRawLenProjector(t *testing.T) {
 	}
 }
 
+// TestBoundRegistryHasNoWayToProjectADifferentID documents, rather than
+// tests at runtime (Go's type system already enforces it at compile time),
+// the central claim this file makes: BoundRegistry.Project takes no
+// ProjectorID parameter at all — there is nothing for a caller to pass, so
+// there is no way to ask a *BoundRegistry obtained from FixtureRegistry() to
+// use a different projector than the one it was built with.
+func TestBoundRegistryHasNoWayToProjectADifferentID(t *testing.T) {
+	reg := FixtureRegistry()
+	fp, err := reg.Project(StateArtifact{ScopeHash: "scope-1", Raw: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.ProjectorID() != "rawlen-v1" {
+		t.Fatalf("every Project call on this BoundRegistry must use rawlen-v1, got %q", fp.ProjectorID())
+	}
+}
+
+func TestNilBoundRegistryNeverProjects(t *testing.T) {
+	var nilReg *BoundRegistry
+	if _, err := nilReg.Project(StateArtifact{ScopeHash: "scope-1", Raw: []byte("x")}); err == nil {
+		t.Fatal("a nil *BoundRegistry must never project (and must not panic)")
+	}
+}
+
 func TestRegistryProjectUnknownIDFails(t *testing.T) {
-	reg := DefaultRegistry()
-	if _, err := reg.Project("no-such-projector", StateArtifact{ScopeHash: "scope-1", Raw: []byte("x")}); err == nil {
-		t.Fatal("Project with an unregistered ProjectorID must fail")
+	reg := newRegistry(RawLenProjector{})
+	if _, err := reg.project("no-such-projector", StateArtifact{ScopeHash: "scope-1", Raw: []byte("x")}); err == nil {
+		t.Fatal("project with an unregistered ProjectorID must fail")
 	}
 }
 
 func TestNilOrZeroRegistryNeverProjects(t *testing.T) {
-	var nilReg *Registry
-	if _, err := nilReg.Project("rawlen-v1", StateArtifact{ScopeHash: "scope-1", Raw: []byte("x")}); err == nil {
-		t.Fatal("a nil *Registry must never project (and must not panic)")
+	var nilReg *registry
+	if _, err := nilReg.project("rawlen-v1", StateArtifact{ScopeHash: "scope-1", Raw: []byte("x")}); err == nil {
+		t.Fatal("a nil *registry must never project (and must not panic)")
 	}
-	var zeroReg Registry
-	if _, err := zeroReg.Project("rawlen-v1", StateArtifact{ScopeHash: "scope-1", Raw: []byte("x")}); err == nil {
-		t.Fatal("a zero-value Registry (nil internal map) must never project")
-	}
-}
-
-// TestRegistryHasNoExportedConstructorAcceptingProjectors documents, rather
-// than tests at runtime (Go's type system already enforces it at compile
-// time), the central claim this file makes: newRegistry is unexported, so
-// this is the ONLY file in the ONLY package that can ever call it with
-// arbitrary StateProjector values. Any other package — research, a future
-// AI-glue file, a future Explorer variant — can only ever obtain a *Registry
-// via DefaultRegistry(), which always contains this package's OWN concrete
-// projectors, never a caller-supplied one.
-func TestRegistryHasNoExportedConstructorAcceptingProjectors(t *testing.T) {
-	reg := DefaultRegistry()
-	if reg == nil {
-		t.Fatal("DefaultRegistry must return a usable, non-nil Registry")
+	var zeroReg registry
+	if _, err := zeroReg.project("rawlen-v1", StateArtifact{ScopeHash: "scope-1", Raw: []byte("x")}); err == nil {
+		t.Fatal("a zero-value registry (nil internal map) must never project")
 	}
 }

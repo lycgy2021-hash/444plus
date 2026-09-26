@@ -620,17 +620,37 @@ the guarantees hold under test:
     for different bytes — the state-authority analogue of exactly the TOCTOU
     fresh-state authorization closes for actions. Fixed the same way
     `actionauth` closes action selection: `internal/stateauth/registry.go`
-    adds a `Registry` whose constructor is UNEXPORTED — the only exported way
-    to obtain one is `stateauth.DefaultRegistry()`, which builds it from
-    stateauth's OWN concrete projectors (`RawLenProjector`) directly in Go
-    code; there is no exported constructor an external package could hand a
-    fake or replaying projector to. `Explorer` now holds a `*stateauth.Registry`
-    and a `ProjectorID`, never a `StateProjector` value — `collectAndProjectLocked`
-    calls `e.projectorRegistry.Project(e.projectorID, artifact)`. This is a
-    compile-time guarantee (nothing to runtime-test from outside `stateauth`
-    beyond what `internal/stateauth/registry_test.go` already pins: unknown
-    IDs and nil/zero registries both fail safely, never panic).
-  - **Eighth regression: `ExplorationBudget.MaxRequests` was enforced by
+    adds an unexported `registry` type plus `BoundRegistry`, which pairs a
+    registry with the ONE `ProjectorID` a given profile is authorized to use.
+    There is no exported constructor an external package could hand a fake
+    or replaying projector to — nor, critically, one that lets a caller pick
+    which registered `ProjectorID` to pair with a registry.
+  - **Ninth regression, found on the very next round, one level up from the
+    fix above: the first cut of this still took the registry and a
+    `ProjectorID` as TWO SEPARATE `NewExplorer` parameters.** That let
+    Explorer's own caller choose WHICH registered projector interprets the
+    same raw evidence — the state-authority analogue of the "caller picks
+    ActionID" bypass S10-E1 closed for actions, one layer further upstream
+    (choosing which authority explains the state, not just which action runs
+    against it). If a registry ever holds both a minimal fixture projector
+    and a real protocol-specific one, a caller choosing the weaker one could
+    turn "authoritative state" into "whichever state semantics the caller
+    finds convenient" — e.g. mapping `{"authenticated":"false"}` and
+    `{"authenticated":"true"}` onto the identical `Fingerprint` via a
+    length-only projector, while a real HTTP-state projector would have told
+    them apart. Fixed: `BoundRegistry` (above) is now the ONLY parameter —
+    `Explorer` holds a single `*stateauth.BoundRegistry` field, with no
+    separate `ProjectorID` a caller could swap in.
+    `stateauth.FixtureRegistry()` is the one named profile constructor that
+    exists today, and its own doc is explicit that it is TEST/FIXTURE ONLY —
+    there is deliberately no generically named `DefaultRegistry()` a
+    production caller might reach for out of habit; a future real profile
+    (an HTTP target, say) gets its own equally explicit, equally named
+    constructor, built the same way, never a parameter filled in by whoever
+    constructs the `Explorer`. This closes cleanly at the type level (nothing
+    to runtime-test beyond what `internal/stateauth/registry_test.go` already
+    pins: unknown IDs and nil/zero values all fail safely, never panic).
+  - **Tenth regression: `ExplorationBudget.MaxRequests` was enforced by
     Explorer GUESSING a fixed number of "requests" per `Step`/`Recover` call
     (3 and 2) — an assumption that breaks the moment a real `Collector`'s
     single `Collect()` call issues several actual requests internally (a
@@ -652,6 +672,31 @@ the guarantees hold under test:
     exhausted (`TestExplorerRecoveryUsesSeparateAllowanceNotBlockedByExhaustedExplorationBudget`),
     but still a real, enforced bound of its own, never unlimited
     (`TestExplorerRecoveryAllowanceIsBoundedNotUnlimited`).
+  - **Eleventh regression, found immediately after: `RequestMeter` (above) was
+    still purely COOPERATIVE — nothing stopped a real `Collector`/`Executor`
+    implementation from forgetting to call `Acquire`, or from calling it
+    fewer times than it actually issued requests (an internal retry, a
+    redirect follow-up), silently reopening the exact "guessed/undercounted
+    cost" problem the previous fix closed at the Explorer level, one layer
+    further down.** Fixed for HTTP specifically:
+    `research/http_meter.go`'s `BudgetedRoundTripper` wraps an
+    `http.RoundTripper` and calls `Acquire` (via
+    `RequestMeterFromContext(req.Context())`) BEFORE forwarding to its `Base`
+    — a real I/O CHOKE POINT, not business-logic discipline. Any future
+    HTTP-based `Collector`/`Executor`/recovery implementation MUST build its
+    `*http.Client` with this as its `Transport` and issue requests via
+    `http.NewRequestWithContext(ctx, ...)` using the SAME `ctx` Explorer
+    passed it; metering then happens at the actual network call regardless
+    of whether the business logic above remembers to account for it.
+    `TestBudgetedRoundTripperMetersAndBlocksBeforeNetwork` proves this with a
+    real `httptest.Server`: with a 2-unit meter, a third request is refused
+    BEFORE reaching the network, and the server's own received-request count
+    (not just the meter's internal count) confirms exactly 2 requests ever
+    went out. This is the metered analogue of `http.NewRequestWithContext`
+    already being required for `recoveryTimeout` — for a REAL http-based
+    executor, cancellation and metering both ride the same context, and both
+    are enforced by the stdlib transport layer itself, not merely "hoped
+    for" cooperative code.
   - **Small hardening pass, not a regression:** `History()` was already
     proven, not just documented, to return a copy
     (`TestHistoryReturnsIndependentCopy` mutates the returned slice and
@@ -666,17 +711,23 @@ the guarantees hold under test:
     without claiming to model any real protocol's state. It is a fixture/test
     projector, not meant to carry real security-research weight (two
     responses of identical length can differ completely, e.g. an
-    `admin=false`/`admin=true` flip) — a real protocol-specific projector
-    (status, content-type, stable headers, auth state, body structural shape)
-    is future work and must live inside `internal/stateauth`, registered
-    through `stateauth.DefaultRegistry`, for the same reason `RawLenProjector`
+    `admin=false`/`admin=true` flip) — reachable ONLY through
+    `stateauth.FixtureRegistry()`, never a generically named production
+    default. A real protocol-specific projector (status, content-type,
+    stable headers, auth state, body structural shape) is future work and
+    must live inside `internal/stateauth`, behind its own equally explicit
+    named `BoundRegistry` constructor, for the same reason `RawLenProjector`
     does.
   - **v1 explicitly does NOT do:** concurrent actions, multiple sessions, AI
     action selection (now closed at the API level, not just by convention —
     `Step` has no parameter to carry one), AI-generated network requests,
     dynamic registry / hot reload, arbitrary `StateProjector` injection (closed
-    at the API level — `Explorer` cannot accept one), a guessed/estimated
-    request cost (closed — `MaxRequests` is enforced by real `Acquire` calls),
+    at the API level — `Explorer` cannot accept one), caller-chosen
+    `ProjectorID` (closed — `Explorer` holds one bound `*stateauth.BoundRegistry`,
+    never a registry and an ID as separate parameters), a guessed/estimated/
+    undercounted request cost (closed — `MaxRequests` is enforced by real
+    `Acquire` calls at the HTTP transport layer itself, not business-logic
+    discipline),
     irreversible actions, exploration without a recovery check, "different
     state = vulnerability", automatic exploitability judgment, or unlimited
     depth/budget. None of these have any code path in `research/explorer.go`

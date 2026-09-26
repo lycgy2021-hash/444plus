@@ -176,14 +176,15 @@ func testPolicyTwoActions() *actionauth.ActionPolicy {
 
 func resetRef() actionauth.RecoveryPlanRef { return actionauth.RecoveryPlanRef{RegistryKey: "reset"} }
 
-// newTestExplorer builds an Explorer wired to stateauth.DefaultRegistry() —
-// the ONLY exported way to obtain a *stateauth.Registry (see PROJECTOR
-// AUTHORITY in explorer.go) — with a generous recovery request allowance,
-// for tests that aren't specifically exercising registry/meter construction
-// failures.
+// newTestExplorer builds an Explorer wired to stateauth.FixtureRegistry() —
+// a named, stateauth-owned test/fixture profile (see PROJECTOR AUTHORITY in
+// explorer.go for why Explorer cannot accept a bare StateProjector, or a
+// registry and ProjectorID as separate parameters) — with a generous
+// recovery request allowance, for tests that aren't specifically exercising
+// registry/meter construction failures.
 func newTestExplorer(t *testing.T, scope ExplorationScope, collector Collector, policy *actionauth.ActionPolicy, executor Executor, budget ExplorationBudget) *Explorer {
 	t.Helper()
-	exp, err := NewExplorer(scope, collector, stateauth.DefaultRegistry(), rawLenProjectorID(), policy, executor, budget, resetRef(), time.Second, 100)
+	exp, err := NewExplorer(scope, collector, stateauth.FixtureRegistry(), policy, executor, budget, resetRef(), time.Second, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +367,7 @@ func TestExplorerRequestMeterCountsRealAcquireCallsNotGuessedCost(t *testing.T) 
 	executor := &fakeExecutor{}
 	budget := generousBudget()
 	budget.MaxRequests = 5
-	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, budget, resetRef(), time.Second, 100)
+	exp, err := NewExplorer(testScope(), collector, stateauth.FixtureRegistry(), testPolicy(), executor, budget, resetRef(), time.Second, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +391,7 @@ func TestExplorerRecoveryUsesSeparateAllowanceNotBlockedByExhaustedExplorationBu
 	executor := &fakeExecutor{}
 	budget := generousBudget()
 	budget.MaxRequests = 1 // exhausted entirely by Baseline's one real Collect
-	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, budget, resetRef(), time.Second, 10)
+	exp, err := NewExplorer(testScope(), collector, stateauth.FixtureRegistry(), testPolicy(), executor, budget, resetRef(), time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +417,7 @@ func TestExplorerRecoveryAllowanceIsBoundedNotUnlimited(t *testing.T) {
 	// past a recoveryRequestAllowance of 3.
 	collector := &fakeCollector{seq: [][]byte{[]byte("A")}, acquiresPerCollect: 5}
 	executor := &fakeExecutor{}
-	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, generousBudget(), resetRef(), time.Second, 3)
+	exp, err := NewExplorer(testScope(), collector, stateauth.FixtureRegistry(), testPolicy(), executor, generousBudget(), resetRef(), time.Second, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +542,7 @@ func TestExplorerConstructionRejectsUnregisteredRecoveryRef(t *testing.T) {
 	// The policy's recovery registry only knows "reset" — configuring the
 	// explorer with a different ref must make every Recover call fail, never
 	// silently fall back to something else.
-	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, generousBudget(), actionauth.RecoveryPlanRef{RegistryKey: "not-registered"}, time.Second, 100)
+	exp, err := NewExplorer(testScope(), collector, stateauth.FixtureRegistry(), testPolicy(), executor, generousBudget(), actionauth.RecoveryPlanRef{RegistryKey: "not-registered"}, time.Second, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,7 +692,7 @@ func TestExplorerRecoveryScopeDriftFailsStop(t *testing.T) {
 func TestExplorerRecoveryTimeoutStopsAHungRecovery(t *testing.T) {
 	collector := &fakeCollector{seq: [][]byte{[]byte("A")}}
 	executor := &fakeExecutor{recoveryDelay: 200 * time.Millisecond}
-	exp, err := NewExplorer(testScope(), collector, stateauth.DefaultRegistry(), rawLenProjectorID(), testPolicy(), executor, generousBudget(), resetRef(), 10*time.Millisecond, 100)
+	exp, err := NewExplorer(testScope(), collector, stateauth.FixtureRegistry(), testPolicy(), executor, generousBudget(), resetRef(), 10*time.Millisecond, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -730,40 +731,39 @@ func TestExplorerRequiresBaselineBeforeStepOrRecover(t *testing.T) {
 func TestNewExplorerRejectsInvalidBudgetOrNilOrEmptyDependencies(t *testing.T) {
 	collector := &fakeCollector{}
 	executor := &fakeExecutor{}
-	registry := stateauth.DefaultRegistry()
-	id := rawLenProjectorID()
+	projector := stateauth.FixtureRegistry()
 
 	var invalidBudget ExplorationBudget
-	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, invalidBudget, resetRef(), time.Second, 100); err == nil {
+	if _, err := NewExplorer(testScope(), collector, projector, testPolicy(), executor, invalidBudget, resetRef(), time.Second, 100); err == nil {
 		t.Fatal("an invalid (zero-value) budget must be refused at construction")
 	}
 	nonBranchingBudget := generousBudget()
 	nonBranchingBudget.MaxBranching = 5
-	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, nonBranchingBudget, resetRef(), time.Second, 100); err == nil {
+	if _, err := NewExplorer(testScope(), collector, projector, testPolicy(), executor, nonBranchingBudget, resetRef(), time.Second, 100); err == nil {
 		t.Fatal("a budget with MaxBranching != 1 must be refused — v1 never branches, so a larger value would misrepresent a capability that does not exist")
 	}
-	if _, err := NewExplorer(testScope(), nil, registry, id, testPolicy(), executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
+	if _, err := NewExplorer(testScope(), nil, projector, testPolicy(), executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
 		t.Fatal("a nil Collector must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, nil, id, testPolicy(), executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
-		t.Fatal("a nil projectorRegistry must be refused at construction")
+	// There is no exported constructor for a bare *stateauth.BoundRegistry
+	// other than a named profile like FixtureRegistry() — a nil one here is
+	// the only "wrong" value this package could even construct.
+	if _, err := NewExplorer(testScope(), collector, nil, testPolicy(), executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
+		t.Fatal("a nil projector (*stateauth.BoundRegistry) must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, registry, "", testPolicy(), executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
-		t.Fatal("an empty projectorID must be refused at construction")
-	}
-	if _, err := NewExplorer(testScope(), collector, registry, id, nil, executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
+	if _, err := NewExplorer(testScope(), collector, projector, nil, executor, generousBudget(), resetRef(), time.Second, 100); err == nil {
 		t.Fatal("a nil ActionPolicy must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), nil, generousBudget(), resetRef(), time.Second, 100); err == nil {
+	if _, err := NewExplorer(testScope(), collector, projector, testPolicy(), nil, generousBudget(), resetRef(), time.Second, 100); err == nil {
 		t.Fatal("a nil Executor must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, generousBudget(), actionauth.RecoveryPlanRef{}, time.Second, 100); err == nil {
+	if _, err := NewExplorer(testScope(), collector, projector, testPolicy(), executor, generousBudget(), actionauth.RecoveryPlanRef{}, time.Second, 100); err == nil {
 		t.Fatal("an empty recoveryRef must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, generousBudget(), resetRef(), 0, 100); err == nil {
+	if _, err := NewExplorer(testScope(), collector, projector, testPolicy(), executor, generousBudget(), resetRef(), 0, 100); err == nil {
 		t.Fatal("a zero or negative recoveryTimeout must be refused at construction")
 	}
-	if _, err := NewExplorer(testScope(), collector, registry, id, testPolicy(), executor, generousBudget(), resetRef(), time.Second, 0); err == nil {
+	if _, err := NewExplorer(testScope(), collector, projector, testPolicy(), executor, generousBudget(), resetRef(), time.Second, 0); err == nil {
 		t.Fatal("a zero or negative recoveryRequestAllowance must be refused at construction")
 	}
 }

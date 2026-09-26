@@ -113,23 +113,35 @@ import (
 // perfectly self-consistent Fingerprint and never suspect it was minted for
 // different bytes — the state-authority analogue of exactly the TOCTOU
 // fresh-state authorization closes for actions. Fixed the same way
-// actionauth closes action selection: Explorer holds a *stateauth.Registry
-// (obtained ONLY via stateauth.DefaultRegistry(), which stateauth builds
-// from its own concrete projectors — there is no exported constructor an
-// external package could hand a fake/replaying projector to) and a
-// ProjectorID, never a StateProjector value directly.
+// actionauth closes action selection: Explorer holds a *stateauth.BoundRegistry
+// (obtained ONLY via a named stateauth profile constructor, e.g.
+// stateauth.FixtureRegistry() — there is no exported constructor an external
+// package could hand a fake/replaying projector to), never a StateProjector
+// value directly.
+//
+// Critically, BoundRegistry ALSO closes a narrower version of that same
+// class of bypass one level up: an earlier version of this file took the
+// registry and a caller-supplied ProjectorID as TWO SEPARATE parameters —
+// which would have let a caller pick WHICH registered projector interprets
+// the same raw evidence, the state-authority analogue of the "caller picks
+// ActionID" bypass S10-E1 closed for actions. If a registry ever holds both
+// a minimal fixture projector and a real protocol-specific one, a caller
+// choosing the weaker one could turn "authoritative state" into "whichever
+// state semantics the caller finds convenient". Explorer therefore holds a
+// single *stateauth.BoundRegistry — registry and projector bound together,
+// by stateauth itself, with no parameter through which Explorer's own caller
+// could ask for a different pairing.
 type Explorer struct {
 	mu sync.Mutex
 
-	scope             ExplorationScope
-	collector         Collector
-	projectorRegistry *stateauth.Registry
-	projectorID       stateauth.ProjectorID
-	policy            *actionauth.ActionPolicy
-	executor          Executor
-	budget            ExplorationBudget
-	recoveryRef       actionauth.RecoveryPlanRef
-	recoveryTimeout   time.Duration
+	scope           ExplorationScope
+	collector       Collector
+	projector       *stateauth.BoundRegistry
+	policy          *actionauth.ActionPolicy
+	executor        Executor
+	budget          ExplorationBudget
+	recoveryRef     actionauth.RecoveryPlanRef
+	recoveryTimeout time.Duration
 
 	// explorationMeter bounds real I/O for Baseline/Step; recoveryMeter is a
 	// SEPARATE, independently bounded "emergency allowance" for every
@@ -156,7 +168,8 @@ type Explorer struct {
 
 // Collector gathers a raw StateArtifact for scope. It is pure mechanical
 // I/O — no interpretation, no authority: turning raw bytes into
-// authoritative Facts is stateauth's own Registry's job, never Collector's.
+// authoritative Facts is stateauth's own BoundRegistry's job, never
+// Collector's.
 // A Collector implementation is free to make network/filesystem/process
 // calls; it MUST call RequestMeter.Acquire (via RequestMeterFromContext) once
 // for EACH real request it actually issues, so ExplorationBudget.MaxRequests
@@ -199,11 +212,13 @@ var (
 // it is enforced by real Collector/Executor calls to RequestMeter.Acquire,
 // never by Explorer guessing a fixed cost per call.
 //
-// projectorRegistry + projectorID name the ONE registered StateProjector this
+// projector names the ONE registered StateProjector (and registry) this
 // Explorer will ever use to turn raw evidence into an authoritative
-// Fingerprint. projectorRegistry must come from stateauth.DefaultRegistry()
-// (or a future equivalent) — see the package doc's PROJECTOR AUTHORITY
-// section for why Explorer cannot simply accept a bare StateProjector value.
+// Fingerprint. It must come from a named stateauth profile constructor, e.g.
+// stateauth.FixtureRegistry() (test/fixture use only — see its own doc) —
+// see the package doc's PROJECTOR AUTHORITY section for why Explorer cannot
+// accept a bare StateProjector value, or a registry and ProjectorID as
+// separate parameters a caller could mix and match.
 //
 // recoveryRef names the SINGLE registered recovery procedure this Explorer
 // will ever use — both for a deliberate Recover call and for the mandatory
@@ -224,8 +239,7 @@ var (
 func NewExplorer(
 	scope ExplorationScope,
 	collector Collector,
-	projectorRegistry *stateauth.Registry,
-	projectorID stateauth.ProjectorID,
+	projector *stateauth.BoundRegistry,
 	policy *actionauth.ActionPolicy,
 	executor Executor,
 	budget ExplorationBudget,
@@ -239,11 +253,8 @@ func NewExplorer(
 	if budget.MaxBranching != 1 {
 		return nil, errors.New("research: v1 never branches — MaxBranching must be exactly 1, not merely positive")
 	}
-	if collector == nil || projectorRegistry == nil || policy == nil || executor == nil {
-		return nil, errors.New("research: explorer requires a non-nil collector, projectorRegistry, policy, and executor")
-	}
-	if projectorID == "" {
-		return nil, errors.New("research: explorer requires a non-empty projectorID")
+	if collector == nil || projector == nil || policy == nil || executor == nil {
+		return nil, errors.New("research: explorer requires a non-nil collector, projector, policy, and executor")
 	}
 	if recoveryRef.RegistryKey == "" {
 		return nil, errors.New("research: explorer requires a non-empty recovery ref")
@@ -255,19 +266,18 @@ func NewExplorer(
 		return nil, errors.New("research: explorer requires a strictly positive recoveryRequestAllowance — mandatory recovery must be bounded, never unlimited")
 	}
 	return &Explorer{
-		scope:             scope,
-		collector:         collector,
-		projectorRegistry: projectorRegistry,
-		projectorID:       projectorID,
-		policy:            policy,
-		executor:          executor,
-		budget:            budget,
-		recoveryRef:       recoveryRef,
-		recoveryTimeout:   recoveryTimeout,
-		explorationMeter:  newBoundedRequestMeter(budget.MaxRequests),
-		recoveryMeter:     newBoundedRequestMeter(recoveryRequestAllowance),
-		visits:            make(map[string]int),
-		tried:             make(map[string]map[string]bool),
+		scope:            scope,
+		collector:        collector,
+		projector:        projector,
+		policy:           policy,
+		executor:         executor,
+		budget:           budget,
+		recoveryRef:      recoveryRef,
+		recoveryTimeout:  recoveryTimeout,
+		explorationMeter: newBoundedRequestMeter(budget.MaxRequests),
+		recoveryMeter:    newBoundedRequestMeter(recoveryRequestAllowance),
+		visits:           make(map[string]int),
+		tried:            make(map[string]map[string]bool),
 	}, nil
 }
 
@@ -616,9 +626,10 @@ func (e *Explorer) preflightBudgetLocked() error {
 
 // collectAndProjectLocked is the one place Explorer turns raw evidence into
 // an authoritative Fingerprint, by delegating to the injected Collector and
-// to e.projectorRegistry.Project (never a bare StateProjector value — see
-// PROJECTOR AUTHORITY). meter is attached to ctx so the Collector can account
-// for every real request it actually issues.
+// to e.projector.Project (never a bare StateProjector value, and never a
+// registry plus a separately chosen ProjectorID — see PROJECTOR AUTHORITY).
+// meter is attached to ctx so the Collector can account for every real
+// request it actually issues.
 func (e *Explorer) collectAndProjectLocked(ctx context.Context, meter RequestMeter) (stateauth.Fingerprint, []byte, error) {
 	ctx = ContextWithRequestMeter(ctx, meter)
 	artifact, err := e.collector.Collect(ctx, e.scope)
@@ -628,7 +639,7 @@ func (e *Explorer) collectAndProjectLocked(ctx context.Context, meter RequestMet
 	if artifact.ScopeHash != e.scope.Hash() {
 		return stateauth.Fingerprint{}, nil, errors.New("research: collector returned a StateArtifact for a different scope")
 	}
-	fp, err := e.projectorRegistry.Project(e.projectorID, artifact)
+	fp, err := e.projector.Project(artifact)
 	if err != nil {
 		return stateauth.Fingerprint{}, nil, fmt.Errorf("research: projecting state: %w", err)
 	}
