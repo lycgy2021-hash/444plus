@@ -52,14 +52,14 @@ func (a *Analyzer) AnalyzeFinding(ctx context.Context, ev Evidence) ([]*Candidat
 		return nil, nil, err
 	}
 	res, err := a.provider.Analyze(ctx, ai.AnalysisRequest{
-		Task:    ai.TaskFindingAnalyst,
+		Task:    ai.TaskFindingAnalysis,
 		Target:  ev.Target,
 		Payload: payload,
 	})
 	if err != nil {
 		return nil, nil, err
 	}
-	origin := Origin{Source: string(ai.TaskFindingAnalyst), AISuggested: true, Provider: a.provider.Name()}
+	origin := Origin{Kind: OriginAI, ID: a.provider.Name()}
 	var candidates []*Candidate
 	for _, p := range res.Proposals {
 		typ := strings.TrimSpace(p.CandidateType)
@@ -70,7 +70,55 @@ func (a *Analyzer) AnalyzeFinding(ctx context.Context, ev Evidence) ([]*Candidat
 		if title == "" {
 			continue // a proposal with no title is not actionable
 		}
-		candidates = append(candidates, NewHypothesis(a.newID(), typ, title, ev.Target, p.Rationale, origin, p.RequiredEvidence))
+		candidates = append(candidates, NewHypothesis(a.newID(), typ, title, ev.Target, p.Hypothesis, origin, p.EvidenceRequired))
 	}
 	return candidates, res, nil
+}
+
+// EvidenceGaps (TaskEvidenceGap) asks the provider only what evidence is missing
+// to reach a conclusion. It proposes nothing — a pure gap list.
+func (a *Analyzer) EvidenceGaps(ctx context.Context, ev Evidence) ([]string, error) {
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		return nil, err
+	}
+	res, err := a.provider.Analyze(ctx, ai.AnalysisRequest{Task: ai.TaskEvidenceGap, Target: ev.Target, Payload: payload})
+	if err != nil {
+		return nil, err
+	}
+	return res.MissingEvidence, nil
+}
+
+// Deduplicate (TaskCandidateDedup) asks the provider which candidates describe the
+// same underlying issue. It returns the model's suggested groups of candidate ids
+// WITHOUT merging anything — grouping is advisory; the caller decides. Groups are
+// filtered to ids that were actually in the input, so the model cannot invent ids.
+func (a *Analyzer) Deduplicate(ctx context.Context, candidates []*Candidate) ([][]string, error) {
+	known := make(map[string]bool, len(candidates))
+	view := make([]map[string]string, 0, len(candidates))
+	for _, c := range candidates {
+		known[c.ID] = true
+		view = append(view, map[string]string{"id": c.ID, "candidate_type": c.Type, "title": c.Title})
+	}
+	payload, err := json.Marshal(view)
+	if err != nil {
+		return nil, err
+	}
+	res, err := a.provider.Analyze(ctx, ai.AnalysisRequest{Task: ai.TaskCandidateDedup, Payload: payload})
+	if err != nil {
+		return nil, err
+	}
+	var groups [][]string
+	for _, g := range res.Duplicates {
+		var filtered []string
+		for _, id := range g {
+			if known[id] {
+				filtered = append(filtered, id)
+			}
+		}
+		if len(filtered) >= 2 { // a group needs at least two real members
+			groups = append(groups, filtered)
+		}
+	}
+	return groups, nil
 }

@@ -3,6 +3,7 @@ package research
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -39,17 +40,31 @@ func rung(s State) int {
 	return -1
 }
 
-// Origin records where a candidate came from — and, critically, whether a
-// non-authoritative AI provider suggested it. This provenance is permanent so an
-// AI origin is never lost or mistaken for a validated fact.
+// OriginKind names the producer that raised a candidate. The Research Plane is
+// the core; a local LLM is only ONE producer among many. Making this an explicit
+// kind keeps AI provenance visible and never mistaken for a validated fact, while
+// leaving room for the non-AI producers (fuzz, diff, source audit, passive
+// anomaly, a human researcher) that S6+ will add.
+type OriginKind string
+
+const (
+	OriginAI          OriginKind = "ai"
+	OriginFuzz        OriginKind = "fuzz"
+	OriginDiff        OriginKind = "diff"
+	OriginSourceAudit OriginKind = "source_audit"
+	OriginPassive     OriginKind = "passive"
+	OriginHuman       OriginKind = "human"
+)
+
+// Origin records where a candidate came from. Kind is the producer type; ID is
+// that producer's identity (e.g. an ai.Provider name, a fuzzer id, a diff ref).
 type Origin struct {
-	// Source is the research source, e.g. "finding_analyst", "diff", "fuzz".
-	Source string `json:"source"`
-	// AISuggested is true when an ai.Provider proposed this candidate.
-	AISuggested bool `json:"ai_suggested"`
-	// Provider/Model identify the backend, when AISuggested.
-	Provider string `json:"provider,omitempty"`
+	Kind OriginKind `json:"kind"`
+	ID   string     `json:"id,omitempty"`
 }
+
+// IsAI reports whether a (non-authoritative) model produced this candidate.
+func (o Origin) IsAI() bool { return o.Kind == OriginAI }
 
 // Transition is one recorded state advance, always attributed to the
 // deterministic validator that made it and the evidence that justified it.
@@ -77,6 +92,11 @@ type Candidate struct {
 	Evidence         []Observation `json:"evidence,omitempty"`
 	CreatedAt        time.Time     `json:"created_at"`
 	History          []Transition  `json:"history,omitempty"`
+
+	// mu guards the read-modify-write in Promote so concurrent promotions cannot
+	// skip a rung (one wins hypothesis→reproducible; the rest see the advanced
+	// state and are rejected). A Candidate is always held by pointer, never copied.
+	mu sync.Mutex
 }
 
 // NewHypothesis constructs a candidate at Hypothesis — the only entry point for
@@ -108,6 +128,8 @@ var ErrIllegalTransition = errors.New("research: illegal state transition")
 // Hypothesis. Advancing more than one rung, backward, without a validator, or
 // without evidence all fail.
 func (c *Candidate) Promote(to State, by string, evidenceRefs []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	cur := rung(c.State)
 	next := rung(to)
 	if cur < 0 || next < 0 {

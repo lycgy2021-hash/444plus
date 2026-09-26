@@ -2,88 +2,93 @@ package ai
 
 import "encoding/json"
 
-// Task names the kind of analysis requested. Each keeps the model in a narrow
-// lane — analyze, compare, audit, triage — and none of them asks the model to
-// decide anything: the model proposes and names gaps, a validator decides.
+// Task names the kind of analysis requested. S4 supports exactly three narrow
+// tasks — no "omni-analysis". Each keeps the model to describing and grouping;
+// none asks it to decide, attack, or rate severity.
 type Task string
 
 const (
-	// TaskFindingAnalyst analyzes existing evidence and points out what evidence
-	// is missing to reach a conclusion (P0).
-	TaskFindingAnalyst Task = "finding_analyst"
-	// TaskDiffAnalyst analyzes a version/patch diff for security-relevant change
-	// (P0).
-	TaskDiffAnalyst Task = "diff_analyst"
-	// TaskSourceAuditor reasons about source→sink / bounds / state machines (P1).
-	TaskSourceAuditor Task = "source_auditor"
-	// TaskCrashTriage clusters and ranks fuzz crashes by suspiciousness (P1).
-	TaskCrashTriage Task = "crash_triage"
+	// TaskFindingAnalysis analyzes existing detection evidence and proposes
+	// hypotheses worth a deterministic look.
+	TaskFindingAnalysis Task = "finding_analysis"
+	// TaskEvidenceGap names the evidence absent from the input that would be
+	// needed to decide — it proposes nothing, it only lists gaps.
+	TaskEvidenceGap Task = "evidence_gap_analysis"
+	// TaskCandidateDedup groups candidates the model believes are the same
+	// underlying issue. Advisory only: the caller decides whether to merge.
+	TaskCandidateDedup Task = "candidate_deduplication"
 )
 
 func (t Task) valid() bool {
 	switch t {
-	case TaskFindingAnalyst, TaskDiffAnalyst, TaskSourceAuditor, TaskCrashTriage:
+	case TaskFindingAnalysis, TaskEvidenceGap, TaskCandidateDedup:
 		return true
 	}
 	return false
 }
 
-// AnalysisRequest is the input to Provider.Analyze. The evidence/context is
-// passed as opaque JSON (marshaled research.Evidence, a diff, a source excerpt)
-// so this package need not import the research or detection planes — keeping the
-// gateway free of any verdict vocabulary and free of import cycles.
+// AnalysisRequest is the input to Provider.Analyze. The material is passed as
+// opaque JSON so this package need not import the research or detection planes —
+// keeping the gateway free of any verdict vocabulary and free of import cycles.
 type AnalysisRequest struct {
 	Task Task `json:"task"`
-	// Target is a label for the subject (a URL, a package name, a file path). It
-	// is context for the prompt, not something the model is asked to attack.
+	// Target is a label for the subject (a URL, a package name). Context for the
+	// prompt, never something the model is asked to attack.
 	Target string `json:"target,omitempty"`
 	// Payload is the task-specific material the model reasons over: marshaled
-	// research.Evidence for a finding analysis, a unified diff for a diff
-	// analysis, a source excerpt for an audit. Never raw target bytes to attack.
+	// research.Evidence, or a list of candidates for deduplication.
 	Payload json.RawMessage `json:"payload,omitempty"`
-	// Instruction is an optional extra, human-authored steer appended to the
-	// task's built-in prompt. It cannot widen the output schema.
+	// Instruction is an optional human-authored steer; it cannot widen the schema.
 	Instruction string `json:"instruction,omitempty"`
 }
 
-// Proposal is a single hypothesis the model puts forward. It is explicitly NOT a
-// finding: it has no verdict, no confidence-as-truth, no state. Confidence is the
-// model's own advisory self-rating and carries no authority.
+// Proposal is a single hypothesis the model puts forward. It is descriptive only:
+// no severity, no confidence, no verdict, no state. It names what to look at and
+// what evidence a validator would need — a deterministic validator decides the
+// rest.
 type Proposal struct {
-	CandidateType    string   `json:"candidate_type"`
-	Title            string   `json:"title"`
-	Rationale        string   `json:"rationale,omitempty"`
-	RequiredEvidence []string `json:"required_evidence,omitempty"`
-	Confidence       float64  `json:"confidence,omitempty"`
+	// CandidateType routes to a registered validator via Validator.Supports; an
+	// unknown type simply matches nothing and the candidate stays a hypothesis.
+	CandidateType string `json:"candidate_type,omitempty"`
+	Title         string `json:"title"`
+	Hypothesis    string `json:"hypothesis,omitempty"`
+	// EvidenceRequired is what a validator must collect to test the hypothesis.
+	EvidenceRequired []string `json:"evidence_required,omitempty"`
+	// RelatedObservations references observation ids from the input evidence.
+	RelatedObservations []string `json:"related_observations,omitempty"`
 }
 
 // AnalysisResult is everything a Provider may return. By construction it can only
-// propose and point at gaps: there is no Verdict, State, Confirmed, or Severity
-// field, so a model — however it is prompted or however it misbehaves — cannot
-// express a decision through this type. Unknown fields in a model's JSON reply
-// are dropped on unmarshal, so a reply that invents `"verdict":"confirmed"` is
-// silently discarded here.
+// describe and group: no Verdict, State, Confirmed, Severity, or Confidence
+// field, so a model — however prompted or however it misbehaves — cannot express
+// a decision or a severity through this type. Unknown fields in a model's JSON
+// reply are dropped on unmarshal, so a reply inventing "verdict":"confirmed" or
+// "severity":"critical" is silently discarded.
 type AnalysisResult struct {
-	Proposals       []Proposal `json:"proposals"`
+	Proposals       []Proposal `json:"proposals,omitempty"`
 	MissingEvidence []string   `json:"missing_evidence,omitempty"`
-	Notes           string     `json:"notes,omitempty"`
+	// Duplicates are groups of candidate ids the model believes are the same
+	// issue (TaskCandidateDedup). Advisory; nothing is merged automatically.
+	Duplicates [][]string `json:"duplicate_groups,omitempty"`
+	Notes      string     `json:"notes,omitempty"`
 	// Usage is filled by the Provider from the backend's token accounting; it is
 	// not part of the model's own reply.
 	Usage Usage `json:"-"`
 }
 
-// resultSchemaHint is embedded in the prompt so the model returns the exact
-// shape AnalysisResult unmarshals. It intentionally offers no verdict/state key.
+// resultSchemaHint is embedded in the prompt so the model returns the exact shape
+// AnalysisResult unmarshals. It offers no verdict/state/severity/confidence key.
 const resultSchemaHint = `{
   "proposals": [
     {
       "candidate_type": "short_snake_case_kind",
       "title": "one line",
-      "rationale": "why this is worth validating",
-      "required_evidence": ["what a deterministic validator must collect to test it"],
-      "confidence": 0.0
+      "hypothesis": "what might be true and why it is worth validating",
+      "evidence_required": ["what a deterministic validator must collect to test it"],
+      "related_observations": ["observation ids from the input this refers to"]
     }
   ],
   "missing_evidence": ["evidence absent from the input that would change the analysis"],
+  "duplicate_groups": [["candidate-id-a", "candidate-id-b"]],
   "notes": "optional short free text"
 }`

@@ -27,14 +27,12 @@ Rules you MUST follow:
 // taskInstruction is the per-task framing appended after the preamble.
 func taskInstruction(t Task) string {
 	switch t {
-	case TaskFindingAnalyst:
-		return "Task: analyze the provided detection evidence. Identify weaknesses/anomalies worth a closer, deterministic look, and list what additional evidence would be needed to decide. Do not restate the existing verdict."
-	case TaskDiffAnalyst:
-		return "Task: analyze the provided version/patch diff. Identify security-relevant changes and what a validator should check to tell an affected build from a fixed one."
-	case TaskSourceAuditor:
-		return "Task: audit the provided source excerpt for source→sink flows, missing bounds/authorization checks, and unsafe state transitions. Propose candidates and the evidence needed to reproduce."
-	case TaskCrashTriage:
-		return "Task: triage the provided crash/fuzz data. Cluster by likely root cause and rank by suspiciousness; name the evidence needed to assess impact."
+	case TaskFindingAnalysis:
+		return "Task: analyze the provided detection evidence. Identify anomalies worth a closer, deterministic look, and list what additional evidence a validator would need. Reference related observation ids. Do not restate any existing verdict."
+	case TaskEvidenceGap:
+		return "Task: given the provided evidence, list ONLY what evidence is missing to reach a conclusion. Put those in missing_evidence; propose nothing."
+	case TaskCandidateDedup:
+		return "Task: the input is a list of research candidates. Group ids that describe the same underlying issue into duplicate_groups. Do not invent new candidates."
 	default:
 		return "Task: analyze the provided material and propose hypotheses worth validating."
 	}

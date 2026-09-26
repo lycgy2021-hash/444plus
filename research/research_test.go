@@ -9,7 +9,7 @@ import (
 )
 
 func TestCandidateStateLadder(t *testing.T) {
-	c := NewHypothesis("RC-2026-000001", "path_normalization", "double-encoded traversal", "http://t", "why", Origin{Source: "finding_analyst", AISuggested: true, Provider: "openai-compat:qwen"}, []string{"baseline_response"})
+	c := NewHypothesis("RC-2026-000001", "path_normalization", "double-encoded traversal", "http://t", "why", Origin{Kind: OriginAI, ID: "openai-compat:qwen"}, []string{"baseline_response"})
 	if c.State != Hypothesis {
 		t.Fatalf("born at %s, want hypothesis", c.State)
 	}
@@ -85,7 +85,7 @@ func (s stubProvider) Analyze(context.Context, ai.AnalysisRequest) (*ai.Analysis
 func TestAnalyzerEmitsOnlyHypotheses(t *testing.T) {
 	prov := stubProvider{res: &ai.AnalysisResult{
 		Proposals: []ai.Proposal{
-			{CandidateType: "path_normalization", Title: "double-encoded traversal", Confidence: 0.99, RequiredEvidence: []string{"baseline"}},
+			{CandidateType: "path_normalization", Title: "double-encoded traversal", Hypothesis: "front/back normalize differently", EvidenceRequired: []string{"baseline_response", "normalized_response"}},
 			{CandidateType: "", Title: "no type but has title"}, // type defaults to "unspecified"
 			{CandidateType: "x", Title: ""},                     // no title -> skipped
 		},
@@ -103,7 +103,7 @@ func TestAnalyzerEmitsOnlyHypotheses(t *testing.T) {
 		if c.State != Hypothesis {
 			t.Errorf("candidate %s born at %s, want hypothesis (AI is never authority)", c.ID, c.State)
 		}
-		if !c.Origin.AISuggested || c.Origin.Provider != "stub" {
+		if !c.Origin.IsAI() || c.Origin.ID != "stub" {
 			t.Errorf("origin not marked AI-suggested: %+v", c.Origin)
 		}
 	}
@@ -112,5 +112,35 @@ func TestAnalyzerEmitsOnlyHypotheses(t *testing.T) {
 	}
 	if len(res.MissingEvidence) != 1 {
 		t.Fatalf("missing evidence lost: %+v", res.MissingEvidence)
+	}
+}
+
+func TestAnalyzerEvidenceGaps(t *testing.T) {
+	prov := stubProvider{res: &ai.AnalysisResult{MissingEvidence: []string{"response under boundary value", "response above boundary value"}}}
+	gaps, err := NewAnalyzer(prov).EvidenceGaps(context.Background(), Evidence{Target: "http://t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gaps) != 2 {
+		t.Fatalf("gaps = %v", gaps)
+	}
+}
+
+func TestAnalyzerDeduplicateFiltersUnknownIDs(t *testing.T) {
+	prov := stubProvider{res: &ai.AnalysisResult{Duplicates: [][]string{
+		{"RC-2026-000001", "RC-2026-000002"}, // both real -> kept
+		{"RC-2026-000001", "RC-9999-999999"}, // one invented id -> collapses to 1 -> dropped
+		{"RC-9999-000000"},                   // all invented -> dropped
+	}}}
+	cands := []*Candidate{
+		NewHypothesis("RC-2026-000001", "t", "a", "", "", Origin{Kind: OriginAI, ID: "stub"}, nil),
+		NewHypothesis("RC-2026-000002", "t", "b", "", "", Origin{Kind: OriginAI, ID: "stub"}, nil),
+	}
+	groups, err := NewAnalyzer(prov).Deduplicate(context.Background(), cands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || len(groups[0]) != 2 {
+		t.Fatalf("dedup must keep only groups of >=2 known ids, got %v (a model cannot invent ids)", groups)
 	}
 }

@@ -1,4 +1,4 @@
-# AI Research Plane (S1–S3)
+# AI Research Plane (S1–S5)
 
 This is an **additive** plane beside the deterministic detection plane, not a
 rewrite of it. The detection base — `--discover`, fingerprint, assessment cache,
@@ -12,14 +12,24 @@ plane only proposes leads and hands them to deterministic validators.
 └───────────────────────────┬─────────────────────────────────────┘
                             │ facts (research.FromModelEvidence)
                             ↓
-┌──────────── Research Plane (this change) ───────────────────────┐
-│ research.Evidence → ai.Provider.Analyze → research.Candidate      │
-│                                            (state: hypothesis)    │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │ later (S5+): Validator promotes with evidence
-                            ↓
-                    Reproducible → ImpactConfirmed → …
+┌──────────── Research Plane ─────────────────────────────────────┐
+│ research.Evidence → ai.Provider.Analyze → Candidate(hypothesis)  │  S1,S2,S4
+│                                              │                    │
+│                              Registry.Match(candidate)            │  S5
+│                                              │                    │
+│              Validator.Validate → ValidationResult{Outcome,facts} │  S5
+│                                              │                    │
+│                   Engine (state machine) → Candidate.Promote      │  S3,S5
+│                                              ↓                    │
+│                       Reproducible → ImpactConfirmed → …          │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+Three roles are kept structurally separate, so authority lives in exactly one
+place: **AI ≠ Validator ≠ State machine.** The model proposes hypotheses; a
+registered Validator decides *how* to safely test one and reports facts + an
+`Outcome` (never a state); the Engine alone reads those facts and calls the sole
+`Promote`.
 
 ## The one rule: AI ≠ Authority
 
@@ -57,15 +67,54 @@ one-way adapter that derives research evidence from a frozen `model.Evidence`.
 
 **S3 — `research/candidate.go`** — `State` ladder (`hypothesis → reproducible →
 impact_confirmed → vendor_confirmed → cve_assigned`), `Candidate`, `NewHypothesis`
-(the only entry point), and `Promote` (the deterministic-validator gate).
-`research/analyzer.go` is the minimal glue proving the boundary end to end.
+(the only entry point), and `Promote` (single-rung, requires a named validator +
+evidence; mutex-guarded so concurrent promotes cannot skip a rung). `Origin` is
+`{Kind, ID}` — the Research Plane is the core and a local LLM is only ONE producer
+(`ai/fuzz/diff/source_audit/passive/human`).
+
+**S4 — `research/analyzer.go`** — three narrow tasks only, no omni-analysis and no
+severity/confidence: `finding_analysis` (`AnalyzeFinding` → hypothesis
+candidates), `evidence_gap_analysis` (`EvidenceGaps` → a gap list, proposes
+nothing), `candidate_deduplication` (`Deduplicate` → advisory groups, filtered to
+real ids, nothing merged). Every proposal becomes a `Hypothesis` candidate tagged
+with its AI origin — regardless of anything the model says.
+
+**S5 — `research/validator.go` + `research/http_differential.go`** — the
+deterministic tier. `Validator` (`Supports`/`Validate`, **no** "execute these
+actions" entry point — a validator owns and bounds its own probes), `Outcome`
+(`no_signal`/`observed`/`reproduced`), `ValidationResult` (facts + `Outcome`, **no
+`State` field**), a compile-time `Registry` (no dynamic validators), and the
+`Engine` state machine that is the *only* caller of `Promote`
+(`reproduced` + validator identity + required-evidence satisfied → one rung).
+`HTTPDifferentialValidator` is the first real validator: read-only GETs of its own
+fixed baseline/normalized paths, never anything from the candidate text.
 
 Nothing here touches the 28 checkers or the engine; `go build/vet/test ./...`
-stays green.
+(and `-race`) stays green.
 
-## Roadmap (not in this change)
+## Boundary audit (all green)
 
-`S4` AI Finding Analyst · `S5` `Validator` interface (the authority that promotes
-candidates) · `S6` Diff Analyzer · `S7` Source-audit ingestion · `S8` Fuzz/crash
-pipeline · `S9` Differential engine · `S10` State-machine explorer. Each is a new
-**Research Source** feeding the same `Candidate → Validator → Evidence` spine.
+The chain runs end to end — `Evidence → Provider → Proposal → Candidate(hypothesis)
+→ Registry → Validator → ValidationResult → Engine → Promote → reproducible` — and
+the guarantees hold under test:
+
+| Attempt | Result |
+| --- | --- |
+| AI reply says `"verdict":"confirmed"` / `"severity":"critical"` | dropped on unmarshal (no such field) |
+| AI proposal → candidate | always born `hypothesis`, AI origin recorded |
+| AI-supplied text drives a request | impossible — validators use only their own fixed probes |
+| candidate with no matching validator | stays `hypothesis` |
+| validator reports `reproduced` but no evidence | not promoted |
+| validator evidence misses a required token | not promoted |
+| validator `reproduced` + evidence satisfies requirements | promoted exactly one rung |
+| repeated validation | idempotent (one transition) |
+| concurrent `Promote` | one wins; never skips a rung |
+
+## Roadmap (frozen until this base is proven, then)
+
+`S6` Diff Analyzer · `S8` Fuzz/crash pipeline (prioritized next — patch diffs and
+crashes are far higher signal-to-noise for a model than a whole repo) · `S7`
+Source-audit ingestion · `S9` Differential engine · `S10` State-machine explorer.
+Each is a new **Research Source** (a new `Origin.Kind`) feeding the same
+`Candidate → Validator → Evidence → Promote` spine — the LLM stays one producer,
+not the engine.

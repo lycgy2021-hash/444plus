@@ -11,7 +11,11 @@
 // the dependency points one way, so the frozen detection base cannot regress.
 package research
 
-import "gopoc/internal/model"
+import (
+	"fmt"
+
+	"gopoc/internal/model"
+)
 
 // NetworkAction records what a probe did to the target. The research plane
 // observes; it does not attack. There is deliberately no "exploit" or
@@ -67,6 +71,9 @@ type Artifact struct {
 // request/response) plus the network action that produced it. It is never a
 // verdict and never carries a decision.
 type Observation struct {
+	// ID is a stable handle within one Evidence bundle, so a Proposal can point at
+	// facts via related_observations (e.g. "obs-17").
+	ID            string          `json:"id,omitempty"`
 	Kind          string          `json:"kind"`
 	Source        string          `json:"source,omitempty"`
 	Endpoint      string          `json:"endpoint,omitempty"`
@@ -102,8 +109,9 @@ func FromModelEvidence(target, source string, ev model.Evidence) Evidence {
 	if ev.Version != "" {
 		out.Product = ProductFact{Version: ev.Version}
 	}
-	for _, o := range ev.Observations {
+	for i, o := range ev.Observations {
 		ro := Observation{
+			ID:            fmt.Sprintf("obs-%d", i+1),
 			Kind:          o.Kind,
 			Source:        source,
 			Endpoint:      o.URL,

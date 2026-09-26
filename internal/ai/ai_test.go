@@ -43,7 +43,7 @@ func TestBudgetTracker(t *testing.T) {
 }
 
 func TestBuildMessagesEnforcesBoundaryInPrompt(t *testing.T) {
-	msgs := BuildMessages(AnalysisRequest{Task: TaskFindingAnalyst, Target: "http://t", Payload: json.RawMessage(`{"x":1}`)})
+	msgs := BuildMessages(AnalysisRequest{Task: TaskFindingAnalysis, Target: "http://t", Payload: json.RawMessage(`{"x":1}`)})
 	if len(msgs) != 2 || msgs[0].Role != "system" || msgs[1].Role != "user" {
 		t.Fatalf("unexpected messages: %+v", msgs)
 	}
@@ -83,7 +83,7 @@ func fakeBackend(t *testing.T, content string, promptTok, compTok int) *httptest
 func TestOpenAICompatAnalyzeParsesProposals(t *testing.T) {
 	// A well-behaved model reply — and note the sneaky "verdict" key, which must be
 	// dropped because AnalysisResult has no such field.
-	content := `{"proposals":[{"candidate_type":"path_normalization","title":"double-encoded traversal","required_evidence":["baseline_response","normalized_response"],"confidence":0.7}],"missing_evidence":["alternate_encoding_response"],"verdict":"confirmed","severity":"critical"}`
+	content := `{"proposals":[{"candidate_type":"path_normalization","title":"double-encoded traversal","evidence_required":["baseline_response","normalized_response"],"confidence":0.7}],"missing_evidence":["alternate_encoding_response"],"verdict":"confirmed","severity":"critical"}`
 	s := fakeBackend(t, content, 42, 17)
 	defer s.Close()
 
@@ -95,7 +95,7 @@ func TestOpenAICompatAnalyzeParsesProposals(t *testing.T) {
 	if !strings.HasPrefix(p.Name(), "openai-compat:") {
 		t.Errorf("name = %q", p.Name())
 	}
-	res, err := p.Analyze(context.Background(), AnalysisRequest{Task: TaskFindingAnalyst, Target: "http://t", Payload: json.RawMessage(`{}`)})
+	res, err := p.Analyze(context.Background(), AnalysisRequest{Task: TaskFindingAnalysis, Target: "http://t", Payload: json.RawMessage(`{}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestOpenAICompatToleratesWrappedJSON(t *testing.T) {
 	s := fakeBackend(t, content, 1, 1)
 	defer s.Close()
 	p, _ := NewOpenAICompat(OpenAICompatConfig{BaseURL: s.URL + "/v1", Model: "m"}, nil)
-	res, err := p.Analyze(context.Background(), AnalysisRequest{Task: TaskDiffAnalyst})
+	res, err := p.Analyze(context.Background(), AnalysisRequest{Task: TaskEvidenceGap})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestOpenAICompatErrors(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
 	defer s.Close()
 	p2, _ := NewOpenAICompat(OpenAICompatConfig{BaseURL: s.URL + "/v1", Model: "m"}, nil)
-	if _, err := p2.Analyze(context.Background(), AnalysisRequest{Task: TaskFindingAnalyst}); err == nil {
+	if _, err := p2.Analyze(context.Background(), AnalysisRequest{Task: TaskFindingAnalysis}); err == nil {
 		t.Fatal("500 accepted")
 	}
 	// Budget exhausted before request.
@@ -149,7 +149,7 @@ func TestOpenAICompatErrors(t *testing.T) {
 	s2 := fakeBackend(t, `{"proposals":[]}`, 1, 1)
 	defer s2.Close()
 	p3, _ := NewOpenAICompat(OpenAICompatConfig{BaseURL: s2.URL + "/v1", Model: "m"}, tr)
-	if _, err := p3.Analyze(context.Background(), AnalysisRequest{Task: TaskFindingAnalyst}); err != ErrBudgetExceeded {
+	if _, err := p3.Analyze(context.Background(), AnalysisRequest{Task: TaskFindingAnalysis}); err != ErrBudgetExceeded {
 		t.Fatalf("expected ErrBudgetExceeded, got %v", err)
 	}
 }
