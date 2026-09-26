@@ -132,6 +132,24 @@ var validationRecords = map[string]model.Validation{
 		EvidenceRefs: []string{"docs/gitlab-attack-surface.md"},
 	},
 
+	// ActiveMQ: four real binaries run this round — 5.16.6, 5.17.5, 5.18.2
+	// (vulnerable, OpenWire live) and 5.17.6 (fixed, OpenWire still live) — see
+	// docs/activemq-attack-surface.md. NegativePath is deliberately false: the
+	// fixed-version state is FixedPath, not NegativePath (that would be
+	// "affected version but OpenWire genuinely absent/disabled", a state we
+	// have not tested against a real instance).
+	"CVE-2023-46604": {
+		Tier:           model.ValidationLive,
+		TestedVersions: []string{"5.16.6", "5.17.5", "5.17.6", "5.18.2"},
+		TestedStates:   []string{"affected_version_openwire_live", "fixed_version_openwire_live"},
+		Coverage: &model.ValidationCoverage{
+			ProductIdentity: true,
+			PositivePath:    true,
+			FixedPath:       true,
+		},
+		EvidenceRefs: []string{"docs/activemq-attack-surface.md"},
+	},
+
 	// Device/mock lines: unit- and FP-corpus-validated only. Fingerprints are
 	// heuristic pending a real appliance — see CHANGELOG.md#coverage.
 	"CVE-2024-55591": {Tier: model.ValidationFixture, EvidenceRefs: []string{"CHANGELOG.md#coverage"}},

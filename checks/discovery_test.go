@@ -48,10 +48,19 @@ func TestDiscoveryRoutesEveryBuiltinProduct(t *testing.T) {
 	}
 
 	// Test discovery routing for each registered product with minimal signals.
+	// verifiedElsewhere: this product has no HTTP-observable signal at all (a raw
+	// TCP protocol on a fixed port, e.g. ActiveMQ's OpenWire), so the generic
+	// httptest.NewServer fixture below can't exercise its route — a real fixture
+	// would need to bind the exact product port, which risks flaky port
+	// conflicts in CI. Its entry only satisfies the reverse-completeness check
+	// below; the actual routing is covered by its own dedicated test (see
+	// TestActiveMQDiscoverySignal), same as TestGitLabDiscoverySignals and
+	// TestJBossWildFlyDiscoverySignals already do for their products.
 	testCases := map[string]struct {
-		header string
-		body   string
-		want   string
+		header            string
+		body              string
+		want              string
+		verifiedElsewhere bool
 	}{
 		"apache": {header: "Server: Apache/2.4.50", body: "", want: "apache"},
 		"nginx": {header: "Server: nginx/1.0", body: "", want: "nginx"},
@@ -66,11 +75,11 @@ func TestDiscoveryRoutesEveryBuiltinProduct(t *testing.T) {
 		"netscaler": {header: "", body: "NetScaler Gateway", want: "netscaler"},
 		"fortinet": {header: "", body: "FortiGate", want: "fortinet"},
 		"oracle-proxy": {header: "Server: Oracle-HTTP-Server/2.0", body: "", want: "oracle-proxy"},
+		"activemq": {want: "activemq", verifiedElsewhere: true},
 	}
 
 	for product, tc := range testCases {
-		if !registered[product] {
-			// Product not registered, skip this test case.
+		if !registered[product] || tc.verifiedElsewhere {
 			continue
 		}
 
@@ -396,6 +405,76 @@ func TestGitLabDiscoveryHeaderStrippedRedirect(t *testing.T) {
 
 	if !disc.Products["gitlab"] {
 		t.Error("GitLab should be routed when root redirects to /users/sign_in (header stripped, body empty)")
+	}
+}
+
+// rawTCPProbe implements httpx.Probe with a canned TCP reply, for products like
+// ActiveMQ's OpenWire that have no HTTP-observable signal at all — Get/Fingerprint
+// are irrelevant to their routing rule, so they return bare 404s.
+type rawTCPProbe struct {
+	tcpResp []byte
+	tcpErr  error
+}
+
+func (p rawTCPProbe) TCP(context.Context, model.Target, []byte, int) ([]byte, error) {
+	return p.tcpResp, p.tcpErr
+}
+func (p rawTCPProbe) Get(context.Context, model.Target, string) (httpx.Response, error) {
+	return httpx.Response{StatusCode: 404, Headers: map[string]string{}}, nil
+}
+func (p rawTCPProbe) Fingerprint(context.Context, model.Target) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p rawTCPProbe) Post(context.Context, model.Target, string, string, []byte) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+func (p rawTCPProbe) Options(context.Context, model.Target, string) (httpx.Response, error) {
+	return httpx.Response{Headers: map[string]string{}}, nil
+}
+
+// TestActiveMQDiscoverySignal is the real end-to-end regression for ActiveMQ's
+// routing rule: unlike every other product here, OpenWire has zero HTTP signal,
+// so target.Port == 61616 is the ONLY routing hint. This fails if that rule is
+// ever removed or the port constant drifts — unlike a fixture-less testCases
+// entry, which would stay silently green.
+func TestActiveMQDiscoverySignal(t *testing.T) {
+	// A real WireFormatInfo frame shape (magic + protocol-version int + a
+	// ProviderVersion property), matching what four real ActiveMQ binaries sent
+	// in docs/activemq-attack-surface.md.
+	frame := append([]byte{0, 0, 0, 0, 0x01}, []byte("ActiveMQ")...)
+	frame = append(frame, 0, 0, 0, 0x0c)
+	frame = append(frame, []byte("ProviderVersion")...)
+	frame = append(frame, 0, 6)
+	frame = append(frame, []byte("5.17.5")...)
+
+	target, err := model.ParseTarget("http://127.0.0.1:61616")
+	if err != nil {
+		t.Fatalf("ParseTarget failed: %v", err)
+	}
+	disc := Discover(context.Background(), rawTCPProbe{tcpResp: frame}, target)
+	if !disc.Products["activemq"] {
+		t.Error("target.Port == 61616 with a real OpenWire handshake must route activemq")
+	}
+
+	// Negative: the same port, but the bytes are not OpenWire at all.
+	discNeg := Discover(context.Background(), rawTCPProbe{tcpResp: []byte("not activemq at all")}, target)
+	if discNeg.Products["activemq"] {
+		t.Error("non-OpenWire bytes on :61616 must not route activemq")
+	}
+
+	// Negative: OpenWire's default port, but nothing is actually listening.
+	discErr := Discover(context.Background(), rawTCPProbe{tcpErr: context.DeadlineExceeded}, target)
+	if discErr.Products["activemq"] {
+		t.Error("a TCP error on :61616 must not route activemq")
+	}
+
+	// Off the default port with the exact same real frame: must NOT route,
+	// since port is the only signal we have (documented limitation, same as
+	// WebLogic's target.Port == 7001 rule).
+	otherPort, _ := model.ParseTarget("http://127.0.0.1:8080")
+	discOffPort := Discover(context.Background(), rawTCPProbe{tcpResp: frame}, otherPort)
+	if discOffPort.Products["activemq"] {
+		t.Error("OpenWire on a non-default port must not route without an HTTP hint — this is a documented gap, not a fixed rule")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"strings"
 
+	"gopoc/checks/activemq/protocol"
 	"gopoc/checks/jbosswildfly"
 	"gopoc/internal/httpx"
 	"gopoc/internal/model"
@@ -165,6 +166,21 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 			add("weblogic")
 		}
 		d.Observations = append(d.Observations, obs)
+	}
+	// OpenWire has no HTTP-observable signal at all (it's a raw binary protocol,
+	// never fronted by an HTTP proxy) — unlike every other product here, the
+	// default port is the ONLY routing hint available. Delegate to the same
+	// protocol.OpenWire the checker uses, so discovery and the checker share one
+	// magic-byte/version parser and can never disagree on what counts as
+	// ActiveMQ. The probe writes nothing (server-speaks-first), so this is as
+	// cheap and safe as the passive read the checker itself performs.
+	if target.Port == 61616 {
+		identified, _, obs := protocol.OpenWire(ctx, client, target)
+		d.TCPRequests++
+		d.Observations = append(d.Observations, obs)
+		if identified {
+			add("activemq")
+		}
 	}
 	return d
 }
