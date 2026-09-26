@@ -47,8 +47,48 @@ type RegisteredAction struct {
 // registry's AllowedActions(scope, state) for the current scope/state, taking
 // an ActionID (or a research.ActionSuggestion carrying one) at most as
 // advisory input to weigh — never as the value it binds.
+//
+// Critically, a BoundAction is not JUST an authorized ActionID: it also binds
+// the scope and state fingerprint it was authorized FOR. Without this, a
+// capability issued while the system was in "Scope X, State A" would remain a
+// bare ActionID with no record of that context — and could then be replayed
+// after the scope changed, or after the state moved to "State B", since
+// nothing about the value itself would say it had gone stale. That is a
+// stale-capability / cross-state-replay bug, not a hypothetical one: "the
+// policy allowed this action when the state was A" must never silently become
+// "this action may run no matter the current state". ValidFor is how a future
+// Executor is required to re-verify this immediately before running the
+// action — never trusting that a BoundAction obtained earlier is still good.
 type BoundAction struct {
 	id ActionID
+	// scopeHash and authorizedStateHash are the ExplorationScope.Hash() and
+	// StateFingerprint.StateFingerprintHash() the future ActionPolicy observed
+	// at the moment of binding. registryRevision is an optional, recommended
+	// tag of the registry state at that moment (e.g. so a hot-reloaded registry
+	// cannot make a stale binding resolve to a different, newer action under
+	// the same RegistryKey); it is not yet checked by anything since no
+	// registry with a revision concept exists.
+	scopeHash           string
+	authorizedStateHash string
+	registryRevision    string
+}
+
+// ID returns the action identity this capability was bound to. Safe to expose:
+// an ActionID alone grants nothing (see ActionID's doc); the authorization proof
+// is ValidFor, not the identity.
+func (a BoundAction) ID() ActionID { return a.id }
+
+// ValidFor reports whether this BoundAction was authorized for EXACTLY this
+// scope and state fingerprint. A future Executor MUST call this immediately
+// before running the action and refuse to execute if it returns false: an
+// action authorized when the state was `authorizedStateHash` does not remain
+// valid once the state has moved on, or the scope has changed, even though the
+// BoundAction value itself still exists and could otherwise be replayed. On the
+// current zero-value BoundAction (no constructor exists yet) this always
+// returns false, since there is nothing to match.
+func (a BoundAction) ValidFor(scopeHash, stateFingerprintHash string) bool {
+	return a.scopeHash != "" && a.scopeHash == scopeHash &&
+		a.authorizedStateHash != "" && a.authorizedStateHash == stateFingerprintHash
 }
 
 // RecoveryPlanRef references a registered recovery procedure — advisory,
@@ -58,7 +98,27 @@ type RecoveryPlanRef struct {
 }
 
 // BoundRecovery is the ONLY value a future Executor may run to recover state —
-// the recovery analogue of BoundAction, with the identical guarantee.
+// the recovery analogue of BoundAction, with the identical guarantee, bound to
+// the scope it was authorized for (so a recovery capability issued in one
+// ExplorationScope can never be replayed against a different one) and to the
+// baseline fingerprint it is meant to restore (so a caller can cross-check it
+// against the RecoveryPlan.Baseline it is about to use).
 type BoundRecovery struct {
-	ref RecoveryPlanRef
+	ref                     RecoveryPlanRef
+	scopeHash               string
+	baselineFingerprintHash string
+}
+
+// Ref returns the recovery identity this capability was bound to. Safe to
+// expose, for the same reason ActionID is.
+func (r BoundRecovery) Ref() RecoveryPlanRef { return r.ref }
+
+// BaselineFingerprintHash returns the fingerprint hash this recovery is
+// authorized to restore to.
+func (r BoundRecovery) BaselineFingerprintHash() string { return r.baselineFingerprintHash }
+
+// ValidFor reports whether this BoundRecovery was authorized for exactly this
+// scope. A future Executor must call this before running the recovery.
+func (r BoundRecovery) ValidFor(scopeHash string) bool {
+	return r.scopeHash != "" && r.scopeHash == scopeHash
 }

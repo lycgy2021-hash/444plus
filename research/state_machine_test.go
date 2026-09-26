@@ -9,8 +9,9 @@ import (
 
 // This file tests only the PURE functions/values the S10 contract defines
 // (ExplorationScope.Hash, ExplorationBudget.Valid, Recovered,
-// StateTransition.ScopeConsistent, StateFingerprint's immutability). There is
-// no explorer, no registry, and no execution logic to test yet — that is the
+// StateTransition.ScopeConsistent, StateFingerprint's constructor-only hashing
+// and immutability, actionauth's zero-value-only capabilities). There is no
+// explorer, no registry, and no execution logic to test yet — that is the
 // point of a contract-only stage. These tests exist so the contract's own
 // value-level guarantees are pinned before any implementation is built on top
 // of them.
@@ -75,12 +76,9 @@ func TestExplorationBudgetValidRequiresEveryFieldStrictlyPositive(t *testing.T) 
 	}
 }
 
-// BoundAction/BoundRecovery now live in a SEPARATE package (internal/actionauth)
-// specifically so this is enforced by the Go compiler, not by convention within
-// one package: there is no identifier this file could even write to construct
-// one with a real identity — actionauth.BoundAction{id: ...} would not compile
-// here, because `id` is unexported in actionauth and this file is in package
-// research. The only value reachable from here is the zero value.
+// --- actionauth capability boundary: compiler-enforced, and now bound to
+// scope+state so a stale capability can never be replayed. ---
+
 func TestBoundActionAndRecoveryAreOpaqueFromResearch(t *testing.T) {
 	var a actionauth.BoundAction
 	if a != (actionauth.BoundAction{}) {
@@ -97,6 +95,14 @@ func TestBoundActionAndRecoveryAreOpaqueFromResearch(t *testing.T) {
 	if tr.Action != (actionauth.BoundAction{}) {
 		t.Fatal("StateTransition.Action must still be inert with no policy implemented")
 	}
+	// The zero-value capability must never validate for anything — proving
+	// ValidFor is a real re-check, not a rubber stamp on an empty capability.
+	if a.ValidFor("some-scope", "some-state") {
+		t.Fatal("a zero-value BoundAction must never validate for any scope/state")
+	}
+	if r.ValidFor("some-scope") {
+		t.Fatal("a zero-value BoundRecovery must never validate for any scope")
+	}
 }
 
 // ActionSuggestion (what AI may offer) and actionauth.ActionID (what it names)
@@ -112,20 +118,59 @@ func TestActionSuggestionIsFreelyConstructibleAndAdvisoryOnly(t *testing.T) {
 	// a bare ActionID into a BoundAction. That absence is the guarantee.
 }
 
+// --- StateFingerprint: immutable AND internally consistent (two different
+// guarantees — see boundary 6's doc). ---
+
+func TestStateFingerprintHashesAreConstructorDerivedNeverCallerSupplied(t *testing.T) {
+	// Same facts (any key order), same raw bytes -> identical fingerprint hashes.
+	f1 := NewStateFingerprint("scope-1", []byte("raw-bytes"), map[string]string{"role": "user", "stage": "login"})
+	f2 := NewStateFingerprint("scope-1", []byte("raw-bytes"), map[string]string{"stage": "login", "role": "user"})
+	if f1.StateFingerprintHash() != f2.StateFingerprintHash() {
+		t.Fatal("identical facts (any map iteration/insertion order) must hash identically")
+	}
+	if f1.RawStateArtifactHash() != f2.RawStateArtifactHash() {
+		t.Fatal("identical raw artifact bytes must hash identically")
+	}
+
+	// A single changed fact value must change StateFingerprintHash but NOT
+	// RawStateArtifactHash (the two hashes are independent, per different inputs).
+	f3 := NewStateFingerprint("scope-1", []byte("raw-bytes"), map[string]string{"role": "admin", "stage": "login"})
+	if f3.StateFingerprintHash() == f1.StateFingerprintHash() {
+		t.Fatal("a changed fact value must change StateFingerprintHash")
+	}
+	if f3.RawStateArtifactHash() != f1.RawStateArtifactHash() {
+		t.Fatal("changing facts must not change RawStateArtifactHash (independent inputs)")
+	}
+
+	// Different raw bytes, same facts -> different RawStateArtifactHash but the
+	// SAME StateFingerprintHash (it depends only on facts).
+	f4 := NewStateFingerprint("scope-1", []byte("different-raw-bytes"), map[string]string{"role": "user", "stage": "login"})
+	if f4.RawStateArtifactHash() == f1.RawStateArtifactHash() {
+		t.Fatal("different raw bytes must change RawStateArtifactHash")
+	}
+	if f4.StateFingerprintHash() != f1.StateFingerprintHash() {
+		t.Fatal("StateFingerprintHash must depend only on facts, not on raw bytes")
+	}
+
+	// There is no constructor parameter through which a caller could supply
+	// either hash directly — this test documents that absence: the ONLY inputs
+	// NewStateFingerprint accepts are scopeHash, rawArtifact bytes, and facts.
+}
+
 func TestStateFingerprintIsImmutable(t *testing.T) {
 	facts := map[string]string{"role": "user"}
-	fp := NewStateFingerprint("scope-1", "raw-hash", "fp-hash", facts)
+	fp := NewStateFingerprint("scope-1", []byte("raw-artifact"), facts)
 
 	// Mutating the caller's original map after construction must not affect the
-	// fingerprint (facts were copied in).
+	// fingerprint (facts were copied in) — and, since the hash was computed from
+	// the copy at construction time, this also can't desynchronize the hash.
 	facts["role"] = "admin"
 	if fp.Facts()["role"] != "user" {
 		t.Fatalf("fingerprint must not be affected by mutating the caller's original map, got %v", fp.Facts())
 	}
 
 	// Mutating the map RETURNED by Facts() must not affect the fingerprint either
-	// (the getter returns a copy) — this is the tamper path that would have
-	// desynchronized Facts from StateFingerprintHash.
+	// (the getter returns a copy).
 	got := fp.Facts()
 	got["role"] = "admin"
 	got["injected"] = "true"
@@ -133,13 +178,18 @@ func TestStateFingerprintIsImmutable(t *testing.T) {
 		t.Fatalf("Facts() must return a fresh copy each call, got %v after mutating a prior copy", fp.Facts())
 	}
 
-	if fp.ScopeHash() != "scope-1" || fp.RawStateArtifactHash() != "raw-hash" || fp.StateFingerprintHash() != "fp-hash" {
-		t.Fatalf("getters did not return constructed values: %+v", fp)
+	if fp.ScopeHash() != "scope-1" {
+		t.Fatalf("ScopeHash getter did not return the constructed value: %+v", fp)
 	}
 }
 
 func TestRecoveredRequiresSameScopeAndSameFingerprint(t *testing.T) {
-	fpIn := func(scope, hash string) StateFingerprint { return NewStateFingerprint(scope, "raw", hash, nil) }
+	fp := func(scope string, facts map[string]string) StateFingerprint {
+		return NewStateFingerprint(scope, []byte("raw"), facts)
+	}
+	sameFacts := map[string]string{"stage": "idle"}
+	diffFacts := map[string]string{"stage": "busy"}
+
 	cases := []struct {
 		name string
 		o    RecoveryOutcome
@@ -147,37 +197,39 @@ func TestRecoveredRequiresSameScopeAndSameFingerprint(t *testing.T) {
 	}{
 		{
 			name: "same_scope_same_fingerprint",
-			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s1", "abc"), Result: fpIn("s1", "abc")},
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fp("s1", sameFacts), Result: fp("s1", sameFacts)},
 			want: true,
 		},
 		{
 			name: "same_scope_different_fingerprint",
-			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s1", "abc"), Result: fpIn("s1", "def")},
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fp("s1", sameFacts), Result: fp("s1", diffFacts)},
 			want: false,
 		},
 		{
-			// The critical case this round's audit exists for: two fingerprints
-			// whose hash strings happen to match, but neither actually belongs to
-			// the outcome's own declared scope (e.g. after crossing a disk/replay/
-			// worker boundary and being paired with the wrong scope). A bare string
-			// comparison of the hashes alone would wrongly call this recovered.
+			// The critical case this audit closed: two fingerprints whose hash
+			// happens to match (same facts), but NEITHER actually belongs to the
+			// outcome's own declared scope. A bare hash-string comparison alone
+			// would wrongly call this recovered.
 			name: "matching_hash_but_wrong_scope",
-			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s2", "abc"), Result: fpIn("s3", "abc")},
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fp("s2", sameFacts), Result: fp("s3", sameFacts)},
 			want: false,
 		},
 		{
 			name: "baseline_scope_mismatch_only",
-			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s2", "abc"), Result: fpIn("s1", "abc")},
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fp("s2", sameFacts), Result: fp("s1", sameFacts)},
 			want: false,
 		},
 		{
 			name: "empty_outcome_scope",
-			o:    RecoveryOutcome{ScopeHash: "", Baseline: fpIn("", "abc"), Result: fpIn("", "abc")},
+			o:    RecoveryOutcome{ScopeHash: "", Baseline: fp("", sameFacts), Result: fp("", sameFacts)},
 			want: false,
 		},
 		{
-			name: "empty_baseline_hash_never_recovered",
-			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: fpIn("s1", ""), Result: fpIn("s1", "")},
+			// A zero-value (never constructed) StateFingerprint has an empty hash —
+			// Recovered's defense-in-depth check must reject it even if ScopeHash
+			// superficially lines up.
+			name: "uninitialized_fingerprint_never_recovered",
+			o:    RecoveryOutcome{ScopeHash: "s1", Baseline: StateFingerprint{}, Result: StateFingerprint{}},
 			want: false,
 		},
 	}
@@ -195,7 +247,7 @@ func TestRecoveredRequiresSameScopeAndSameFingerprint(t *testing.T) {
 }
 
 func TestStateTransitionScopeConsistent(t *testing.T) {
-	fp := func(scope string) StateFingerprint { return NewStateFingerprint(scope, "raw", "hash", nil) }
+	fp := func(scope string) StateFingerprint { return NewStateFingerprint(scope, []byte("raw"), nil) }
 	consistent := StateTransition{
 		ScopeHash:         "scope-1",
 		BeforeFingerprint: fp("scope-1"),
