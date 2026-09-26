@@ -862,12 +862,122 @@ the guarantees hold under test:
     after a policy has already authorized it; the whole chain
     (`ActionID` → an immutable executable catalog → a fixed `GET` path)
     depends on that staying true.
+- **S10-E6 (`research/state_machine_producer.go`): the state-machine Candidate
+  Producer — the first time S10's real `StateTransition`s feed the
+  `Producer → Candidate → Validator → Engine` spine.** Scoped deliberately
+  narrow, exactly as specified: answer ONLY "does a real observed
+  `StateTransition` violate an explicit, pre-declared, authoritative
+  expectation?", emit a `hypothesis` `Candidate` when it does, and stop —
+  **no replay validator, no LLM judgment, and no new execution capability
+  live in this file.** The core rule the whole design exists to enforce:
+  `State A != State B` is never itself an anomaly; only
+  `observed transition + explicit authorized expectation + deterministic
+  comparison` is.
+  - **`OriginStateMachine = "state_machine"`** is a new `Origin.Kind`,
+    added to `research/candidate.go` beside `diff`/`fuzz`/`differential`/`ai`
+    at the exact same level — a SOURCE label, never a higher-confidence
+    marker.
+  - **`TransitionCase` is the producer's ONLY input**: an already-recorded
+    `StateTransition` (Explorer's own output), paired with an explicit
+    `TransitionExpectation` and the `ExpectationSource` that authored it.
+    `ExpectationSource` is S9's already-frozen whitelist, reused
+    **UNCHANGED** — E6 invents no second "who may define correct behavior"
+    system. `spec` / `deterministic_rule` / `human_config` / `detection_fact`
+    remain the only authoritative kinds; `ai`, `llm`, `candidate`,
+    `proposal`, `fuzz`, `diff`, and even `state_machine` itself all remain
+    non-authoritative — so an AI that looks at a transition and says "I
+    think this should stay unauthenticated" produces analysis text, never a
+    `TransitionExpectation`.
+  - **`TransitionExpectation` is PLAIN DATA, never a callback.** The same
+    declarative-not-closure lesson `actionauth.Registration.Requirements`
+    already forced (a closure can silently capture anything — a candidate,
+    an AI-authored predicate, a live reference — a fixed data shape cannot):
+    a closed `TransitionExpectationKind` enum (`state_unchanged`,
+    `fact_unchanged`, `fact_equals`, `fact_transition`) plus `Fact`,
+    `BeforeValue`, `AfterValue` string fields is the entire vocabulary v1
+    supports. `TransitionCase.validate()` rejects a non-authoritative
+    `ExpectationSource`, a self-contradictory (`ScopeConsistent() == false`)
+    transition, and — reusing `actionauth.BoundAction.ValidFor` exactly as
+    designed — a transition whose `Action` was never actually authorized
+    for the state it claims to have started from (a zero-value or replayed
+    `BoundAction` always fails `ValidFor` and so always fails validation
+    here too).
+  - **Fact absence is never silently treated as an empty string.** Every
+    `analyzeFact*` helper reads `value, ok := facts[key]` and returns
+    `TransitionInsufficientEvidence` — never `TransitionViolated` — the
+    instant a fact the rule needs is simply ABSENT. This is the same
+    zero-false-positive discipline S9's boundary judgment already follows:
+    absence of evidence must never manufacture a violation.
+  - **`TransitionAssessment` is THREE-STATE, never a bool**: `satisfied` /
+    `violated` / `insufficient_evidence`. Only `violated` ever produces a
+    candidate; both `satisfied` and `insufficient_evidence` produce zero.
+  - **`TransitionAnomaly` is FACTS ONLY** — `Type`, `RuleKind`, `Fact`,
+    `ExpectedBefore/After`, `ObservedBefore/After`, `EvidenceRefs`; no
+    `Severity`/`Confidence`/`Exploitability`/`Vulnerable`/`Confirmed`/`State`
+    field anywhere, and deliberately not called `Finding` — it is what the
+    deterministic analyzer found, nothing about what it means.
+    `StateMachineProducer.Produce` is the only thing that wraps it into a
+    hypothesis `Candidate`, and it is kept BORING on purpose: validate
+    authority → hash the raw case artifact → analyze deterministically →
+    take only `violated` → `NewHypothesis`. It never re-executes the
+    action, re-collects state, calls an LLM, decides a validator, or
+    promotes anything.
+  - **Provenance/hash discipline, the S8/S9 lossless-vs-denoised split
+    extended to E6.** `StateTransition.TransitionArtifactHash` is
+    Explorer's OWN record of the transition it observed — it does not cover
+    `Expectation`/`ExpectationSource` at all, so it is never what
+    `Candidate.Provenance().RawInputHash` points at.
+    `transitionCaseArtifactHash` is the LOSSLESS canonical serialization of
+    the FULL `TransitionCase` this producer actually consumed (`Transition`
+    + `Expectation` + `ExpectationSource`, including every fact in both
+    fingerprints, sorted only because Go maps have no defined order) — THIS
+    is what `RawInputHash` points at, keeping that field's frozen,
+    cross-producer meaning intact. `TransitionArtifactHash` is still
+    recorded, in `Refs`, alongside `case_artifact_hash`,
+    `expectation_source_kind/id`, `expectation_kind`, and
+    `action_registry_key/variant_id` — never in place of the case hash.
+  - **E6 registers no second "define correct behavior after the fact"
+    escape hatch.** An `Expectation` must exist, authored by an
+    authoritative `ExpectationSource`, BEFORE the `Explorer` session that
+    produces the `StateTransition` it will be judged against ever runs —
+    E6 has no code path that looks at an observed transition and invents
+    what "should" have happened; that would be hindsight bias wearing a
+    detection hat.
+  - **17-item freeze-gate battery** (`research/state_machine_producer_test.go`),
+    every fixture built through the REAL authority packages
+    (`stateauth.HTTPFixtureRegistry()` for `Fingerprint`,
+    `actionauth.ActionPolicy.Select` for `BoundAction` — never a struct
+    literal, since neither type can be constructed with a real identity
+    from outside its own package): no `ExpectationSource` → reject; an
+    `ai`/`llm`/`candidate`/`proposal`/`fuzz`/`diff`/`state_machine` source →
+    reject; differing states with no declared `Expectation` → 0 candidates;
+    `state_unchanged` violated → exactly 1 hypothesis; `state_unchanged`
+    satisfied → 0; `fact_unchanged` with an absent fact →
+    `insufficient_evidence`, 0 candidates; `fact_equals` satisfied → 0;
+    `fact_equals` violated → 1; `fact_transition` A→B as declared → 0;
+    `fact_transition` actually A→C → 1; a scope-inconsistent transition →
+    reject; a zero-value `BoundAction` transition → reject; produced
+    `Candidate.State` is always `Hypothesis`; `Provenance().RawInputHash`
+    equals the `TransitionCase` artifact hash and never equals
+    `TransitionArtifactHash` alone; the case hash is stable across repeated
+    calls on an identical case; and the case hash changes when either
+    `Expectation` or `ExpectationSource.ID` alone changes. All 17 pass.
+  - **v1 explicitly does NOT do:** a replay validator, LLM-based judgment of
+    what counts as an anomaly, any new execution capability, auto-generating
+    an `Expectation` from an observed transition, a `Check func(before,
+    after) bool` callback, treating "fact absent" as `""`, or advancing a
+    `Candidate` past `Hypothesis`. None of these have any code path in
+    `research/state_machine_producer.go` today. A state-machine replay
+    validator is explicitly deferred to a future stage.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
+  A state-machine replay validator for S10/E6 anomalies is also deferred —
+  E6 stops at `Candidate` by design.
 
-Three independent unknown-issue sources now feed the plane: **patch difference
-(S6), crash behavior (S8), runtime differential (S9)** — all deterministic
-producers on the one `Producer → Candidate → Validator → Engine` spine.
+Four independent unknown-issue sources now feed the plane: **patch difference
+(S6), crash behavior (S8), runtime differential (S9), state-machine transition
+(S10/E6)** — all deterministic producers on the one
+`Producer → Candidate → Validator → Engine` spine.
 
 Every source is a new `Origin.Kind` feeding the one spine
 `Producer → Candidate → Registered Validator → ValidationResult → Engine → state`.

@@ -53,6 +53,14 @@ const (
 	OriginFuzz         OriginKind = "fuzz"
 	OriginDiff         OriginKind = "diff"
 	OriginDifferential OriginKind = "differential"
+	// OriginStateMachine (S10/E6): a candidate raised from an observed
+	// StateTransition (a real Explorer session) that violated an explicit,
+	// pre-declared, authoritative TransitionExpectation. This is a SOURCE
+	// label, exactly like OriginDiff/OriginFuzz/OriginDifferential — never a
+	// higher-confidence marker. "State A != State B" is never itself an
+	// anomaly; only a transition that violates an ALREADY-AUTHORIZED
+	// contract is.
+	OriginStateMachine OriginKind = "state_machine"
 	OriginSourceAudit  OriginKind = "source_audit"
 	OriginPassive      OriginKind = "passive"
 	OriginHuman        OriginKind = "human"
