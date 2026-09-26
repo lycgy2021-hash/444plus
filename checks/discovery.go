@@ -75,6 +75,16 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 	if hasHeader("X-Jenkins") || hasHeader("X-Hudson") {
 		add("jenkins")
 	}
+	// GitLab emits X-Gitlab-Meta on every response; the checkers require ≥2
+	// independent signals (header + body/manifest), so this is a routing hint only.
+	if hasHeader("X-Gitlab-Meta") {
+		add("gitlab")
+	}
+	// JBoss/WildFly Management Interface signals. /management probe happens in the
+	// checker itself; this is purely a routing hint based on product name/structure.
+	if strings.Contains(body, "jboss") || strings.Contains(body, "wildfly") || strings.Contains(body, "hibernate validator") {
+		add("jbosswildfly")
+	}
 	if hasHeader("MicrosoftSharePointTeamServices") || hasHeader("X-SharePointHealthScore") || strings.Contains(body, "/_layouts/15/") {
 		add("sharepoint")
 	}
