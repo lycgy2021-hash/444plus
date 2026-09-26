@@ -20,17 +20,24 @@ func fp(t *testing.T, scopeHash string, raw []byte) stateauth.Fingerprint {
 	return f
 }
 
+// rawLenReq is a StateRequirements matching any Fingerprint produced by
+// stateauth.RawLenProjector, regardless of its raw_len value — the
+// declarative equivalent of "always applies", used throughout these tests.
+func rawLenReq() StateRequirements {
+	return StateRequirements{ProjectorID: stateauth.RawLenProjector{}.ID()}
+}
+
 func TestSelectPicksApplicableActionDeterministicallyBySortedKey(t *testing.T) {
 	reg := NewRegistry(
-		Registration{Action: RegisteredAction{Key: "zeta"}, Supports: func(stateauth.Fingerprint) bool { return true }},
-		Registration{Action: RegisteredAction{Key: "alpha"}, Supports: func(stateauth.Fingerprint) bool { return true }},
+		Registration{Action: RegisteredAction{Key: "zeta"}, Requirements: rawLenReq()},
+		Registration{Action: RegisteredAction{Key: "alpha"}, Requirements: rawLenReq()},
 	)
 	policy := NewActionPolicy(reg, NewRecoveryRegistry("reset"))
 	state := fp(t, "scope-1", []byte("AAAA"))
 
 	a, ok := policy.Select("scope-1", state, nil)
 	if !ok {
-		t.Fatal("Select must find an applicable action when at least one Supports the state")
+		t.Fatal("Select must find an applicable action when at least one Requirements matches the state")
 	}
 	if a.ID().RegistryKey != "alpha" {
 		t.Fatalf("Select() picked %q, want the lexically-first applicable key \"alpha\" — selection must be deterministic, not map-iteration order", a.ID().RegistryKey)
@@ -51,17 +58,17 @@ func TestSelectPicksApplicableActionDeterministicallyBySortedKey(t *testing.T) {
 	}
 }
 
-func TestSelectSkipsUnsupportedAndExcludedActions(t *testing.T) {
-	supportsNothing := func(stateauth.Fingerprint) bool { return false }
+func TestSelectSkipsUnmatchedAndExcludedActions(t *testing.T) {
+	otherProjector := StateRequirements{ProjectorID: "some-other-projector"}
 	reg := NewRegistry(
-		Registration{Action: RegisteredAction{Key: "unsupported"}, Supports: supportsNothing},
-		Registration{Action: RegisteredAction{Key: "alpha"}, Supports: func(stateauth.Fingerprint) bool { return true }},
-		Registration{Action: RegisteredAction{Key: "beta"}, Supports: func(stateauth.Fingerprint) bool { return true }},
+		Registration{Action: RegisteredAction{Key: "unmatched"}, Requirements: otherProjector},
+		Registration{Action: RegisteredAction{Key: "alpha"}, Requirements: rawLenReq()},
+		Registration{Action: RegisteredAction{Key: "beta"}, Requirements: rawLenReq()},
 	)
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 	state := fp(t, "scope-1", []byte("AAAA"))
 
-	// "unsupported" never applies, regardless of exclude.
+	// "unmatched" is registered for a different ProjectorID and never applies.
 	a, ok := policy.Select("scope-1", state, nil)
 	if !ok || a.ID().RegistryKey != "alpha" {
 		t.Fatalf("expected alpha (the first applicable, non-excluded key), got %+v ok=%v", a.ID(), ok)
@@ -80,8 +87,33 @@ func TestSelectSkipsUnsupportedAndExcludedActions(t *testing.T) {
 	}
 }
 
+func TestMatchesRequiresExactProjectorIDAndFactSubset(t *testing.T) {
+	state := fp(t, "scope-1", []byte("AAAA")) // RawLenProjector -> Facts{"raw_len":"4"}
+
+	if matches(StateRequirements{ProjectorID: "rawlen-v1", Facts: map[string]string{"raw_len": "4"}}, state) != true {
+		t.Fatal("a requirement whose ProjectorID and listed fact both match must match")
+	}
+	if matches(StateRequirements{ProjectorID: "rawlen-v1", Facts: map[string]string{"raw_len": "5"}}, state) {
+		t.Fatal("a requirement whose listed fact disagrees with the state must not match")
+	}
+	if matches(StateRequirements{ProjectorID: "rawlen-v1", Facts: map[string]string{"nonexistent_fact": "x"}}, state) {
+		t.Fatal("a requirement listing a fact the state does not have must not match")
+	}
+	if matches(StateRequirements{ProjectorID: "some-other-projector"}, state) {
+		t.Fatal("a requirement for a different ProjectorID must never match, regardless of Facts")
+	}
+	if matches(StateRequirements{}, state) {
+		t.Fatal("a zero-value StateRequirements (no ProjectorID) must match nothing — fail-closed")
+	}
+	// An empty Facts map with the right ProjectorID means "any facts" (a
+	// subset match against zero required keys is vacuously satisfied).
+	if !matches(StateRequirements{ProjectorID: "rawlen-v1"}, state) {
+		t.Fatal("a requirement with the right ProjectorID and no Facts constraints must match")
+	}
+}
+
 func TestSelectRequiresNonEmptyScopeAndValidFingerprint(t *testing.T) {
-	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "alpha"}, Supports: func(stateauth.Fingerprint) bool { return true }})
+	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "alpha"}, Requirements: rawLenReq()})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 
 	if _, ok := policy.Select("", fp(t, "scope-1", []byte("A")), nil); ok {
@@ -99,10 +131,10 @@ func TestSelectNeverConsultsAnAdvisorySuggestion(t *testing.T) {
 	// AI-authored suggestion (or anything resembling one) could be passed at
 	// all — there is nothing to wire in, and nothing to accidentally start
 	// consulting later without a deliberate signature change reviewers would
-	// have to notice.
-	reg := NewRegistry(
-		Registration{Action: RegisteredAction{Key: "safe-action"}, Supports: func(stateauth.Fingerprint) bool { return true }},
-	)
+	// have to notice. Requirements being plain data (not a closure) also means
+	// there is no hidden side channel (a global, an env var, a clock) through
+	// which an external actor could influence which key applicable() returns.
+	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "safe-action"}, Requirements: rawLenReq()})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 	state := fp(t, "scope-1", []byte("A"))
 	a, ok := policy.Select("scope-1", state, nil)
@@ -160,18 +192,19 @@ func TestNilAndZeroValuePolicyNeverSelectOrBind(t *testing.T) {
 	}
 }
 
-func TestRegistrationWithNilSupportsFailsClosed(t *testing.T) {
-	// A Registration given with no Supports predicate must support NOTHING —
-	// fail-closed — never silently default to "always applicable".
-	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "no-predicate"}})
+func TestRegistrationWithEmptyRequirementsFailsClosed(t *testing.T) {
+	// A Registration given with a zero-value Requirements (no ProjectorID)
+	// must match NOTHING — fail-closed — never silently default to "always
+	// applicable".
+	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "no-requirements"}})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 	if _, ok := policy.Select("scope-1", fp(t, "scope-1", []byte("A")), nil); ok {
-		t.Fatal("a Registration with a nil Supports must never be selected")
+		t.Fatal("a Registration with empty Requirements must never be selected")
 	}
 }
 
 func TestRegistryHasNoWayToAddAfterConstruction(t *testing.T) {
-	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "http-probe"}, Supports: func(stateauth.Fingerprint) bool { return true }})
+	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "http-probe"}, Requirements: rawLenReq()})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
 	state := fp(t, "scope-1", []byte("A"))
 	// There is no exported method on Registry that adds an entry — this test

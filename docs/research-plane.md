@@ -435,22 +435,41 @@ the guarantees hold under test:
     removing the parameter entirely: `Step()` takes no action-identifying
     input at all. `ActionPolicy.Bind(id, ...)` was replaced with
     `ActionPolicy.Select(scopeHash, fingerprint, exclude)`, which is the ONLY
-    way an action gets chosen: it walks the registry's own COMPILE-TIME
-    `Registration{Action, Supports func(stateauth.Fingerprint) bool}`
-    entries — `Supports` is Go code written by whoever builds the registry,
-    never data, never something an AI/candidate can supply — collects the
-    RegistryKeys that are both applicable (`Supports(fp)==true`) and not
-    already in `exclude`, sorts them, and binds the first one. "Registered !=
-    Allowed" is now a real, enforced relationship, not a slogan: being in the
-    registry only means the key exists; `Supports` is what makes it
-    APPLICABLE to a specific state. `exclude` is FACTS Explorer supplies
-    (which action keys have already been tried from this exact
-    `StateFingerprintHash`) — never a decision; v1 deliberately does not wire
-    any AI-authored suggestion into `Select` at all, not even as an advisory
-    tie-breaker. `TestExplorerStepSelectionIsDeterministicNotCallerChosen`
-    proves two independently constructed Explorers, given identical
+    way an action gets chosen: it walks the registry's own
+    `Registration{Action, Requirements}` entries — see the next bullet for
+    `Requirements`'s own shape — collects the RegistryKeys that MATCH the
+    given Fingerprint and are not already in `exclude`, sorts them, and binds
+    the first one. "Registered != Allowed" is now a real, enforced
+    relationship, not a slogan: being in the registry only means the key
+    exists; `Requirements` is what makes it APPLICABLE to a specific state.
+    `exclude` is FACTS Explorer supplies (which action keys have already been
+    tried from this exact `StateFingerprintHash`) — never a decision; v1
+    deliberately does not wire any AI-authored suggestion into `Select` at
+    all, not even as an advisory tie-breaker.
+    `TestExplorerStepSelectionIsDeterministicNotCallerChosen` proves two
+    independently constructed Explorers, given identical
     scope/collector/policy, select the identical action — the choice comes
     entirely from (scope, state, registry), never from a caller.
+  - **Second regression, found on the very next audit round: the first
+    version of `Requirements` was `Supports func(stateauth.Fingerprint) bool`
+    — a Go closure.** From the type system's point of view that looked like a
+    deterministic predicate, but nothing stops a closure body from reading
+    the wall clock, a global, an environment variable, a feature flag, a
+    random source, or doing I/O — so "Registered != Allowed" would still have
+    rested on an arbitrary function body, not on something that can be read
+    and matched, and the same `(registry, fingerprint)` pair was not
+    actually guaranteed to select the same action every time. Fixed by making
+    `Requirements` pure DATA: `actionauth.StateRequirements{ProjectorID
+    stateauth.ProjectorID, Facts map[string]string}`, matched by a private,
+    pure `matches` function — exact `ProjectorID` equality plus a Facts
+    subset match, no callback, nothing to audit beyond the struct's own
+    fields. A zero-value `StateRequirements` (empty `ProjectorID`) matches
+    NOTHING — fail-closed. Pinning `ProjectorID` (which
+    `stateauth.Fingerprint` already exposed) also closes a narrower gap:
+    different `StateProjector` implementations could otherwise produce
+    similarly-shaped `Facts` for entirely different meanings, and a
+    `Registration` could accidentally (or be crafted to) match a state it was
+    never written for.
   - **`Explorer` holds no authority of its own — it is pure orchestration.** It
     never decides what the state IS (delegated to the injected
     `stateauth.StateProjector`), never decides WHICH action MAY run (delegated
@@ -484,14 +503,60 @@ the guarantees hold under test:
     state already known to exceed the budget the moment it was observed.
     `TestExplorerMaxVisitsPerStateTriggersMandatoryRecoveryThenStops` proves
     the executor actually recorded a recovery call, not merely that `Stopped()`
-    became true. `MaxBranching` still has no runtime check — v1 never branches
-    at all (`Select` always picks at most one action), so there is nothing for
-    it to bound yet; it stays reserved for a future multi-branch Explorer.
+    became true. `MaxBranching` is now enforced, not merely validated:
+    `NewExplorer` REQUIRES it to be exactly 1, not merely positive — v1 never
+    branches at all (`Select` always picks at most one action), so a budget
+    claiming to allow anything else would be configuration that lies about a
+    capability this Explorer does not provide; `MaxBranching` stays reserved
+    for a future multi-branch Explorer to actually use.
   - **Recovery failure is a permanent stop, proved by test:**
     `TestExplorerRecoverySuccessAndFailure/failure_stops_exploration` drives a
     `Recover` call whose re-collected state does not match the baseline and
     checks that every subsequent `Step` and `Recover` call is refused with
     `ErrExplorerStopped`.
+  - **Third regression, closed in the same audit round: scope continuity was
+    checked (`collectAndProjectLocked` already rejected a cross-scope
+    `StateArtifact`/`Fingerprint`), but a rejection only returned an error —
+    it did not stop the explorer.** A caller ignoring that specific error
+    could keep calling `Step`/`Recover` as if nothing had happened. This
+    matters because nothing else structurally prevents the underlying target
+    from silently becoming a DIFFERENT session mid-exploration (a dropped
+    connection, a load balancer routing a probe to a different backend, a
+    misconfigured test double) — without a hard stop, Explorer could keep
+    recording "transitions" that are really "old session state A -> unrelated
+    new session state B", never a legitimate observation. Fixed: EVERY
+    collection/projection failure — in `Baseline`, after an action in `Step`,
+    and inside a recovery attempt — now calls the same permanent-stop path any
+    other fatal condition uses, never merely returning a retryable error.
+    Three tests pin this at each of the three call sites:
+    `TestExplorerBaselineScopeMismatchStopsPermanently`,
+    `TestExplorerPostActionScopeDriftFailsStop` (the action itself ran
+    against a still-valid scope; the drift is caught on the collection
+    immediately after, and the step is never recorded in `History`), and
+    `TestExplorerRecoveryScopeDriftFailsStop` (the recovery WAS dispatched to
+    the executor — a real side effect happened — but verifying it is refused
+    once the re-collection disagrees on scope). Because `e.baseline` and
+    `e.current` are therefore ALWAYS the result of a successful
+    (same-scope) collection for the entire lifetime of a non-stopped
+    Explorer, a "same `StateFingerprintHash` but different scope" scenario —
+    already covered by `stateauth`'s own `Recovered` tests
+    (`matching_hash_but_wrong_scope`) — can never actually arise inside
+    Explorer's orchestration: the drift is caught and stopped at the moment
+    it is observed, before anything could ever compare it against something
+    else.
+  - **Fourth lock, not a regression but tightened before E5: mandatory
+    recovery bypassing the request-budget preflight (deliberate — an
+    exhausted budget must never block the one safety mechanism meant to run
+    exactly when it's exhausted) needed its OWN hard bound, independent of
+    `ExplorationBudget.MaxWallTime`, so a hung recovery could not turn
+    "bounded exploration" into an unbounded wait.** `NewExplorer` now takes a
+    `recoveryTimeout time.Duration` (REQUIRED, strictly positive), and every
+    recovery attempt runs the `Executor.ExecuteRecovery` call under a
+    `context.WithTimeout` derived from it.
+    `TestExplorerRecoveryTimeoutStopsAHungRecovery` drives a cooperative fake
+    executor whose recovery call blocks for 200ms against a 10ms
+    `recoveryTimeout` and checks `Recover` returns well before the full delay
+    and stops the explorer.
   - **`RawLenProjector`** is the first concrete `StateProjector` — deliberately
     minimal (one fact, the raw byte length), proving the contract end-to-end
     without claiming to model any real protocol's state. It is a fixture/test

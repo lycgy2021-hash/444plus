@@ -39,7 +39,9 @@ import (
 //     action runs, with the registry doing nothing but rubber-stamp
 //     membership. Step below takes NO action-identifying parameter at all;
 //     Select is the only place a choice is made, and it is entirely
-//     deterministic (registry + Supports predicates + exclude set);
+//     deterministic — a declarative actionauth.StateRequirements match (plain
+//     data, never a callback: see that type's own doc for why a Go closure
+//     would have been an escape hatch) plus the exclude set;
 //   - it never decides whether a transition is WORTH a hypothesis — that is a
 //     future producer's job against an authoritative ExpectationSource
 //     (boundary 11), not implemented here;
@@ -50,11 +52,11 @@ import (
 // single session, strictly serial (mu serializes every Step/Recover call —
 // at most one in flight at a time, boundary 12), a fixed compile-time
 // registry (no dynamic registration, no hot reload), and a budget that must
-// already be Valid() (no unlimited exploration). There is no automatic
-// exploitability judgment anywhere in this file, and no branching (v1 always
-// selects at most one action per state per Step call — MaxBranching is
-// validated by ExplorationBudget.Valid() but has no corresponding runtime
-// check here, since there is nothing to branch yet).
+// already be Valid() (no unlimited exploration) AND have MaxBranching exactly
+// 1 — NewExplorer refuses any other value, so a budget can never claim to
+// support a branching capability v1's Step/Select do not actually provide
+// (Select always picks at most one action; there is no code path to branch).
+// There is no automatic exploitability judgment anywhere in this file.
 //
 // A budget violation discovered only AFTER a step (MaxStates/
 // MaxVisitsPerState — these depend on the state actually observed, so they
@@ -63,16 +65,36 @@ import (
 // recovery back toward the baseline immediately, then a permanent stop —
 // never a continuation from a state that was already known to exceed the
 // budget the moment it was observed.
+//
+// SCOPE CONTINUITY is enforced structurally, not left to a caller's
+// judgment: every single collect-and-project (in Baseline, after an action in
+// Step, and inside a recovery attempt) requires the observed StateArtifact
+// and Fingerprint to agree with this Explorer's own fixed ExplorationScope —
+// collectAndProjectLocked refuses otherwise — and ANY error there (a scope
+// drift, a plain I/O failure, a projector error) is treated as a PERMANENT
+// STOP, never a retryable condition. Without this, a session that silently
+// reconnected to a different target/session mid-exploration (the target
+// dropped the connection, a load balancer routed a probe to a different
+// backend, a test double was misconfigured) could keep recording
+// "transitions" that are not really state A -> state B at all, but state A
+// (old session) -> state B (an unrelated new session) — never a legitimate
+// observation. Because both e.baseline and e.current are ALWAYS the result of
+// a successful (and therefore same-scope) collectAndProjectLocked call for
+// the entire lifetime of a non-stopped Explorer, RecoveryOutcome's own
+// cross-scope check (stateauth.Recovered) can never actually be exercised by
+// a genuine scope drift here — the drift is caught and stopped at the moment
+// it is observed, before it could ever be compared against anything.
 type Explorer struct {
 	mu sync.Mutex
 
-	scope       ExplorationScope
-	collector   Collector
-	projector   stateauth.StateProjector
-	policy      *actionauth.ActionPolicy
-	executor    Executor
-	budget      ExplorationBudget
-	recoveryRef actionauth.RecoveryPlanRef
+	scope           ExplorationScope
+	collector       Collector
+	projector       stateauth.StateProjector
+	policy          *actionauth.ActionPolicy
+	executor        Executor
+	budget          ExplorationBudget
+	recoveryRef     actionauth.RecoveryPlanRef
+	recoveryTimeout time.Duration
 
 	started   bool
 	stopped   bool
@@ -124,15 +146,24 @@ var (
 
 // NewExplorer constructs an Explorer for exactly one ExplorationScope. It
 // performs no I/O and takes no action itself — Baseline/Step/Recover do
-// that. budget MUST already be Valid(); an invalid budget can never drive
-// exploration (boundary 10), so NewExplorer refuses to construct one.
-// recoveryRef names the SINGLE registered recovery procedure this Explorer
-// will ever use — both for a deliberate Recover call and for the mandatory
-// recovery a post-action budget violation triggers — mirroring RecoveryPlan's
-// own shape (one Baseline, one Recovery ref, never a menu).
-func NewExplorer(scope ExplorationScope, collector Collector, projector stateauth.StateProjector, policy *actionauth.ActionPolicy, executor Executor, budget ExplorationBudget, recoveryRef actionauth.RecoveryPlanRef) (*Explorer, error) {
+// that. budget MUST already be Valid() AND have MaxBranching exactly 1 — v1
+// has no code path that ever branches, so a budget claiming to allow
+// anything else would be configuration that lies about a capability this
+// Explorer does not provide. recoveryRef names the SINGLE registered
+// recovery procedure this Explorer will ever use — both for a deliberate
+// Recover call and for the mandatory recovery a post-action budget violation
+// triggers — mirroring RecoveryPlan's own shape (one Baseline, one Recovery
+// ref, never a menu). recoveryTimeout bounds EVERY recovery attempt (the
+// ExecuteRecovery call specifically, via a derived context) with its own
+// hard deadline, independent of the overall ExplorationBudget.MaxWallTime: a
+// hung recovery — the one safety mechanism v1 has — must never be able to
+// turn "bounded exploration" into an unbounded wait.
+func NewExplorer(scope ExplorationScope, collector Collector, projector stateauth.StateProjector, policy *actionauth.ActionPolicy, executor Executor, budget ExplorationBudget, recoveryRef actionauth.RecoveryPlanRef, recoveryTimeout time.Duration) (*Explorer, error) {
 	if !budget.Valid() {
 		return nil, errors.New("research: exploration budget is invalid (every bound must be strictly positive)")
+	}
+	if budget.MaxBranching != 1 {
+		return nil, errors.New("research: v1 never branches — MaxBranching must be exactly 1, not merely positive")
 	}
 	if collector == nil || projector == nil || policy == nil || executor == nil {
 		return nil, errors.New("research: explorer requires a non-nil collector, projector, policy, and executor")
@@ -140,16 +171,20 @@ func NewExplorer(scope ExplorationScope, collector Collector, projector stateaut
 	if recoveryRef.RegistryKey == "" {
 		return nil, errors.New("research: explorer requires a non-empty recovery ref")
 	}
+	if recoveryTimeout <= 0 {
+		return nil, errors.New("research: explorer requires a strictly positive recoveryTimeout — a hung recovery must never wait forever")
+	}
 	return &Explorer{
-		scope:       scope,
-		collector:   collector,
-		projector:   projector,
-		policy:      policy,
-		executor:    executor,
-		budget:      budget,
-		recoveryRef: recoveryRef,
-		visits:      make(map[string]int),
-		tried:       make(map[string]map[string]bool),
+		scope:           scope,
+		collector:       collector,
+		projector:       projector,
+		policy:          policy,
+		executor:        executor,
+		budget:          budget,
+		recoveryRef:     recoveryRef,
+		recoveryTimeout: recoveryTimeout,
+		visits:          make(map[string]int),
+		tried:           make(map[string]map[string]bool),
 	}, nil
 }
 
@@ -170,6 +205,10 @@ func (e *Explorer) Baseline(ctx context.Context) (stateauth.Fingerprint, error) 
 
 	fp, raw, err := e.collectAndProjectLocked(ctx)
 	if err != nil {
+		// Any collection/projection failure — including a scope mismatch — is
+		// a permanent stop, never a retryable condition: see the package doc
+		// on SCOPE CONTINUITY.
+		e.stopLocked(err)
 		return stateauth.Fingerprint{}, err
 	}
 	e.requests++
@@ -244,6 +283,14 @@ func (e *Explorer) Step(ctx context.Context) (StateTransition, error) {
 
 	after, afterRaw, err := e.collectAndProjectLocked(ctx)
 	if err != nil {
+		// Any collection/projection failure after an action — including a
+		// scope mismatch (the target dropped the connection, a load balancer
+		// routed to a different backend, a session was silently rebuilt) — is
+		// a permanent stop. The action already ran (recorded in e.tried) so
+		// there is no meaningful "retry" here: the observed world no longer
+		// matches this Explorer's own scope, so nothing further it collects
+		// could be trusted either. See the package doc on SCOPE CONTINUITY.
+		e.stopLocked(err)
 		return StateTransition{}, err
 	}
 	e.requests++
@@ -314,6 +361,12 @@ func (e *Explorer) Recover(ctx context.Context) (stateauth.RecoveryOutcome, erro
 
 	outcome, err := e.executeRecoveryLocked(ctx)
 	if err != nil {
+		// Any failure to even RUN a recovery attempt (bind failure, executor
+		// error, a recovery timeout, or a scope mismatch on re-collection) is
+		// a permanent stop: a deliberate Recover call that could not complete
+		// cleanly leaves no state this Explorer can trust enough to continue
+		// from.
+		e.stopLocked(err)
 		return stateauth.RecoveryOutcome{}, err
 	}
 	if !stateauth.Recovered(outcome) {
@@ -347,10 +400,13 @@ func (e *Explorer) forceRecoveryAndStopLocked(ctx context.Context, cause error) 
 
 // executeRecoveryLocked is the shared mechanics behind both a deliberate
 // Recover call and forceRecoveryAndStopLocked's mandatory one: bind this
-// Explorer's single fixed recoveryRef, re-verify ValidFor, run it, and
-// re-collect/re-project. It never itself decides whether the outcome counts
-// as recovered (stateauth.Recovered is the only function that may) and never
-// itself stops the explorer — callers do that.
+// Explorer's single fixed recoveryRef, re-verify ValidFor, run it under its
+// own recoveryTimeout deadline, and re-collect/re-project (itself subject to
+// the same scope-continuity check as every other collection — a scope
+// mismatch here surfaces as an ordinary error, handled like any other
+// executeRecoveryLocked failure by its callers). It never itself decides
+// whether the outcome counts as recovered (stateauth.Recovered is the only
+// function that may) and never itself stops the explorer — callers do that.
 func (e *Explorer) executeRecoveryLocked(ctx context.Context) (stateauth.RecoveryOutcome, error) {
 	recovery, ok := e.policy.BindRecovery(e.recoveryRef, e.scope.Hash(), e.baseline.StateFingerprintHash())
 	if !ok {
@@ -359,7 +415,13 @@ func (e *Explorer) executeRecoveryLocked(ctx context.Context) (stateauth.Recover
 	if !recovery.ValidFor(e.scope.Hash()) {
 		return stateauth.RecoveryOutcome{}, ErrRecoveryNotAuthorized
 	}
-	if err := e.executor.ExecuteRecovery(ctx, recovery); err != nil {
+	// recoveryTimeout is a hard deadline on this call alone, independent of
+	// ExplorationBudget.MaxWallTime — the one safety mechanism v1 has must
+	// never be able to hang forever.
+	recoveryCtx, cancel := context.WithTimeout(ctx, e.recoveryTimeout)
+	err := e.executor.ExecuteRecovery(recoveryCtx, recovery)
+	cancel()
+	if err != nil {
 		return stateauth.RecoveryOutcome{}, fmt.Errorf("research: executing recovery %s: %w", e.recoveryRef.RegistryKey, err)
 	}
 	e.requests++
@@ -392,8 +454,8 @@ func (e *Explorer) History() []StateTransition {
 }
 
 // Stopped reports whether the explorer has permanently stopped (a budget
-// bound was reached, a recovery failed to verify, or an internal consistency
-// check failed) and, if so, why.
+// bound was reached, a recovery failed to run or verify, a scope-continuity
+// check failed, or an internal consistency check failed) and, if so, why.
 func (e *Explorer) Stopped() (bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

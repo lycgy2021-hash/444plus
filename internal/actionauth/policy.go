@@ -6,21 +6,70 @@ import (
 	"gopoc/internal/stateauth"
 )
 
-// Registration pairs a RegisteredAction with the deterministic, COMPILE-TIME
-// applicability predicate that decides whether it applies to a given
-// authoritative state. Supports is Go code written by whoever builds the
-// registry — literal, compiled-in logic, never data — so "does this action
-// apply here" can never come from an AI proposal, a candidate, or any other
-// caller-supplied value. This is what makes "Registered != Allowed" real
-// rather than a slogan: being in the registry only means the key exists;
-// Supports is what makes it APPLICABLE to a specific stateauth.Fingerprint.
+// StateRequirements is a DECLARATIVE, purely-data description of which
+// states a registered action applies to — deliberately not a callback. An
+// earlier version of this file used `Supports func(stateauth.Fingerprint)
+// bool`: from the type system's point of view that looked like a
+// deterministic predicate, but a Go closure can read the wall clock, a
+// global, an environment variable, a feature flag, a random source, or do
+// I/O — nothing in the type stops it, so "Registered != Allowed" would still
+// have rested on an arbitrary function body rather than on something that
+// can be read and matched. StateRequirements has no such escape hatch: it is
+// plain data, matched by matches (below) with a pure struct comparison — no
+// callback, no hidden input, nothing to audit beyond the struct's own
+// fields.
+//
+// ProjectorID pins WHICH state semantics this requirement is written
+// against — required, and matched exactly against
+// stateauth.Fingerprint.ProjectorID(). Different StateProjector
+// implementations may produce similarly-shaped Facts for entirely different
+// meanings; without pinning ProjectorID, a Registration could accidentally
+// (or be crafted to) match a state it was never actually written for. Facts
+// lists the exact key/value pairs a Fingerprint's own Facts() must contain
+// (a subset match: any fact NOT listed here is a "don't care" — Facts being
+// empty means "any facts, as long as the ProjectorID matches").
+type StateRequirements struct {
+	ProjectorID stateauth.ProjectorID
+	Facts       map[string]string
+}
+
+// matches reports whether fp satisfies req: fp must have been produced by
+// EXACTLY the ProjectorID req names, and every key/value pair in req.Facts
+// must be present, with an exact value match, in fp.Facts(). A zero-value
+// StateRequirements (empty ProjectorID) matches NOTHING — fail-closed, never
+// fail-open by silently treating an unset requirement as "matches anything".
+func matches(req StateRequirements, fp stateauth.Fingerprint) bool {
+	if req.ProjectorID == "" {
+		return false
+	}
+	if fp.ProjectorID() != req.ProjectorID {
+		return false
+	}
+	facts := fp.Facts()
+	for k, want := range req.Facts {
+		if got, ok := facts[k]; !ok || got != want {
+			return false
+		}
+	}
+	return true
+}
+
+// Registration pairs a RegisteredAction with the declarative
+// StateRequirements that decide whether it applies to a given authoritative
+// state. This is Go DATA written by whoever builds the registry — never a
+// callback — so "does this action apply here" can never come from an AI
+// proposal, a candidate, or any other caller-supplied value, and can never
+// depend on anything outside the Fingerprint being matched. This is what
+// makes "Registered != Allowed" real rather than a slogan: being in the
+// registry only means the key exists; Requirements is what makes it
+// APPLICABLE to a specific stateauth.Fingerprint.
 type Registration struct {
-	Action   RegisteredAction
-	Supports func(stateauth.Fingerprint) bool
+	Action       RegisteredAction
+	Requirements StateRequirements
 }
 
 // Registry is a compile-time-only, closed set of registered actions, each
-// with its own deterministic applicability predicate — the S10 analogue of
+// with its own declarative applicability requirement — the S10 analogue of
 // research.Registry (S5's Validator registry): built once, from a fixed
 // list, with no method to add an entry afterward. Combined with
 // BoundAction's own doc (the v1 registry is immutable for the lifetime of a
@@ -36,21 +85,17 @@ type Registry struct {
 // purpose: dynamic registration would let anything holding a *Registry grow
 // what it authorizes at runtime, which is exactly the "authority that isn't
 // pinned down in the type/construction itself" this package exists to
-// avoid. A Registration with a nil Supports is treated as supporting
-// NOTHING — fail-closed, never fail-open by silently defaulting to "always
-// applicable".
+// avoid. A Registration with a zero-value Requirements (no ProjectorID)
+// matches nothing — fail-closed, never fail-open.
 func NewRegistry(regs ...Registration) *Registry {
 	m := make(map[string]Registration, len(regs))
 	for _, r := range regs {
-		if r.Supports == nil {
-			r.Supports = func(stateauth.Fingerprint) bool { return false }
-		}
 		m[r.Action.Key] = r
 	}
 	return &Registry{entries: m}
 }
 
-// applicable returns the RegistryKeys whose Supports(fp) is true, in a
+// applicable returns the RegistryKeys whose Requirements match(es) fp, in a
 // FIXED, deterministic order (lexically sorted) — so the same (registry, fp)
 // always produces the same candidate list, in the same order, for
 // ActionPolicy.Select to walk. This is never exposed directly: only Select
@@ -61,7 +106,7 @@ func (r *Registry) applicable(fp stateauth.Fingerprint) []string {
 	}
 	keys := make([]string, 0, len(r.entries))
 	for key, reg := range r.entries {
-		if reg.Supports(fp) {
+		if matches(reg.Requirements, fp) {
 			keys = append(keys, key)
 		}
 	}
@@ -99,21 +144,20 @@ func (r *RecoveryRegistry) has(key string) bool {
 
 // ActionPolicy is the SOLE constructor for BoundAction and BoundRecovery —
 // the only place, in this package or any package, either type is ever built
-// with a real (non-zero) identity — AND, critically, the SOLE decision-maker
-// for WHICH action runs. There is no Bind(id)-style entry point that lets a
-// caller (a human, a research.Explorer, or indirectly an AI-authored
+// with a real (non-zero) identity — AND the SOLE decision-maker for WHICH
+// action runs. There is no Bind(id)-style entry point that lets a caller (a
+// human, a research.Explorer, or indirectly an AI-authored
 // research.ActionSuggestion) NAME the action to run and have that name
 // alone produce a credential: Select (below) itself walks the registry's
 // applicable, deterministically sorted candidates for the caller's current
-// Fingerprint and picks the first one not already excluded. The same
+// Fingerprint — matched by pure declarative StateRequirements comparison,
+// never a callback — and picks the first one not already excluded. The same
 // (scope, state, registry, exclude set) therefore always selects the same
-// action — this is what "ActionPolicy = Action Authority" means in
-// practice, not just in a doc comment. A caller supplies FACTS (the current
-// scope, the current authoritative state, which action keys have already
-// been tried from this exact state) — never a decision. v1 deliberately does
-// not wire any AI-authored suggestion into Select at all, even as a
-// tie-breaking hint — the cleanest way to keep AI strictly out of action
-// selection.
+// action. A caller supplies FACTS (the current scope, the current
+// authoritative state, which action keys have already been tried from this
+// exact state) — never a decision. v1 deliberately does not wire any
+// AI-authored suggestion into Select at all, even as a tie-breaking hint —
+// the cleanest way to keep AI strictly out of action selection.
 type ActionPolicy struct {
 	registry         *Registry
 	recoveryRegistry *RecoveryRegistry
@@ -127,15 +171,14 @@ func NewActionPolicy(registry *Registry, recoveryRegistry *RecoveryRegistry) *Ac
 	return &ActionPolicy{registry: registry, recoveryRegistry: recoveryRegistry}
 }
 
-// Select deterministically picks exactly one registered action that is BOTH
-// applicable to fp (per the registry's own compiled-in Supports predicates)
-// AND not already a key in exclude, and returns it bound to scopeHash and
-// fp's own StateFingerprintHash. ok is false if no such action exists —
-// either nothing in the registry supports this state, or everything that
-// does has already been excluded (e.g. already tried from this exact
-// state). The returned ActionID always carries an empty VariantID — v1
-// selects among registered actions only, never among a registered action's
-// own parameter variants.
+// Select deterministically picks exactly one registered action whose
+// StateRequirements match fp AND whose key is not already in exclude, and
+// returns it bound to scopeHash and fp's own StateFingerprintHash. ok is
+// false if no such action exists — either nothing in the registry matches
+// this state, or everything that does has already been excluded (e.g.
+// already tried from this exact state). The returned ActionID always
+// carries an empty VariantID — v1 selects among registered actions only,
+// never among a registered action's own parameter variants.
 func (p *ActionPolicy) Select(scopeHash string, fp stateauth.Fingerprint, exclude map[string]bool) (BoundAction, bool) {
 	stateFingerprintHash := fp.StateFingerprintHash()
 	if p == nil || scopeHash == "" || stateFingerprintHash == "" {
