@@ -87,12 +87,44 @@ type Registry struct {
 // pinned down in the type/construction itself" this package exists to
 // avoid. A Registration with a zero-value Requirements (no ProjectorID)
 // matches nothing — fail-closed, never fail-open.
+//
+// Every Registration is rebuilt here field-by-field, and Requirements.Facts
+// is deep-copied into a fresh map — never stored by the caller's own
+// reference. Without this, "the registry is immutable" would be true only
+// of the Registry TYPE (no add/remove method) while a caller holding the
+// original StateRequirements.Facts map (or the regs slice passed in) could
+// still mutate it after construction and silently change what
+// ActionPolicy.Select considers applicable — an "immutable registry" that
+// can still be edited through a live reference is not actually immutable.
+// Mutating the caller's own copies after this call has NO effect on
+// anything Select ever returns.
 func NewRegistry(regs ...Registration) *Registry {
 	m := make(map[string]Registration, len(regs))
 	for _, r := range regs {
-		m[r.Action.Key] = r
+		m[r.Action.Key] = Registration{
+			Action: r.Action,
+			Requirements: StateRequirements{
+				ProjectorID: r.Requirements.ProjectorID,
+				Facts:       copyFacts(r.Requirements.Facts),
+			},
+		}
 	}
 	return &Registry{entries: m}
+}
+
+// copyFacts returns a fresh map with the same contents as facts, severing
+// any reference back to the caller's original map. A nil input stays nil
+// (a Registration with no Facts constraints means "any facts", not "an
+// empty map of constraints" — the distinction matches's own doc explains).
+func copyFacts(facts map[string]string) map[string]string {
+	if facts == nil {
+		return nil
+	}
+	copied := make(map[string]string, len(facts))
+	for k, v := range facts {
+		copied[k] = v
+	}
+	return copied
 }
 
 // applicable returns the RegistryKeys whose Requirements match(es) fp, in a

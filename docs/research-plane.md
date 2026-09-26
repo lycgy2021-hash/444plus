@@ -556,7 +556,59 @@ the guarantees hold under test:
     `TestExplorerRecoveryTimeoutStopsAHungRecovery` drives a cooperative fake
     executor whose recovery call blocks for 200ms against a 10ms
     `recoveryTimeout` and checks `Recover` returns well before the full delay
-    and stops the explorer.
+    and stops the explorer. **Caveat, corrected on the next audit round:** Go's
+    `ctx` cancellation is COOPERATIVE, not forceful — Explorer provides the
+    deadline and stops trusting the call once it expires, but cannot
+    physically kill an `Executor` implementation that ignores `ctx.Done()`
+    and never returns. Every real `Executor` v1 plugs in MUST itself be
+    context-cooperative (e.g. a future HTTP-based one must build requests
+    with `http.NewRequestWithContext`, not `http.NewRequest`, or the timeout
+    does nothing to the underlying network I/O).
+  - **Fifth regression, found on the next audit round: `Registration`'s
+    declarative `Requirements` (the fix for the earlier closure blocker) still
+    stored the CALLER'S OWN `Facts` map by reference.** `NewRegistry`
+    rebuilding its `map[string]Registration` did not stop a caller who still
+    held the original `StateRequirements.Facts` map (or the `regs` slice
+    passed in) from mutating it AFTER construction and silently changing what
+    `ActionPolicy.Select` would consider applicable from then on — an
+    "immutable registry" that can still be edited through a live reference is
+    not actually immutable, reopening a narrower version of the same class of
+    gap boundary 3 and boundary 6 close elsewhere (a value that LOOKS
+    locked down but has a live path to being changed after the fact). Fixed:
+    `NewRegistry` now rebuilds every `Registration` field-by-field and
+    deep-copies `Requirements.Facts` into a fresh map via `copyFacts` — the
+    registry never stores a reference the caller still holds.
+    `TestNewRegistryDeepCopiesRequirementsAndIsUnaffectedByLaterMutation`
+    mutates both the original `Facts` map and the original `regs` slice after
+    construction and checks `Select`'s result is completely unaffected.
+  - **Sixth regression — the deepest one found so far, a genuine
+    authorization TOCTOU: every action was authorized against `e.current`, a
+    Fingerprint left over from a PAST collection** (`Baseline`, or the
+    previous `Step`'s own post-action collect) — not one taken at the moment
+    of authorization. Even with scope continuity and a fully deterministic,
+    closure-free `Select`, nothing stopped the real target from changing on
+    its own, for reasons this Explorer never caused, in the window between
+    that past observation and the actual `Execute` call — a classic
+    check-then-act gap on the state the check was performed against. Fixed:
+    `Step` now collects and projects a FRESH `Fingerprint` FIRST, before
+    `Select` is ever consulted, and compares it against `e.current`; any
+    disagreement is EXTERNAL STATE DRIFT and an immediate permanent stop,
+    with the action never selected or executed — never silently accepted as
+    a new baseline to continue from. `TestExplorerFreshStateDriftBeforeActionPreventsExecution`
+    is the direct proof: a drifted fresh-before collection stops the explorer
+    with the executor never invoked at all, distinct from
+    `TestExplorerPostActionScopeDriftFailsStop`, which drives the OTHER
+    collection point (no drift before the action — it legitimately runs —
+    drift is only observed on the collection immediately after). Each `Step`
+    now costs three collector-facing "requests" (fresh-before, execute,
+    after) instead of two, reflected in `preflightBudgetLocked`'s cost
+    argument. v1 has no revision/ETag/session-nonce freshness primitive, so
+    this is the deliberately blunt v1 answer — no asynchronous network system
+    eliminates a TOCTOU window entirely, but authorizing off a fresh
+    observation instead of a historical cache closes the part of it this
+    Explorer itself controls; binding a real protocol's own freshness
+    primitive into `BoundAction`/`StateArtifact` is future work, not required
+    to close v1's own responsibility here.
   - **`RawLenProjector`** is the first concrete `StateProjector` — deliberately
     minimal (one fact, the raw byte length), proving the contract end-to-end
     without claiming to model any real protocol's state. It is a fixture/test

@@ -84,6 +84,26 @@ import (
 // cross-scope check (stateauth.Recovered) can never actually be exercised by
 // a genuine scope drift here — the drift is caught and stopped at the moment
 // it is observed, before it could ever be compared against anything.
+//
+// FRESH-STATE AUTHORIZATION closes a narrower, but real, TOCTOU: even with
+// scope continuity enforced, an action was still being authorized against
+// e.current — a Fingerprint left over from a PAST collection (Baseline, or
+// the previous Step's own post-action collect). Nothing stops the real
+// target from changing on its own, for reasons this Explorer never caused,
+// in the time between that past observation and this Step's Execute call.
+// So Step (below) re-collects and re-projects FIRST, before Select is ever
+// consulted, and compares the fresh result against e.current: any
+// disagreement is EXTERNAL STATE DRIFT and a permanent stop, never silently
+// treated as a new baseline to continue from. Every action this Explorer
+// ever authorizes is therefore authorized against a Fingerprint collected
+// THIS Step, not a cached one — v1 has no revision/ETag/session-nonce
+// freshness mechanism, so this is the deliberately blunt v1 answer: no
+// asynchronous network system can eliminate a TOCTOU window entirely, but
+// authorizing off a fresh observation instead of a historical cache closes
+// the window this Explorer itself controls. A future version with a real
+// protocol's own freshness primitive (an ETag, a session nonce, a version
+// counter) could bind that into BoundAction/StateArtifact instead — that is
+// future work, not needed to close v1's own responsibility here.
 type Explorer struct {
 	mu sync.Mutex
 
@@ -154,10 +174,19 @@ var (
 // Recover call and for the mandatory recovery a post-action budget violation
 // triggers — mirroring RecoveryPlan's own shape (one Baseline, one Recovery
 // ref, never a menu). recoveryTimeout bounds EVERY recovery attempt (the
-// ExecuteRecovery call specifically, via a derived context) with its own
-// hard deadline, independent of the overall ExplorationBudget.MaxWallTime: a
-// hung recovery — the one safety mechanism v1 has — must never be able to
-// turn "bounded exploration" into an unbounded wait.
+// ExecuteRecovery call specifically) with its own hard deadline context,
+// independent of the overall ExplorationBudget.MaxWallTime: a hung recovery
+// — the one safety mechanism v1 has — must never be able to turn "bounded
+// exploration" into an unbounded wait. IMPORTANT CAVEAT: ctx cancellation in
+// Go is COOPERATIVE, not forceful. Explorer provides the deadline context and
+// stops trusting the call once it expires (the caller-visible effect is the
+// same either way: Recover returns promptly and the explorer stops), but it
+// cannot physically kill an Executor implementation that ignores ctx.Done()
+// and never returns. Every real Executor v1 plugs in MUST be
+// context-cooperative — e.g. a future HTTP-based Executor must build its
+// requests with http.NewRequestWithContext, not http.NewRequest, or the
+// underlying network I/O will not actually be cancelled when this deadline
+// fires.
 func NewExplorer(scope ExplorationScope, collector Collector, projector stateauth.StateProjector, policy *actionauth.ActionPolicy, executor Executor, budget ExplorationBudget, recoveryRef actionauth.RecoveryPlanRef, recoveryTimeout time.Duration) (*Explorer, error) {
 	if !budget.Valid() {
 		return nil, errors.New("research: exploration budget is invalid (every bound must be strictly positive)")
@@ -239,6 +268,21 @@ func (e *Explorer) Baseline(ctx context.Context) (stateauth.Fingerprint, error) 
 // budget violation discovered only AFTER this step (MaxStates/
 // MaxVisitsPerState) triggers MANDATORY recovery and a permanent stop before
 // Step returns — see the package doc.
+//
+// Step authorizes its action against a FRESHLY collected Fingerprint, never
+// against e.current as a cached credential. e.current is only ever set by a
+// PAST collection (Baseline, or the previous Step's post-action collect) —
+// trusting it here would leave a TOCTOU window: the real target could
+// change on its own, for reasons this Explorer never caused, in the time
+// between when that past Fingerprint was taken and when this Step actually
+// authorizes and runs an action against it. So every Step call re-collects
+// and re-projects FIRST, before Select is ever consulted, and if that fresh
+// observation disagrees with e.current, that is EXTERNAL STATE DRIFT — never
+// treated as a new legitimate state to continue from, never silently
+// accepted as the new baseline. It is a permanent stop, for the same reason
+// a scope mismatch is (see SCOPE CONTINUITY): an explorer whose authorization
+// might be based on a state that no longer exists cannot be trusted to keep
+// authorizing anything.
 func (e *Explorer) Step(ctx context.Context) (StateTransition, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -249,14 +293,33 @@ func (e *Explorer) Step(ctx context.Context) (StateTransition, error) {
 	if !e.started {
 		return StateTransition{}, errors.New("research: Baseline must be called before the first Step")
 	}
-	if err := e.preflightBudgetLocked(2); err != nil {
+	if err := e.preflightBudgetLocked(3); err != nil {
 		e.stopLocked(err)
 		return StateTransition{}, err
 	}
 
-	before := e.current
-	beforeRaw := e.currentRaw
+	// Fresh authorization state — NEVER e.current used as-is. This is the
+	// TOCTOU fix: Select/Bind below only ever see a Fingerprint collected
+	// this instant, not one left over from a previous Step.
+	before, beforeRaw, err := e.collectAndProjectLocked(ctx)
+	if err != nil {
+		e.stopLocked(err)
+		return StateTransition{}, err
+	}
+	e.requests++
 	beforeHash := before.StateFingerprintHash()
+	if beforeHash != e.current.StateFingerprintHash() {
+		// The target changed on its own between the end of the previous
+		// step (or Baseline) and the start of this one — external state
+		// drift, not anything this Explorer's own action caused (no action
+		// has run yet this Step). v1's rule: fail-stop, never continue as if
+		// the drifted state were the new current one, and never re-baseline
+		// automatically — that decision belongs to whoever restarts
+		// exploration, not to this Step call.
+		stopErr := fmt.Errorf("research: external state drift observed before Step could authorize an action (expected state %q, observed %q) — exploration STOPS", e.current.StateFingerprintHash(), beforeHash)
+		e.stopLocked(stopErr)
+		return StateTransition{}, stopErr
+	}
 
 	action, ok := e.policy.Select(e.scope.Hash(), before, e.tried[beforeHash])
 	if !ok {

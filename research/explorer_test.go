@@ -155,7 +155,13 @@ func newTestExplorer(t *testing.T, scope ExplorationScope, collector Collector, 
 }
 
 func TestExplorerBaselineThenStepRecordsTransition(t *testing.T) {
-	collector := &fakeCollector{seq: [][]byte{[]byte("AAAA"), []byte("BB")}}
+	// Step now re-collects a FRESH authorization Fingerprint before it does
+	// anything else (the S10-E4d fix) — so each Step consumes TWO collector
+	// calls: a fresh-before (which must match the current state, or Step
+	// fail-stops on drift) and the usual post-action "after". The middle
+	// "AAAA" repeats the baseline value so the fresh-before check sees no
+	// drift; "BB" is the real post-action state.
+	collector := &fakeCollector{seq: [][]byte{[]byte("AAAA"), []byte("AAAA"), []byte("BB")}}
 	executor := &fakeExecutor{}
 	exp := newTestExplorer(t, testScope(), collector, testPolicy(), executor, generousBudget())
 
@@ -203,7 +209,9 @@ func TestExplorerBaselineThenStepRecordsTransition(t *testing.T) {
 // from a caller.
 func TestExplorerStepSelectionIsDeterministicNotCallerChosen(t *testing.T) {
 	run := func() actionauth.ActionID {
-		collector := &fakeCollector{seq: [][]byte{[]byte("AAAA"), []byte("BB")}}
+		// See TestExplorerBaselineThenStepRecordsTransition's comment: Step
+		// now costs two collector calls (fresh-before, then after).
+		collector := &fakeCollector{seq: [][]byte{[]byte("AAAA"), []byte("AAAA"), []byte("BB")}}
 		executor := &fakeExecutor{}
 		exp := newTestExplorer(t, testScope(), collector, testPolicyTwoActions(), executor, generousBudget())
 		if _, err := exp.Baseline(context.Background()); err != nil {
@@ -255,7 +263,11 @@ func TestExplorerStepReturnsNoApplicableActionWithoutSideEffectOrStop(t *testing
 }
 
 func TestExplorerBudgetStopsFurtherSteps(t *testing.T) {
-	collector := &fakeCollector{seq: [][]byte{[]byte("A"), []byte("B"), []byte("C")}}
+	// "A" repeats for the fresh-before check (no drift), then "B" is the
+	// post-action state. The second Step call must be refused by the budget
+	// PREFLIGHT, before it ever touches the collector — so no third value is
+	// needed.
+	collector := &fakeCollector{seq: [][]byte{[]byte("A"), []byte("A"), []byte("B")}}
 	executor := &fakeExecutor{}
 	budget := generousBudget()
 	budget.MaxTransitions = 1
@@ -333,7 +345,10 @@ func TestExplorerMaxVisitsPerStateTriggersMandatoryRecoveryThenStops(t *testing.
 func TestExplorerRecoverySuccessAndFailure(t *testing.T) {
 	t.Run("success_restores_baseline", func(t *testing.T) {
 		baselineRaw := []byte("BASELINE")
-		collector := &fakeCollector{seq: [][]byte{baselineRaw, []byte("DIFFERENT-LEN-9"), baselineRaw}}
+		// baselineRaw repeats once for Step's fresh-before check (no drift),
+		// then "DIFFERENT-LEN-9" is the post-action state, then baselineRaw
+		// again for Recover's re-collection.
+		collector := &fakeCollector{seq: [][]byte{baselineRaw, baselineRaw, []byte("DIFFERENT-LEN-9"), baselineRaw}}
 		executor := &fakeExecutor{}
 		exp := newTestExplorer(t, testScope(), collector, testPolicy(), executor, generousBudget())
 		if _, err := exp.Baseline(context.Background()); err != nil {
@@ -428,16 +443,53 @@ func TestExplorerBaselineScopeMismatchStopsPermanently(t *testing.T) {
 	}
 }
 
+// TestExplorerFreshStateDriftBeforeActionPreventsExecution is the direct
+// regression test for the S10-E4d TOCTOU fix: Step now re-collects a FRESH
+// Fingerprint before it ever selects or executes anything, specifically so
+// it never authorizes an action against e.current as a stale cache. Here the
+// fresh-before collection itself observes a drifted scope (the target
+// changed between the end of Baseline and the start of Step) — the action
+// must NEVER run: this proves the drift is caught BEFORE Execute, not just
+// eventually noticed afterward.
+func TestExplorerFreshStateDriftBeforeActionPreventsExecution(t *testing.T) {
+	drifted := ExplorationScope{TargetID: "drifted"}
+	collector := &fakeCollector{
+		seq:      [][]byte{[]byte("AAAA")},
+		scopeSeq: []ExplorationScope{testScope(), drifted}, // call 0 = baseline (real), call 1 = Step's fresh-before (drifted)
+	}
+	executor := &fakeExecutor{}
+	exp := newTestExplorer(t, testScope(), collector, testPolicy(), executor, generousBudget())
+	if _, err := exp.Baseline(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exp.Step(context.Background()); err == nil {
+		t.Fatal("a fresh-before collection returning a different scope must fail Step")
+	}
+	if len(executor.executed) != 0 {
+		t.Fatalf("executor.executed = %v, want the action to NEVER run once fresh-before authorization observes drift", executor.executed)
+	}
+	stopped, _ := exp.Stopped()
+	if !stopped {
+		t.Fatal("fresh-state drift observed before authorization must permanently stop the explorer")
+	}
+	if got := exp.History(); len(got) != 0 {
+		t.Fatalf("a drift caught before execution must never be recorded in History, got %v", got)
+	}
+}
+
 // TestExplorerPostActionScopeDriftFailsStop is the regression test for the
 // "target dropped/rebuilt the session mid-exploration" scenario S10-E4b
-// closes: the action itself runs against a scope that was still valid at
-// call time, but the collection immediately AFTER it observes a different
-// scope. That must never be recorded as a legitimate transition.
+// closes, exercised at the OTHER collection point Step makes: the
+// fresh-before check sees no drift (the action is legitimately authorized
+// and runs), but the collection immediately AFTER it observes a different
+// scope. That must never be recorded as a legitimate transition either.
 func TestExplorerPostActionScopeDriftFailsStop(t *testing.T) {
 	drifted := ExplorationScope{TargetID: "drifted"}
 	collector := &fakeCollector{
-		seq:      [][]byte{[]byte("AAAA"), []byte("BB")},
-		scopeSeq: []ExplorationScope{testScope(), drifted}, // call 0 = baseline (real scope), call 1 = post-action collect (drifted)
+		seq: [][]byte{[]byte("AAAA"), []byte("AAAA"), []byte("BB")},
+		// call 0 = baseline (real), call 1 = Step's fresh-before (real, no
+		// drift — the action DOES run), call 2 = post-action collect (drifted).
+		scopeSeq: []ExplorationScope{testScope(), testScope(), drifted},
 	}
 	executor := &fakeExecutor{}
 	exp := newTestExplorer(t, testScope(), collector, testPolicy(), executor, generousBudget())
@@ -446,6 +498,9 @@ func TestExplorerPostActionScopeDriftFailsStop(t *testing.T) {
 	}
 	if _, err := exp.Step(context.Background()); err == nil {
 		t.Fatal("a post-action collection returning a different scope must be rejected, not recorded as a transition")
+	}
+	if len(executor.executed) != 1 {
+		t.Fatalf("executor.executed = %v, want the action to have run (drift was only observed AFTER it, not before)", executor.executed)
 	}
 	stopped, _ := exp.Stopped()
 	if !stopped {
@@ -566,7 +621,22 @@ func TestNewExplorerRejectsInvalidBudgetOrNilOrEmptyDependencies(t *testing.T) {
 }
 
 func TestExplorerSerializesConcurrentSteps(t *testing.T) {
-	collector := &fakeCollector{seq: [][]byte{[]byte("A"), []byte("B"), []byte("C")}}
+	// Each successful Step needs its fresh-before collection to match the
+	// PREVIOUS step's resulting state (or the drift check refuses it before
+	// ever reaching Execute) — so consecutive values repeat once each:
+	// baseline=V0; step: fresh-before=V0 (repeat, no drift), after=V1; next
+	// step: fresh-before=V1 (repeat), after=V2; and so on. This is what lets
+	// all 5 concurrent Step calls genuinely reach Execute (a single
+	// always-applicable action would otherwise be excluded as "already
+	// tried" the moment the state stopped changing).
+	collector := &fakeCollector{seq: [][]byte{
+		[]byte("A"),               // baseline V0
+		[]byte("A"), []byte("BB"), // step: fresh-before V0, after V1
+		[]byte("BB"), []byte("CCC"), // step: fresh-before V1, after V2
+		[]byte("CCC"), []byte("DDDD"), // step: fresh-before V2, after V3
+		[]byte("DDDD"), []byte("EEEEE"), // step: fresh-before V3, after V4
+		[]byte("EEEEE"), []byte("FFFFFF"), // step: fresh-before V4, after V5
+	}}
 	executor := &fakeExecutor{delay: 10 * time.Millisecond}
 	exp := newTestExplorer(t, testScope(), collector, testPolicy(), executor, generousBudget())
 	if _, err := exp.Baseline(context.Background()); err != nil {
@@ -585,5 +655,8 @@ func TestExplorerSerializesConcurrentSteps(t *testing.T) {
 
 	if executor.sawConcurrent {
 		t.Fatal("Explorer must serialize Step calls — the executor must never be entered concurrently")
+	}
+	if len(executor.executed) != 5 {
+		t.Fatalf("executor.executed = %v, want all 5 concurrent Step calls to have genuinely reached Execute (otherwise this test does not exercise real concurrency)", executor.executed)
 	}
 }

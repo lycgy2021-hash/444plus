@@ -203,6 +203,32 @@ func TestRegistrationWithEmptyRequirementsFailsClosed(t *testing.T) {
 	}
 }
 
+func TestNewRegistryDeepCopiesRequirementsAndIsUnaffectedByLaterMutation(t *testing.T) {
+	facts := map[string]string{"raw_len": "4"}
+	regs := []Registration{
+		{Action: RegisteredAction{Key: "alpha"}, Requirements: StateRequirements{ProjectorID: "rawlen-v1", Facts: facts}},
+	}
+	reg := NewRegistry(regs...)
+	policy := NewActionPolicy(reg, NewRecoveryRegistry())
+	state := fp(t, "scope-1", []byte("AAAA")) // RawLenProjector -> Facts{"raw_len":"4"}
+
+	a, ok := policy.Select("scope-1", state, nil)
+	if !ok || a.ID().RegistryKey != "alpha" {
+		t.Fatalf("expected an initial match against alpha, got %+v ok=%v", a.ID(), ok)
+	}
+
+	// Mutate BOTH the original Facts map and the original regs slice after
+	// construction — an "immutable registry" that a live reference could
+	// still edit through would not actually be immutable.
+	facts["raw_len"] = "999"
+	regs[0].Action.Key = "renamed"
+
+	b, ok := policy.Select("scope-1", state, nil)
+	if !ok || b.ID().RegistryKey != "alpha" {
+		t.Fatalf("mutating the caller's original Facts map/regs slice after NewRegistry must not affect Select, got %+v ok=%v", b.ID(), ok)
+	}
+}
+
 func TestRegistryHasNoWayToAddAfterConstruction(t *testing.T) {
 	reg := NewRegistry(Registration{Action: RegisteredAction{Key: "http-probe"}, Requirements: rawLenReq()})
 	policy := NewActionPolicy(reg, NewRecoveryRegistry())
