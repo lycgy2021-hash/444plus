@@ -115,6 +115,30 @@ validator registered yet they correctly stay `hypothesis` (no second pipeline, n
 auto-promotion). An AI diff pass can later enrich these candidates, never replace
 the deterministic classification.
 
+**S8 v1 — `research/fuzz.go`** — the fuzz/crash producer, deterministic and
+volume-controlled. Pipeline: `CrashArtifact → Normalize → CrashSignature → dedup
+into CrashGroup → deterministic CrashInterest → (only non-noise groups) →
+Candidate{Origin{Kind:"fuzz"}}`. Boundaries locked from v1:
+- **Two hashes never mixed.** `CrashArtifact.RawInputHash()` is the byte-for-byte
+  hash of the raw crash output; `CrashSignature.Hash` is the hash of the
+  *normalized* crash type + top stable frames (the dedup key). A fuzz candidate's
+  `Provenance.RawInputHash` is a representative raw-crash hash; the signature hash
+  lives in its rationale — distinct fields, distinct meanings.
+- **Normalize before hashing.** Addresses, PIDs, timestamps, temp paths, corpus
+  names, line:col and concrete indices are stripped; crash type and top function
+  frames are kept — so the same bug across runs (different address/PID/temp file)
+  collapses to one signature instead of thousands.
+- **Deterministic classification.** ASAN/sanitizer → memory_safety, SIGSEGV/SIGBUS
+  → memory_safety, Go index/slice/nil panic → panic, timeout/OOM → hang,
+  assertion/abort → invariant_violation, else unknown, and no crash marker →
+  noise. An AI pass may later explain/enrich/suggest-merges — never decide state.
+- **Group before candidate.** Crashes dedup into groups first; only non-noise
+  groups become candidates, so 100k crashes of one bug yield one candidate.
+
+Fuzz candidates flow into the **same** Registry → Validator → Engine spine; with
+no fuzz validator registered they stay `hypothesis` (no auto-promotion, no
+exploitability judgment).
+
 Nothing here touches the 28 checkers or the engine; `go build/vet/test ./...`
 (and `-race`) stays green.
 
@@ -140,12 +164,11 @@ the guarantees hold under test:
 
 - **S1–S5: foundation frozen.**
 - **Provenance: locked.**
-- **S6 (patch/diff intelligence): v1 landed** (deterministic `DiffProducer`; an AI
-  diff pass can enrich later).
-- **S8 (fuzz/crash intelligence): next** — v1 stays small: fuzzer output → crash
-  normalization → stack hash → dedup → security-interesting classification →
-  `Candidate{Origin{Kind:"fuzz"}}`. The fuzz engine discovers; the LLM only
-  understands/classifies — no LLM-generated fuzz inputs yet.
+- **S6 (patch/diff intelligence): v1 landed & audited** (deterministic
+  `DiffProducer`; an AI diff pass can enrich later). Contract frozen.
+- **S8 (fuzz/crash intelligence): v1 landed** (deterministic `FuzzProducer`;
+  raw→normalize→signature→dedup→classify→candidate). No AI fuzz-input generation,
+  no auto-exploitability. Next: review dedup stability + provenance, then freeze.
 - **Deferred:** `S7` large-scale source audit, `S9` differential engine, `S10`
   state-machine explorer — not until S6/S8 are stable.
 
