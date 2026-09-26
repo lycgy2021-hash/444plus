@@ -2,6 +2,7 @@ package research
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -55,11 +56,16 @@ func TestBudgetedRoundTripperMetersAndBlocksBeforeNetwork(t *testing.T) {
 	}
 }
 
-// TestBudgetedRoundTripperWithoutMeterPassesThrough proves a request with no
-// RequestMeter attached to its context still works — the same
-// "cooperative when absent" behavior RequestMeterFromContext documents,
-// exercised through the real HTTP path this time.
-func TestBudgetedRoundTripperWithoutMeterPassesThrough(t *testing.T) {
+// TestBudgetedRoundTripperFailsClosedWithoutMeter is the direct regression
+// test for the audit's one remaining ask on E4h: a request whose context
+// carries NO RequestMeter must be refused outright, never quietly performed
+// unmetered. Without this, a future real Collector that built its
+// *http.Request with plain http.NewRequest (instead of
+// http.NewRequestWithContext(ctx, ...) using the context Explorer actually
+// attached a meter to) would silently escape MaxRequests entirely, even
+// with BudgetedRoundTripper installed as its Transport — the choke point
+// only works if "missing meter" means "refuse", not "proceed anyway".
+func TestBudgetedRoundTripperFailsClosedWithoutMeter(t *testing.T) {
 	var served int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&served, 1)
@@ -67,14 +73,17 @@ func TestBudgetedRoundTripperWithoutMeterPassesThrough(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := &http.Client{Transport: &BudgetedRoundTripper{}}
-	resp, err := client.Get(ts.URL)
-	if err != nil {
-		t.Fatalf("a request with no meter attached must still succeed: %v", err)
+	base := &fakeBaseRoundTripper{}
+	client := &http.Client{Transport: &BudgetedRoundTripper{Base: base}}
+	_, err := client.Get(ts.URL)
+	if !errors.Is(err, ErrNoRequestMeter) {
+		t.Fatalf("a request with no meter attached = %v, want it to wrap ErrNoRequestMeter", err)
 	}
-	resp.Body.Close()
-	if served != 1 {
-		t.Fatalf("server received %d requests, want 1", served)
+	if served != 0 {
+		t.Fatalf("server received %d requests, want 0 — a request with no meter must never reach the network", served)
+	}
+	if atomic.LoadInt32(&base.calls) != 0 {
+		t.Fatalf("base.calls = %d, want 0 — Base.RoundTrip must never be called when the meter is missing", base.calls)
 	}
 }
 
@@ -93,7 +102,8 @@ func (f *fakeBaseRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 func TestBudgetedRoundTripperUsesProvidedBase(t *testing.T) {
 	base := &fakeBaseRoundTripper{}
 	rt := &BudgetedRoundTripper{Base: base}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.invalid", nil)
+	meter := newBoundedRequestMeter(1)
+	req, err := http.NewRequestWithContext(ContextWithRequestMeter(context.Background(), meter), http.MethodGet, "http://example.invalid", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

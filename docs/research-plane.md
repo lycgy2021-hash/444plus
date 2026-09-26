@@ -697,6 +697,32 @@ the guarantees hold under test:
     executor, cancellation and metering both ride the same context, and both
     are enforced by the stdlib transport layer itself, not merely "hoped
     for" cooperative code.
+  - **Twelfth regression, found on the very next round, closing the last gap
+    in the choke point itself: a request whose context carried NO
+    `RequestMeter` at all was let through unmetered (fail-OPEN), rather than
+    refused.** That would have quietly defeated the whole point: a future
+    real `Collector` that built its `*http.Request` with plain
+    `http.NewRequest` instead of `http.NewRequestWithContext(ctx, ...)` — the
+    context Explorer actually attached a meter to — would silently escape
+    `MaxRequests` entirely, even with `BudgetedRoundTripper` correctly
+    installed as its `Transport`. Fixed: `RoundTrip` now returns
+    `ErrNoRequestMeter` and never calls `Base` at all when no meter is
+    present — FAIL-CLOSED, not a graceful pass-through.
+    `TestBudgetedRoundTripperFailsClosedWithoutMeter` proves the request
+    never reaches the network (the test server's own received-request count
+    is 0, and the `Base` test double's call count is 0) — "missing meter"
+    now means "refuse", never "proceed anyway".
+  - **`S10-E4 = PASS`.** Twelve regressions found and closed across five audit
+    rounds since Explorer v1 first landed (`a08cb5e`) — caller-chosen action
+    identity, post-budget continuation, arbitrary applicability closures,
+    scope/session drift, cached-state authorization, external projector
+    injection, caller-chosen projector identity, guessed request cost,
+    cooperative-only metering, and a fail-open gap in the metering choke
+    point itself — none of which required changing the frozen S10 data
+    contract. The next stage, S10-E5, is the first REAL (non-mock) target: a
+    local read-only HTTP fixture, exercising all of state authority, action
+    authority, scope continuity, budget/metering, and recovery together
+    against real network I/O for the first time.
   - **Small hardening pass, not a regression:** `History()` was already
     proven, not just documented, to return a copy
     (`TestHistoryReturnsIndependentCopy` mutates the returned slice and

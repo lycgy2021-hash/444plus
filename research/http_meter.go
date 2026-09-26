@@ -1,6 +1,9 @@
 package research
 
-import "net/http"
+import (
+	"errors"
+	"net/http"
+)
 
 // BudgetedRoundTripper wraps an http.RoundTripper so that EVERY actual HTTP
 // round trip is metered by whatever RequestMeter is attached to the
@@ -33,17 +36,33 @@ type BudgetedRoundTripper struct {
 	Base http.RoundTripper
 }
 
+// ErrNoRequestMeter is returned by RoundTrip when req's context carries no
+// RequestMeter at all. This is FAIL-CLOSED, not a graceful fallback: a
+// choke point that quietly let an unmetered request through the moment a
+// meter was missing would still let MaxRequests be bypassed entirely — a
+// future real Collector that built its *http.Request with plain
+// http.NewRequest instead of http.NewRequestWithContext(ctx, ...) (the
+// context Explorer actually attached a meter to) would silently escape all
+// metering even with BudgetedRoundTripper installed as its Transport. The
+// whole point of this type is that metering must not depend on whether the
+// caller remembered to wire the context through correctly; refusing when it
+// clearly wasn't is what makes that true, rather than merely likely.
+var ErrNoRequestMeter = errors.New("research: request carries no RequestMeter in its context; refusing to perform it unmetered")
+
 // RoundTrip acquires one unit of request budget from the RequestMeter
 // attached to req's own context (see RequestMeterFromContext) BEFORE
 // forwarding to Base — a request refused here never reaches the network at
-// all. If no meter is attached (e.g. a caller not going through Explorer),
-// RoundTrip performs the request unmetered — the same "cooperative when
-// absent" fallback RequestMeterFromContext documents.
+// all. If NO meter is attached, RoundTrip refuses the request outright
+// (ErrNoRequestMeter) and never calls Base at all — see ErrNoRequestMeter's
+// own doc for why "no meter configured" must never be read as "proceed
+// unmetered" for this specific type.
 func (t *BudgetedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if meter := RequestMeterFromContext(req.Context()); meter != nil {
-		if err := meter.Acquire(); err != nil {
-			return nil, err
-		}
+	meter := RequestMeterFromContext(req.Context())
+	if meter == nil {
+		return nil, ErrNoRequestMeter
+	}
+	if err := meter.Acquire(); err != nil {
+		return nil, err
 	}
 	base := t.Base
 	if base == nil {
