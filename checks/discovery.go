@@ -118,24 +118,44 @@ func Discover(ctx context.Context, client httpx.Probe, target model.Target) Disc
 		add("jbosswildfly")
 	}
 	// Preflight: when app port has no JBoss markers, probe sibling management port.
-	// Real topology: app:8080 (business page) + management:9990 (WildFly). Avoid
-	// false negative by doing one lightweight /management probe on standard ports.
-	if !strings.Contains(body, "jboss") && !strings.Contains(body, "wildfly") && target.Port != 9990 && target.Port != 9993 {
-		mgmtTarget := target
-		for _, mgmtPort := range []int{9990, 9993} {
-			mgmtTarget.Port = mgmtPort
+	// Real topology: app:8080 (business page) + management:9990/9993 (WildFly).
+	// Only probe standard app ports (80, 443, 8000-8999) to avoid noisy probes
+	// against unrelated services. 9990=HTTP, 9993=HTTPS (correct protocols).
+	isStandardAppPort := (target.Port == 80 || target.Port == 443 ||
+		(target.Port >= 8000 && target.Port <= 8999))
+
+	if !strings.Contains(body, "jboss") && !strings.Contains(body, "wildfly") &&
+		target.Port != 9990 && target.Port != 9993 && isStandardAppPort {
+
+		candidates := []struct {
+			port   int
+			scheme string
+		}{
+			{9990, "http"},
+			{9993, "https"},
+		}
+
+		for _, candidate := range candidates {
+			mgmtTarget := target
+			mgmtTarget.Port = candidate.port
+			mgmtTarget.Scheme = candidate.scheme
+
 			mgmtResp, err := client.Get(ctx, mgmtTarget, "/management")
-			if err == nil && mgmtResp.StatusCode >= 200 && mgmtResp.StatusCode < 300 {
-				// Check for management interface signatures
+			d.HTTPRequests++
+
+			if err != nil {
+				continue
+			}
+
+			// Check for management interface signatures
+			if mgmtResp.StatusCode >= 200 && mgmtResp.StatusCode < 300 {
 				body := strings.ToLower(string(mgmtResp.Body))
 				if strings.Contains(body, "managementrealm") || strings.Contains(body, "dmr") || strings.Contains(body, "wildfly") {
-					d.HTTPRequests++
 					add("jbosswildfly")
 					break
 				}
-			} else if err == nil && mgmtResp.StatusCode == 401 {
+			} else if mgmtResp.StatusCode == 401 {
 				// 401 with basic auth challenge is typical for management interface
-				d.HTTPRequests++
 				add("jbosswildfly")
 				break
 			}
