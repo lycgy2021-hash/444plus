@@ -1563,50 +1563,76 @@ the guarantees hold under test:
   - **Fourth hardening item, found on a real code-level construction of the
     exact byte-for-byte gap it predicts (again): `TransitionCase.OriginID`
     was a PLAIN EXPORTED STRING FIELD — the doc comment said "never a
-    caller assertion", but the type said otherwise. Nothing stopped
-    `TransitionCase{Transition: transitionFromServerA, Scope: scopeA,
-    OriginID: "http://server-B"}` — a real transition that ran against A,
-    permanently mislabeled as having come from B — after which every later
-    check (`ReplayTargetHash`, the origin self-consistency check, the
-    strict-origin-binding check the third hardening item just added) would
-    agree with that lie, because all of them, ultimately, just compare
-    against whatever string `Produce` copied out of this field.** Fixed,
-    WITHOUT a new package or a new authority layer, mirroring
-    `actionauth.BoundAction`'s own "identity comes from construction, never
-    a caller-supplied field" discipline: `TransitionCase.OriginID` is now
-    an unexported `originID` with a read-only `OriginID() string` getter,
-    and the ONLY way to obtain a non-empty one is the new
-    `NewHTTPTransitionCase(profile *HTTPProfile, transition StateTransition)
-    (TransitionCase, error)` — it requires `profile.Scope().Hash() ==
-    transition.ScopeHash` (proving profile really is the SAME profile that
-    produced this exact transition, not merely some other profile the
-    caller happens to also be holding) and then takes BOTH `Scope` and
-    `originID` FROM the profile itself, never from a separately-supplied
-    value — closing the identical gap for `Scope` that `originID` closes
-    for origin. A `TransitionCase` built the plain struct-literal way
-    (still the only path for a non-HTTP transition) has no field a caller
-    could set to fake an origin at all; `OriginID()` is simply `""`.
-    `TestNewHTTPTransitionCaseDerivesOriginIDFromProfile`,
-    `TestNewHTTPTransitionCaseRejectsScopeHashMismatch`,
-    `TestNewHTTPTransitionCaseRejectsNilProfile`, and
-    `TestPlainTransitionCaseLiteralHasEmptyOriginID` prove the primitive
-    directly; every pre-existing E7/E8 fixture (`e7BuildOriginalCandidateWithSafety`)
-    was rewritten to build its Collector/Executor through an `HTTPProfile`
-    and call `NewHTTPTransitionCase` — the SAME profile that actually
-    issues the fixture's requests is the only thing ever trusted for that
-    candidate's real origin, exactly as production code must.
+    caller assertion", but the type said otherwise.** First fixed by making
+    it an unexported `originID` obtainable only via a
+    `NewHTTPTransitionCase(profile *HTTPProfile, transition StateTransition)`
+    constructor that checked `profile.Scope().Hash() == transition.ScopeHash`
+    before deriving `originID` from `profile.OriginID()`. This fix was
+    itself INCOMPLETE, found on the very next audit round: `ScopeHash`
+    equality proves `profile` and `transition` share the same ABSTRACT
+    `ExplorationScope` (`TargetID`/`BuildID`/`SessionID`/`Protocol`/
+    `HarnessID`) — it says nothing about whether `profile` is the
+    PARTICULAR profile that actually produced this transition's I/O. Two
+    different `HTTPProfile`s, built for two GENUINELY DIFFERENT real
+    servers but the exact same abstract `Scope`, would satisfy that check
+    identically — so a transition collected against server-A could still
+    be paired, after the fact, with server-B's profile and have B's
+    `OriginID` permanently attached to the resulting Candidate. Every later
+    check (`ReplayTargetHash`, both origin-consistency checks) would agree
+    with that mismatch, because none of them are computed from anything
+    tying the transition to the SPECIFIC profile that collected it, only to
+    the abstract Scope both profiles happen to share.
+  - **Fifth hardening item, same round: closes the "reinterpretation after
+    the fact" gap structurally, by moving origin binding out of
+    `TransitionCase` ENTIRELY and into the transition's OWN birth.**
+    `TransitionCase` reverted to its original `{Transition, Scope}` shape —
+    `NewHTTPTransitionCase` is gone. `StateTransition` itself gained an
+    unexported `originID` with a read-only `OriginID() string` getter,
+    frozen by `Explorer.Step` (the ONE real production place a
+    `StateTransition` is ever born — see that method's own doc) at the
+    EXACT moment it builds the transition, directly from `e.collector` —
+    the SAME `Collector` value that just issued the real requests for THIS
+    transition, never a separately-supplied profile reconciled afterward.
+    A new optional capability, `originIdentifiable` (`explorer.go`) —
+    `interface { OriginID() string }` — and its sole consumer
+    `collectorOriginID(collector Collector) string` are the entire
+    mechanism: if `e.collector` implements it, `Step` stamps the result; if
+    not (a fake/test Collector, or a future non-HTTP implementation),
+    `originID` stays `""`, never invented. `HTTPCollector` gained the
+    concrete `OriginID()` implementation (a pure function of its own
+    `baseURL`); `HTTPProfile.OriginID()` now simply delegates to
+    `p.collector.OriginID()` so the two can never independently drift.
+    `Produce`'s `resolve()` reads `c.Transition.OriginID()` directly — E6
+    never touches a profile, a constructor, or a cross-check; it only ever
+    reads what the transition already carries.
+    `TestExplorerStepFreezesOriginIDFromTheRealCollector` proves a real
+    `Explorer.Step` against a real HTTP fixture stamps exactly the
+    Collector's own `OriginID()`; `TestCollectorOriginIDIsEmptyForACollectorWithNoRealOrigin`
+    proves the fail-closed default. The direct adversarial proof,
+    `TestOriginIDCannotBeReinterpretedByADifferentProfileSharingTheSameScope`,
+    builds TWO real, independent fixture servers under the EXACT SAME
+    abstract `ExplorationScope`, produces a real transition through ONLY
+    one of them via a real `Explorer.Step`, and proves the resulting
+    Candidate's `StateMachineBinding.OriginalOriginID()` is unconditionally
+    the transition's own real origin — the other, same-scope profile is
+    built, proven to have a genuinely different `OriginID()`, and then
+    never touched again, because no function signature anywhere accepts it
+    alongside an already-built transition. Every pre-existing E7/E8 fixture
+    was updated to stamp `originID` the same way `Step` does
+    (`collectorOriginID(collector)`, directly on the `StateTransition`
+    literal it hand-builds), since these tests drive collect/execute calls
+    manually rather than through a real `Explorer`.
 
-  **`S10-E8 = SEALED`** after this fifth hardening round: `hypothesis →
-  independent replay → reproducible` is a real, tested, end-to-end path
-  through production code, with the Engine's authority untouched, the
-  replay validator's own target/network binding structurally
-  self-consistent AND independently proven to match the ORIGINAL
-  candidate's real physical origin (never merely internally consistent
-  with itself, and never a caller-asserted string standing in for that
-  origin at ANY point in the chain), and session freshness a checked fact
-  rather than a documented intent. S10's own architecture stops expanding
-  here — the next stage is Value Proof against a real, authorized target,
-  not further infrastructure.
+  With this fix, `S10-E8`'s physical-origin chain now runs unbroken from
+  the real network call to the Candidate: **real network origin → frozen
+  on `StateTransition` at its own birth → copied unexamined onto
+  `StateMachineBinding` → independently checked against the replay
+  validator's own real origin before any I/O** — with no reconciliation
+  step anywhere in that chain that accepts a second, independently-supplied
+  origin claim. Combined with the fresh-session structural proof and the
+  Engine's own untouched authority, this is the state this document
+  presents S10-E8 in; `S10-E8 = SEALED` is a judgment for the next audit
+  round to confirm, not a status this document declares unilaterally.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
   Any future state-preparation capability remains deferred — it needs its

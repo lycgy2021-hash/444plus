@@ -1,6 +1,7 @@
 package research
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -780,68 +781,148 @@ func TestE6CaseArtifactHashChangesWhenExpectationSourceIDChanges(t *testing.T) {
 	}
 }
 
-// --- NewHTTPTransitionCase: OriginID can ONLY come from a real HTTPProfile,
-// never a caller-supplied string — S10/E8's final freeze blocker.
+// --- StateTransition.OriginID: frozen at the transition's OWN creation,
+// from the REAL Collector that produced it — S10/E8's final freeze
+// blocker. An earlier design tried to attach origin one layer up, at
+// TransitionCase construction time, by cross-checking a separately-
+// supplied *HTTPProfile against the transition's ScopeHash — but two
+// different HTTPProfiles (different real origins) can share the exact
+// same abstract ExplorationScope, so that check could never actually rule
+// out "this transition, relabeled under a different origin's profile".
+// Freezing origin at StateTransition's own birth (Explorer.Step, via
+// collectorOriginID(e.collector) — see that function's own doc) removes
+// the reinterpretation risk structurally: there is no function anywhere
+// that takes an already-built StateTransition plus a second profile and
+// produces or checks an origin from it.
 
-// TestNewHTTPTransitionCaseDerivesOriginIDFromProfile proves the ONLY path
-// to a non-empty TransitionCase.OriginID() actually derives it from a real
-// *HTTPProfile — never accepts one as a bare argument the caller could
-// invent — and that Scope is likewise taken from the profile itself.
-func TestNewHTTPTransitionCaseDerivesOriginIDFromProfile(t *testing.T) {
+// TestExplorerStepFreezesOriginIDFromTheRealCollector drives one real
+// Explorer session (baseline -> step) against a real HTTP fixture and
+// proves the StateTransition Step returns carries exactly the Collector's
+// own OriginID — never empty, never anything else.
+func TestExplorerStepFreezesOriginIDFromTheRealCollector(t *testing.T) {
 	ts := newHTTPFixtureServer(t)
-	scope := ExplorationScope{TargetID: "e6-http-target", SessionID: "s1"}
+	scope := ExplorationScope{TargetID: "e6-origin-target", SessionID: "s1"}
 	profile, err := NewHTTPProfile(scope, ts.URL, "/state", map[string]string{"get-root": "/"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr := StateTransition{ScopeHash: scope.Hash()}
-
-	tc, err := NewHTTPTransitionCase(profile, tr)
-	if err != nil {
-		t.Fatalf("NewHTTPTransitionCase: %v", err)
-	}
-	if tc.OriginID() == "" {
-		t.Fatal("OriginID() must be non-empty when built via NewHTTPTransitionCase")
-	}
-	if tc.OriginID() != profile.OriginID() {
-		t.Fatalf("OriginID() = %q, want the profile's own OriginID() %q", tc.OriginID(), profile.OriginID())
-	}
-	if tc.Scope != profile.Scope() {
-		t.Fatalf("Scope = %+v, want the profile's own Scope() %+v", tc.Scope, profile.Scope())
-	}
-}
-
-// TestNewHTTPTransitionCaseRejectsScopeHashMismatch proves profile must
-// actually be the profile that produced transition — a caller cannot pair
-// a real transition from one scope with an unrelated profile built for a
-// different one and have OriginID silently attached anyway.
-func TestNewHTTPTransitionCaseRejectsScopeHashMismatch(t *testing.T) {
-	ts := newHTTPFixtureServer(t)
-	profile, err := NewHTTPProfile(ExplorationScope{TargetID: "a"}, ts.URL, "/state", map[string]string{"get-root": "/"})
+	httpReq := actionauth.StateRequirements{ProjectorID: stateauth.HTTPStateProjector{}.ID()}
+	policy := actionauth.NewActionPolicy(
+		mustActionRegistry(t, actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/")}, Requirements: httpReq}),
+		actionauth.NewRecoveryRegistry("reset"),
+	)
+	budget := ExplorationBudget{MaxStates: 5, MaxTransitions: 5, MaxDepth: 5, MaxRequests: 10, MaxVisitsPerState: 5, MaxBranching: 1, MaxWallTime: 10 * time.Second}
+	exp, err := NewExplorer(profile.Scope(), profile.Collector(), stateauth.HTTPFixtureRegistry(), policy, profile.Executor(), budget, actionauth.RecoveryPlanRef{RegistryKey: "reset"}, 5*time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	unrelatedTransition := StateTransition{ScopeHash: ExplorationScope{TargetID: "a-completely-different-scope"}.Hash()}
-	if _, err := NewHTTPTransitionCase(profile, unrelatedTransition); err == nil {
-		t.Fatal("NewHTTPTransitionCase must reject a transition whose ScopeHash does not match profile.Scope().Hash()")
+	ctx := context.Background()
+	if _, err := exp.Baseline(ctx); err != nil {
+		t.Fatalf("Baseline: %v", err)
+	}
+	tr, err := exp.Step(ctx)
+	if err != nil {
+		t.Fatalf("Step: %v", err)
+	}
+	if tr.OriginID() == "" {
+		t.Fatal("StateTransition.OriginID() must be non-empty for a real HTTP-backed Step")
+	}
+	if tr.OriginID() != profile.OriginID() {
+		t.Fatalf("StateTransition.OriginID() = %q, want the profile's own OriginID() %q", tr.OriginID(), profile.OriginID())
 	}
 }
 
-// TestNewHTTPTransitionCaseRejectsNilProfile is the direct nil-guard proof.
-func TestNewHTTPTransitionCaseRejectsNilProfile(t *testing.T) {
-	if _, err := NewHTTPTransitionCase(nil, StateTransition{}); err == nil {
-		t.Fatal("NewHTTPTransitionCase must reject a nil profile")
+// TestCollectorOriginIDIsEmptyForACollectorWithNoRealOrigin proves
+// collectorOriginID fails closed for a Collector that never claims a
+// verifiable network origin (fakeCollector, used throughout the rest of
+// this package's tests) — never invents one.
+func TestCollectorOriginIDIsEmptyForACollectorWithNoRealOrigin(t *testing.T) {
+	if got := collectorOriginID(&fakeCollector{}); got != "" {
+		t.Fatalf("collectorOriginID(fakeCollector) = %q, want \"\"", got)
 	}
 }
 
-// TestPlainTransitionCaseLiteralHasEmptyOriginID proves the "never a
-// caller assertion" claim holds structurally: the plain struct-literal
-// construction path (still the only one for a non-HTTP transition) simply
-// has no field a caller could set to fake an origin — OriginID() is always
-// "" unless NewHTTPTransitionCase built the value.
-func TestPlainTransitionCaseLiteralHasEmptyOriginID(t *testing.T) {
-	tc := TransitionCase{Transition: StateTransition{}, Scope: ExplorationScope{}}
-	if tc.OriginID() != "" {
-		t.Fatalf("OriginID() = %q, want \"\" for a plain struct-literal TransitionCase", tc.OriginID())
+// TestOriginIDCannotBeReinterpretedByADifferentProfileSharingTheSameScope
+// is the direct adversarial proof: two real HTTPProfiles built against
+// TWO GENUINELY DIFFERENT servers (A and B) but the EXACT SAME abstract
+// ExplorationScope. A real transition is produced ONLY through A. Nothing
+// in this package accepts profileB alongside that already-built
+// transition to "reinterpret" its origin — Produce's recorded
+// originalOriginID is proven to be A's, unconditionally, regardless of
+// profileB's mere existence.
+func TestOriginIDCannotBeReinterpretedByADifferentProfileSharingTheSameScope(t *testing.T) {
+	serverA := newHTTPFixtureServer(t)
+	serverB := newHTTPFixtureServer(t) // a genuinely different real origin
+
+	sharedScope := ExplorationScope{TargetID: "shared-target", BuildID: "shared-build", SessionID: "shared-session", Protocol: "http", HarnessID: "shared-harness"}
+	profileA, err := NewHTTPProfile(sharedScope, serverA.URL, "/state", map[string]string{"get-root": "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileB, err := NewHTTPProfile(sharedScope, serverB.URL, "/state", map[string]string{"get-root": "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profileA.OriginID() == profileB.OriginID() {
+		t.Fatal("setup: profileA and profileB must have genuinely different real origins")
+	}
+
+	httpReq := actionauth.StateRequirements{ProjectorID: stateauth.HTTPStateProjector{}.ID()}
+	policy := actionauth.NewActionPolicy(
+		mustActionRegistry(t, actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/")}, Requirements: httpReq}),
+		actionauth.NewRecoveryRegistry("reset"),
+	)
+	budget := ExplorationBudget{MaxStates: 5, MaxTransitions: 5, MaxDepth: 5, MaxRequests: 10, MaxVisitsPerState: 5, MaxBranching: 1, MaxWallTime: 10 * time.Second}
+	// The real transition is produced ONLY through profileA — profileB is
+	// never wired into this Explorer at all.
+	exp, err := NewExplorer(profileA.Scope(), profileA.Collector(), stateauth.HTTPFixtureRegistry(), policy, profileA.Executor(), budget, actionauth.RecoveryPlanRef{RegistryKey: "reset"}, 5*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := exp.Baseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := exp.Step(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rule := TransitionRule{
+		RuleID:      "origin-reinterpretation-test-rule",
+		ActionID:    tr.Action.ID(),
+		ProjectorID: tr.BeforeFingerprint.ProjectorID(),
+		// A value the fixture's real status ("200") can never equal —
+		// guarantees TransitionViolated deterministically, regardless of
+		// whether the read-only GET happened to change anything.
+		Expectation:       TransitionExpectation{Kind: ExpectFactEquals, Fact: "status", AfterValue: "999"},
+		ExpectationSource: ExpectationSource{Kind: ExpectationSourceHumanConfig, ID: "origin-test-config"},
+	}
+	registry, err := NewTransitionRuleRegistry(rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// profileB is deliberately never passed to Produce, or to anything —
+	// there is no function signature anywhere that would accept it
+	// alongside tr to "reinterpret" its origin. This line exists only to
+	// prove profileB was really built against a different real server
+	// (the earlier OriginID inequality check), not to influence anything
+	// below.
+	_ = profileB
+
+	candidates := NewStateMachineProducer(registry).Produce(TransitionCase{Transition: tr, Scope: profileA.Scope()})
+	if len(candidates) != 1 {
+		t.Fatalf("expected exactly 1 candidate (the rule's AfterValue can never match the fixture's real status), got %d", len(candidates))
+	}
+	binding, ok := candidates[0].StateMachineBinding()
+	if !ok {
+		t.Fatal("candidate must carry a StateMachineBinding")
+	}
+	if binding.OriginalOriginID() != profileA.OriginID() {
+		t.Fatalf("StateMachineBinding.OriginalOriginID() = %q, want profileA's own OriginID() %q — it must NEVER be influenced by profileB merely sharing the same abstract Scope",
+			binding.OriginalOriginID(), profileA.OriginID())
+	}
+	if binding.OriginalOriginID() == profileB.OriginID() {
+		t.Fatal("StateMachineBinding.OriginalOriginID() must never equal profileB's origin")
 	}
 }

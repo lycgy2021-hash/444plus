@@ -1,7 +1,6 @@
 package research
 
 import (
-	"fmt"
 	"net/url"
 	"strings"
 )
@@ -30,10 +29,6 @@ type HTTPProfile struct {
 	scope     ExplorationScope
 	collector *HTTPCollector
 	executor  *HTTPExecutor
-	// originID is computed ONCE, at construction, as a pure function of
-	// baseURL — never a caller assertion. See OriginID's own doc for why
-	// this exists (S10/E8's "same-target physical binding" freeze item).
-	originID string
 }
 
 // NewHTTPProfile builds an HTTPProfile for scope against baseURL: one
@@ -52,11 +47,7 @@ func NewHTTPProfile(scope ExplorationScope, baseURL, observationPath string, act
 	if err != nil {
 		return nil, err
 	}
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return nil, fmt.Errorf("research: HTTPProfile: invalid baseURL: %w", err)
-	}
-	return &HTTPProfile{scope: scope, collector: collector, executor: executor, originID: canonicalHTTPOrigin(u)}, nil
+	return &HTTPProfile{scope: scope, collector: collector, executor: executor}, nil
 }
 
 // canonicalHTTPOrigin renders u's scheme+host (which already includes a
@@ -78,11 +69,12 @@ func (p *HTTPProfile) Collector() Collector { return p.collector }
 func (p *HTTPProfile) Executor() Executor { return p.executor }
 
 // OriginID returns the canonical network origin (scheme://host) this
-// profile's Collector AND Executor were both built from — a pure function
-// of baseURL, never a caller assertion, and never affected by
-// observationPath or the actions map. NewHTTPStateMachineReplayValidator
-// (state_machine_replay.go) uses this to prove a ReplayTarget's own
-// declared OriginID really does match the real network location the
-// profile's Collector/Executor point at, rather than assuming it by
-// convention — see that constructor's own doc for the gap this closes.
-func (p *HTTPProfile) OriginID() string { return p.originID }
+// profile's Collector AND Executor were both built from — delegated
+// directly to p.collector.OriginID() (HTTPCollector's own method) so the
+// two can never independently drift; never affected by observationPath or
+// the actions map. NewHTTPStateMachineReplayValidator (state_machine_replay.go)
+// uses this to prove a ReplayTarget's own declared OriginID really does
+// match the real network location the profile's Collector/Executor point
+// at, rather than assuming it by convention — see that constructor's own
+// doc for the gap this closes.
+func (p *HTTPProfile) OriginID() string { return p.collector.OriginID() }

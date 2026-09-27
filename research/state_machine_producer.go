@@ -392,63 +392,27 @@ func (r *TransitionRuleRegistry) LookupByRuleID(ruleID string) (TransitionRule, 
 // scope that produced this ScopeHash — a caller cannot claim an arbitrary
 // Scope for a real transition and have it accepted.
 //
-// originID is OPTIONAL and protocol-specific: for a transition collected
-// through an HTTPProfile, it is that profile's own OriginID() — the real
-// network origin the ORIGINAL Collector/Executor were built from. Produce
-// copies it, unexamined, onto StateMachineBinding.originalOriginID (see
-// that field's own doc) — it is the ONLY way a later
-// NewHTTPStateMachineReplayValidator can prove a replay ran against the
-// SAME physical HTTP origin as the ORIGINAL candidate, rather than merely
-// a validator whose own target/profile pair happens to be internally
-// self-consistent.
-//
-// DELIBERATELY UNEXPORTED, with NO general-purpose exported setter: an
-// earlier version of this field was a plain exported string, which meant
-// "never a caller assertion" was true only by doc comment, not by type —
-// nothing stopped a caller from writing
-// TransitionCase{OriginID: "whatever they wanted"} for a transition that
-// actually ran somewhere else entirely, after which every later check
-// (ReplayTargetHash, the origin self-consistency check) would agree with
-// that lie. The ONLY way to obtain a TransitionCase with a non-empty
-// originID is NewHTTPTransitionCase (below), which derives it from a real
-// *HTTPProfile — the same "identity comes from construction, never from a
-// caller-supplied field" discipline actionauth.BoundAction already
-// established for action identity. A TransitionCase built via the plain
-// struct literal (still the only path for a non-HTTP transition) always
-// has an empty originID — never treated as "matches anything" by a
-// strict-origin-binding replay validator.
+// OriginID travels with the Transition itself (StateTransition.OriginID(),
+// frozen by Explorer.Step at the exact moment the transition was created
+// from whatever Collector actually produced it — see that method's own
+// doc) — TransitionCase carries no OriginID of its own. An earlier version
+// of this file DID add one directly to TransitionCase (first as a plain
+// exported string, then behind a NewHTTPTransitionCase constructor that
+// cross-checked it against a separately-supplied *HTTPProfile's own scope)
+// — both were removed: a TransitionCase-level mechanism can only ever
+// prove "this profile and this transition SHARE an abstract
+// ExplorationScope", never "this profile is the one that actually produced
+// this transition" — two HTTPProfiles built for the SAME Scope but
+// DIFFERENT real origins would satisfy that check identically, letting a
+// transition collected against server-A be silently reinterpreted as
+// having come from server-B. Binding origin to the transition's OWN
+// creation, rather than reconstructing it afterward from a paired-up
+// profile, closes that gap structurally: there is no code path left that
+// accepts a second profile as a "reinterpretation" of an already-built
+// transition at all.
 type TransitionCase struct {
 	Transition StateTransition
 	Scope      ExplorationScope
-	originID   string
-}
-
-// OriginID returns the real HTTP origin this case's transition was
-// collected against, if it was built via NewHTTPTransitionCase — "" for
-// any TransitionCase built the plain way (never HTTP-provenanced, or
-// predating origin binding).
-func (c TransitionCase) OriginID() string { return c.originID }
-
-// NewHTTPTransitionCase is the ONLY way to build a TransitionCase whose
-// OriginID is non-empty. It takes the *HTTPProfile that ACTUALLY produced
-// transition (the one whose Collector/Executor really issued the requests)
-// and transition itself, and requires transition.ScopeHash to equal
-// profile.Scope().Hash() — proving profile really is the profile this
-// EXACT transition was collected under, not merely some other profile the
-// caller happens to also be holding. Scope is taken from profile.Scope()
-// itself (never a separately caller-supplied value), closing the same gap
-// for Scope that originID closes for origin: a caller cannot pair a REAL
-// transition with a Scope or an OriginID that did not actually produce it.
-func NewHTTPTransitionCase(profile *HTTPProfile, transition StateTransition) (TransitionCase, error) {
-	if profile == nil {
-		return TransitionCase{}, fmt.Errorf("research: NewHTTPTransitionCase requires a non-nil HTTPProfile")
-	}
-	scope := profile.Scope()
-	if scope.Hash() != transition.ScopeHash {
-		return TransitionCase{}, fmt.Errorf("research: NewHTTPTransitionCase: profile's own scope hash %q does not match transition.ScopeHash %q — profile did not actually produce this transition",
-			scope.Hash(), transition.ScopeHash)
-	}
-	return TransitionCase{Transition: transition, Scope: scope, originID: profile.OriginID()}, nil
 }
 
 // resolvedTransitionCase pairs a TransitionCase with the ONE TransitionRule
@@ -474,7 +438,7 @@ func (p *StateMachineProducer) resolve(c TransitionCase) (resolvedTransitionCase
 	if !ok {
 		return resolvedTransitionCase{}, false
 	}
-	return resolvedTransitionCase{Transition: c.Transition, Scope: c.Scope, OriginID: c.originID, Rule: rule}, true
+	return resolvedTransitionCase{Transition: c.Transition, Scope: c.Scope, OriginID: c.Transition.OriginID(), Rule: rule}, true
 }
 
 // validate reports whether rc is well-formed and authorized enough to judge

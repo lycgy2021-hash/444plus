@@ -200,6 +200,38 @@ type Collector interface {
 	Collect(ctx context.Context, scope ExplorationScope) (stateauth.StateArtifact, error)
 }
 
+// originIdentifiable is an OPTIONAL capability a Collector implementation
+// may satisfy: a stable identity for the real network origin every one of
+// its requests actually targets, computed purely from the Collector's own
+// construction — never a caller assertion. HTTPCollector is the only
+// implementation today (see its own OriginID method). collectorOriginID
+// (below) is the ONE place this is ever consulted, and Step (below) is the
+// ONE place that result is ever stamped onto a StateTransition — AT THE
+// MOMENT of that transition's own creation, from the SAME collector that
+// actually issued the requests for it. This is deliberately the opposite
+// of an earlier design (a TransitionCase-level constructor that paired an
+// already-built transition with a separately-supplied *HTTPProfile after
+// the fact): that design could still be fooled by a second profile that
+// happened to share the same abstract ExplorationScope but a DIFFERENT
+// real origin, because nothing tied the transition's OWN creation to the
+// profile actually used. Freezing origin here, at birth, closes that gap
+// structurally — there is no code path left that lets a transition be
+// "reinterpreted" under a different origin after the fact.
+type originIdentifiable interface {
+	OriginID() string
+}
+
+// collectorOriginID returns collector's own OriginID() if it implements
+// originIdentifiable, or "" otherwise — a Collector with no verifiable
+// real-world network origin (a fake/test Collector, or a future non-HTTP
+// implementation) never pretends to have one.
+func collectorOriginID(collector Collector) string {
+	if oi, ok := collector.(originIdentifiable); ok {
+		return oi.OriginID()
+	}
+	return ""
+}
+
 // Executor runs a single authorized action or recovery. It is the ONLY place
 // production code may perform a side-effecting call against the explored
 // target. Per boundary 4 of the S10 contract, a real Executor implementation
@@ -472,6 +504,10 @@ func (e *Explorer) Step(ctx context.Context) (StateTransition, error) {
 		AfterFingerprint:       after,
 		TransitionArtifactHash: transitionArtifactHash(e.scope.Hash(), beforeRaw, action.ID(), afterRaw, now),
 		Timestamp:              now,
+		// Frozen HERE, from e.collector — the SAME Collector that just
+		// issued the real requests above — never reconstructed later from
+		// a separately-supplied value. See originIdentifiable's own doc.
+		originID: collectorOriginID(e.collector),
 	}
 	if !transition.ScopeConsistent() {
 		// Should be unreachable given the checks above (before/after both came

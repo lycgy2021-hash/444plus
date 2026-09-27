@@ -103,9 +103,10 @@ func e7DenyOnlyPolicy(projectorID stateauth.ProjectorID, safety actionauth.Actio
 func e7BuildOriginalCandidateWithSafety(t *testing.T, f *e7Fixture, sessionID string, safety actionauth.ActionSafety) (*Candidate, *TransitionRuleRegistry, *actionauth.ActionPolicy, TransitionRule) {
 	t.Helper()
 	scope := e7ReplayTarget().Scope(sessionID)
-	// Built via HTTPProfile — the SAME profile that actually issues the
-	// requests below is the ONLY thing NewHTTPTransitionCase (below) will
-	// ever trust for this candidate's real origin.
+	// Built via HTTPProfile — the SAME collector that actually issues the
+	// requests below (via collectorOriginID, exactly as Explorer.Step
+	// itself uses) is the ONLY thing ever trusted for this candidate's
+	// real origin, frozen directly onto the StateTransition below.
 	profile, err := NewHTTPProfile(scope, f.ts.URL, "/state", map[string]string{"deny": "/deny"})
 	if err != nil {
 		t.Fatal(err)
@@ -142,6 +143,10 @@ func e7BuildOriginalCandidateWithSafety(t *testing.T, f *e7Fixture, sessionID st
 		EvidenceRefs:           []string{"orig-evidence"},
 		TransitionArtifactHash: transitionArtifactHash(scope.Hash(), beforeRaw, boundAction.ID(), afterRaw, now),
 		Timestamp:              now,
+		// Frozen exactly as Explorer.Step itself freezes it — from the
+		// SAME collector that actually issued the requests above, never
+		// reconstructed afterward from a separately-supplied profile.
+		originID: collectorOriginID(collector),
 	}
 	rule := TransitionRule{
 		RuleID:            "deny-must-not-change-status",
@@ -154,11 +159,7 @@ func e7BuildOriginalCandidateWithSafety(t *testing.T, f *e7Fixture, sessionID st
 	if err != nil {
 		t.Fatalf("NewTransitionRuleRegistry: %v", err)
 	}
-	tc, err := NewHTTPTransitionCase(profile, tr)
-	if err != nil {
-		t.Fatalf("NewHTTPTransitionCase: %v", err)
-	}
-	candidates := NewStateMachineProducer(registry).Produce(tc)
+	candidates := NewStateMachineProducer(registry).Produce(TransitionCase{Transition: tr, Scope: scope})
 	if len(candidates) != 1 {
 		t.Fatalf("setup: expected exactly 1 real candidate, got %d", len(candidates))
 	}

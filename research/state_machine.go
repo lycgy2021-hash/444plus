@@ -184,7 +184,26 @@ type StateTransition struct {
 	TransitionArtifactHash string
 
 	Timestamp time.Time
+
+	// originID is the real network origin (for HTTP, scheme://host) the
+	// Collector that ACTUALLY produced this transition's own I/O was built
+	// from — frozen by Explorer.Step (or an equivalent real collect/
+	// execute/collect sequence) at the EXACT moment this StateTransition
+	// was created, via collectorOriginID(collector) — never reconstructed
+	// afterward from a separately-supplied value. Unexported and with no
+	// general-purpose setter: nothing outside a real collect/execute
+	// sequence can claim "this transition's origin was X" — see
+	// originIdentifiable's own doc (explorer.go) for the gap this closes.
+	// Empty for a Collector with no verifiable real-world origin (a fake/
+	// test Collector, or a future non-HTTP implementation).
+	originID string
 }
+
+// OriginID returns the real network origin t's transition was actually
+// collected against, if its Collector had one — "" otherwise. This is the
+// ONLY value S10/E6's Produce ever trusts for StateMachineBinding's own
+// originalOriginID (see that field's own doc).
+func (t StateTransition) OriginID() string { return t.originID }
 
 // ScopeConsistent reports whether t's own ScopeHash agrees with both
 // fingerprints it references. A transition whose scope disagrees with either
