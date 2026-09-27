@@ -103,10 +103,10 @@ func e7DenyOnlyPolicy(projectorID stateauth.ProjectorID, safety actionauth.Actio
 func e7BuildOriginalCandidateWithSafety(t *testing.T, f *e7Fixture, sessionID string, safety actionauth.ActionSafety) (*Candidate, *TransitionRuleRegistry, *actionauth.ActionPolicy, TransitionRule) {
 	t.Helper()
 	scope := e7ReplayTarget().Scope(sessionID)
-	// Built via HTTPProfile — the SAME collector that actually issues the
-	// requests below (via collectorOriginID, exactly as Explorer.Step
-	// itself uses) is the ONLY thing ever trusted for this candidate's
-	// real origin, frozen directly onto the StateTransition below.
+	// Built via HTTPProfile — the SAME profile is the ONLY thing ever
+	// trusted for this candidate's real origin (profile.OriginID(),
+	// exactly as NewHTTPExplorer stamps it), frozen directly onto the
+	// StateTransition below.
 	profile, err := NewHTTPProfile(scope, f.ts.URL, "/state", map[string]string{"deny": "/deny"})
 	if err != nil {
 		t.Fatal(err)
@@ -143,10 +143,11 @@ func e7BuildOriginalCandidateWithSafety(t *testing.T, f *e7Fixture, sessionID st
 		EvidenceRefs:           []string{"orig-evidence"},
 		TransitionArtifactHash: transitionArtifactHash(scope.Hash(), beforeRaw, boundAction.ID(), afterRaw, now),
 		Timestamp:              now,
-		// Frozen exactly as Explorer.Step itself freezes it — from the
-		// SAME collector that actually issued the requests above, never
-		// reconstructed afterward from a separately-supplied profile.
-		originID: collectorOriginID(collector),
+		// Frozen exactly as NewHTTPExplorer + Step freeze it — from the
+		// SAME profile whose Collector/Executor actually issued the
+		// requests above, never derived by asking the collector to
+		// identify itself.
+		originID: profile.OriginID(),
 	}
 	rule := TransitionRule{
 		RuleID:            "deny-must-not-change-status",

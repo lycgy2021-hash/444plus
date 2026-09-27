@@ -782,24 +782,36 @@ func TestE6CaseArtifactHashChangesWhenExpectationSourceIDChanges(t *testing.T) {
 }
 
 // --- StateTransition.OriginID: frozen at the transition's OWN creation,
-// from the REAL Collector that produced it — S10/E8's final freeze
-// blocker. An earlier design tried to attach origin one layer up, at
-// TransitionCase construction time, by cross-checking a separately-
-// supplied *HTTPProfile against the transition's ScopeHash — but two
-// different HTTPProfiles (different real origins) can share the exact
-// same abstract ExplorationScope, so that check could never actually rule
-// out "this transition, relabeled under a different origin's profile".
-// Freezing origin at StateTransition's own birth (Explorer.Step, via
-// collectorOriginID(e.collector) — see that function's own doc) removes
-// the reinterpretation risk structurally: there is no function anywhere
-// that takes an already-built StateTransition plus a second profile and
-// produces or checks an origin from it.
+// from the producing Explorer's OWN trusted origin — S10/E8's final freeze
+// blocker. Two earlier designs both proved insufficient:
+//  1. A TransitionCase-level constructor that cross-checked a separately-
+//     supplied *HTTPProfile against the transition's ScopeHash — but two
+//     different HTTPProfiles (different real origins) can share the exact
+//     same abstract ExplorationScope, so that check could never rule out
+//     "this transition, relabeled under a different origin's profile".
+//  2. Freezing origin in Explorer.Step by type-asserting e.collector
+//     against an exported, single-method interface (originIdentifiable) —
+//     but ANY external Collector implementation could satisfy that
+//     interface and simply claim whatever origin it liked, AND the
+//     generic NewExplorer still accepted collector/executor as two
+//     INDEPENDENTLY supplied values, so a Collector=server-A /
+//     Executor=server-B mismatch would still only ever reflect the
+//     Collector's (possibly unrelated) claim.
+//
+// The actual fix: Explorer itself carries a private, untyped originID,
+// set to a real value ONLY by NewHTTPExplorer — which takes a single
+// *HTTPProfile (never separate collector/executor), so Collector≠Executor
+// origin is structurally impossible for any Explorer built this way — and
+// NEVER by the generic NewExplorer, regardless of what Collector/Executor
+// it is handed. Step (explorer.go) stamps e.originID directly, with no
+// interface, no type assertion, and no way for an external Collector to
+// influence it at all.
 
-// TestExplorerStepFreezesOriginIDFromTheRealCollector drives one real
-// Explorer session (baseline -> step) against a real HTTP fixture and
-// proves the StateTransition Step returns carries exactly the Collector's
-// own OriginID — never empty, never anything else.
-func TestExplorerStepFreezesOriginIDFromTheRealCollector(t *testing.T) {
+// TestNewHTTPExplorerFreezesOriginIDFromTheProfile drives one real
+// Explorer session (baseline -> step), built via NewHTTPExplorer, against
+// a real HTTP fixture and proves the StateTransition Step returns carries
+// exactly the profile's own OriginID — never empty, never anything else.
+func TestNewHTTPExplorerFreezesOriginIDFromTheProfile(t *testing.T) {
 	ts := newHTTPFixtureServer(t)
 	scope := ExplorationScope{TargetID: "e6-origin-target", SessionID: "s1"}
 	profile, err := NewHTTPProfile(scope, ts.URL, "/state", map[string]string{"get-root": "/"})
@@ -812,7 +824,7 @@ func TestExplorerStepFreezesOriginIDFromTheRealCollector(t *testing.T) {
 		actionauth.NewRecoveryRegistry("reset"),
 	)
 	budget := ExplorationBudget{MaxStates: 5, MaxTransitions: 5, MaxDepth: 5, MaxRequests: 10, MaxVisitsPerState: 5, MaxBranching: 1, MaxWallTime: 10 * time.Second}
-	exp, err := NewExplorer(profile.Scope(), profile.Collector(), stateauth.HTTPFixtureRegistry(), policy, profile.Executor(), budget, actionauth.RecoveryPlanRef{RegistryKey: "reset"}, 5*time.Second, 10)
+	exp, err := NewHTTPExplorer(profile, stateauth.HTTPFixtureRegistry(), policy, budget, actionauth.RecoveryPlanRef{RegistryKey: "reset"}, 5*time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -825,31 +837,118 @@ func TestExplorerStepFreezesOriginIDFromTheRealCollector(t *testing.T) {
 		t.Fatalf("Step: %v", err)
 	}
 	if tr.OriginID() == "" {
-		t.Fatal("StateTransition.OriginID() must be non-empty for a real HTTP-backed Step")
+		t.Fatal("StateTransition.OriginID() must be non-empty for a real HTTP-backed Step through NewHTTPExplorer")
 	}
 	if tr.OriginID() != profile.OriginID() {
 		t.Fatalf("StateTransition.OriginID() = %q, want the profile's own OriginID() %q", tr.OriginID(), profile.OriginID())
 	}
 }
 
-// TestCollectorOriginIDIsEmptyForACollectorWithNoRealOrigin proves
-// collectorOriginID fails closed for a Collector that never claims a
-// verifiable network origin (fakeCollector, used throughout the rest of
-// this package's tests) — never invents one.
-func TestCollectorOriginIDIsEmptyForACollectorWithNoRealOrigin(t *testing.T) {
-	if got := collectorOriginID(&fakeCollector{}); got != "" {
-		t.Fatalf("collectorOriginID(fakeCollector) = %q, want \"\"", got)
+// TestGenericNewExplorerNeverGrantsOriginIDEvenWithRealHTTPCollectorAndExecutor
+// proves the generic constructor's own fail-closed default: even when a
+// caller wires up a REAL, matching *HTTPCollector/*HTTPExecutor pair
+// (built from the same baseURL, not mismatched), NewExplorer itself still
+// never grants the physical-origin guarantee — only NewHTTPExplorer does.
+func TestGenericNewExplorerNeverGrantsOriginIDEvenWithRealHTTPCollectorAndExecutor(t *testing.T) {
+	ts := newHTTPFixtureServer(t)
+	scope := ExplorationScope{TargetID: "e6-generic-origin-target", SessionID: "s1"}
+	collector, err := NewHTTPCollector(ts.URL, "/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewHTTPExecutor(ts.URL, map[string]string{"get-root": "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpReq := actionauth.StateRequirements{ProjectorID: stateauth.HTTPStateProjector{}.ID()}
+	policy := actionauth.NewActionPolicy(
+		mustActionRegistry(t, actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/")}, Requirements: httpReq}),
+		actionauth.NewRecoveryRegistry("reset"),
+	)
+	budget := ExplorationBudget{MaxStates: 5, MaxTransitions: 5, MaxDepth: 5, MaxRequests: 10, MaxVisitsPerState: 5, MaxBranching: 1, MaxWallTime: 10 * time.Second}
+	exp, err := NewExplorer(scope, collector, stateauth.HTTPFixtureRegistry(), policy, executor, budget, actionauth.RecoveryPlanRef{RegistryKey: "reset"}, 5*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := exp.Baseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := exp.Step(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.OriginID() != "" {
+		t.Fatalf("StateTransition.OriginID() = %q, want \"\" — the generic NewExplorer must never grant the physical-origin guarantee, even with a real, correctly-matched HTTPCollector/HTTPExecutor pair", tr.OriginID())
+	}
+}
+
+// TestGenericNewExplorerAcceptsMismatchedCollectorAndExecutorOriginsButRecordsNoOriginID
+// is the user's exact adversarial scenario: a Collector built against
+// server-A wired alongside an Executor built against a GENUINELY DIFFERENT
+// server-B, both passed to the generic NewExplorer. This is structurally
+// acceptable to NewExplorer (it has no way to know, and does not claim
+// to) — but the resulting transition's OriginID must be "", never A's,
+// never B's, so a strict-origin-binding replay validator later fails
+// closed (ErrReplayMissingOriginBinding) rather than silently trusting a
+// mismatched pair.
+func TestGenericNewExplorerAcceptsMismatchedCollectorAndExecutorOriginsButRecordsNoOriginID(t *testing.T) {
+	serverA := newHTTPFixtureServer(t)
+	serverB := newHTTPFixtureServer(t) // a genuinely different real origin
+
+	scope := ExplorationScope{TargetID: "e6-mismatched-origin-target", SessionID: "s1"}
+	collectorA, err := NewHTTPCollector(serverA.URL, "/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executorB, err := NewHTTPExecutor(serverB.URL, map[string]string{"get-root": "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// HTTPExecutor exposes no OriginID of its own — a throwaway Collector
+	// for the same baseURL is just this test's way of confirming serverB
+	// really is a different real origin from serverA, nothing more.
+	collectorB, err := NewHTTPCollector(serverB.URL, "/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collectorA.OriginID() == collectorB.OriginID() {
+		t.Fatal("setup: collectorA and executorB (via serverB) must have genuinely different real origins")
+	}
+
+	httpReq := actionauth.StateRequirements{ProjectorID: stateauth.HTTPStateProjector{}.ID()}
+	policy := actionauth.NewActionPolicy(
+		mustActionRegistry(t, actionauth.Registration{Action: actionauth.RegisteredAction{Key: "get-root", Safety: actionauth.ActionStrictReadOnly, SpecID: HTTPActionSpecID("/")}, Requirements: httpReq}),
+		actionauth.NewRecoveryRegistry("reset"),
+	)
+	budget := ExplorationBudget{MaxStates: 5, MaxTransitions: 5, MaxDepth: 5, MaxRequests: 10, MaxVisitsPerState: 5, MaxBranching: 1, MaxWallTime: 10 * time.Second}
+	// NewExplorer accepts this mismatched pair — it is not this
+	// constructor's job to detect it.
+	exp, err := NewExplorer(scope, collectorA, stateauth.HTTPFixtureRegistry(), policy, executorB, budget, actionauth.RecoveryPlanRef{RegistryKey: "reset"}, 5*time.Second, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := exp.Baseline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := exp.Step(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.OriginID() != "" {
+		t.Fatalf("StateTransition.OriginID() = %q, want \"\" for a mismatched Collector/Executor pair built via the generic NewExplorer — it must never reflect either A's or B's origin", tr.OriginID())
 	}
 }
 
 // TestOriginIDCannotBeReinterpretedByADifferentProfileSharingTheSameScope
 // is the direct adversarial proof: two real HTTPProfiles built against
 // TWO GENUINELY DIFFERENT servers (A and B) but the EXACT SAME abstract
-// ExplorationScope. A real transition is produced ONLY through A. Nothing
-// in this package accepts profileB alongside that already-built
-// transition to "reinterpret" its origin — Produce's recorded
-// originalOriginID is proven to be A's, unconditionally, regardless of
-// profileB's mere existence.
+// ExplorationScope. A real transition is produced ONLY through A, via
+// NewHTTPExplorer(profileA, ...). Nothing in this package accepts
+// profileB alongside that already-built transition to "reinterpret" its
+// origin — Produce's recorded originalOriginID is proven to be A's,
+// unconditionally, regardless of profileB's mere existence.
 func TestOriginIDCannotBeReinterpretedByADifferentProfileSharingTheSameScope(t *testing.T) {
 	serverA := newHTTPFixtureServer(t)
 	serverB := newHTTPFixtureServer(t) // a genuinely different real origin
@@ -875,7 +974,7 @@ func TestOriginIDCannotBeReinterpretedByADifferentProfileSharingTheSameScope(t *
 	budget := ExplorationBudget{MaxStates: 5, MaxTransitions: 5, MaxDepth: 5, MaxRequests: 10, MaxVisitsPerState: 5, MaxBranching: 1, MaxWallTime: 10 * time.Second}
 	// The real transition is produced ONLY through profileA — profileB is
 	// never wired into this Explorer at all.
-	exp, err := NewExplorer(profileA.Scope(), profileA.Collector(), stateauth.HTTPFixtureRegistry(), policy, profileA.Executor(), budget, actionauth.RecoveryPlanRef{RegistryKey: "reset"}, 5*time.Second, 10)
+	exp, err := NewHTTPExplorer(profileA, stateauth.HTTPFixtureRegistry(), policy, budget, actionauth.RecoveryPlanRef{RegistryKey: "reset"}, 5*time.Second, 10)
 	if err != nil {
 		t.Fatal(err)
 	}

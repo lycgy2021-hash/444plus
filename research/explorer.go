@@ -164,6 +164,27 @@ type Explorer struct {
 	budget          ExplorationBudget
 	recoveryRef     actionauth.RecoveryPlanRef
 	recoveryTimeout time.Duration
+	// originID is the real network origin every StateTransition this
+	// Explorer produces is stamped with — see Step's own doc. It is set
+	// ONLY by NewHTTPExplorer, NEVER by the generic NewExplorer (which
+	// always leaves it "", regardless of what Collector/Executor a caller
+	// passes — even a genuine *HTTPCollector/*HTTPExecutor pair). This is
+	// deliberate: an EARLIER design derived it by type-asserting
+	// e.collector against an exported, single-method interface
+	// (originIdentifiable{ OriginID() string }) — but ANY external
+	// Collector implementation could satisfy that interface and claim
+	// whatever origin it liked, and NewExplorer itself still accepted
+	// collector/executor as two INDEPENDENTLY supplied values, so nothing
+	// stopped a caller from wiring Collector=server-A alongside
+	// Executor=server-B and having the resulting transition's origin
+	// reflect only the Collector's (possibly unrelated) claim about the
+	// Executor's real target. originID is now a private field this
+	// Explorer trusts about ITSELF, set exactly once by NewHTTPExplorer
+	// from a single *HTTPProfile's own OriginID() — the SAME profile whose
+	// Collector() and Executor() were both passed to NewExplorer, so
+	// Collector/Executor origin mismatch is structurally impossible for
+	// any Explorer built this way.
+	originID string
 
 	// explorationMeter bounds real I/O for Baseline/Step; recoveryMeter is a
 	// SEPARATE, independently bounded "emergency allowance" for every
@@ -198,38 +219,6 @@ type Explorer struct {
 // bounds real I/O rather than a number Explorer itself guesses.
 type Collector interface {
 	Collect(ctx context.Context, scope ExplorationScope) (stateauth.StateArtifact, error)
-}
-
-// originIdentifiable is an OPTIONAL capability a Collector implementation
-// may satisfy: a stable identity for the real network origin every one of
-// its requests actually targets, computed purely from the Collector's own
-// construction — never a caller assertion. HTTPCollector is the only
-// implementation today (see its own OriginID method). collectorOriginID
-// (below) is the ONE place this is ever consulted, and Step (below) is the
-// ONE place that result is ever stamped onto a StateTransition — AT THE
-// MOMENT of that transition's own creation, from the SAME collector that
-// actually issued the requests for it. This is deliberately the opposite
-// of an earlier design (a TransitionCase-level constructor that paired an
-// already-built transition with a separately-supplied *HTTPProfile after
-// the fact): that design could still be fooled by a second profile that
-// happened to share the same abstract ExplorationScope but a DIFFERENT
-// real origin, because nothing tied the transition's OWN creation to the
-// profile actually used. Freezing origin here, at birth, closes that gap
-// structurally — there is no code path left that lets a transition be
-// "reinterpreted" under a different origin after the fact.
-type originIdentifiable interface {
-	OriginID() string
-}
-
-// collectorOriginID returns collector's own OriginID() if it implements
-// originIdentifiable, or "" otherwise — a Collector with no verifiable
-// real-world network origin (a fake/test Collector, or a future non-HTTP
-// implementation) never pretends to have one.
-func collectorOriginID(collector Collector) string {
-	if oi, ok := collector.(originIdentifiable); ok {
-		return oi.OriginID()
-	}
-	return ""
 }
 
 // Executor runs a single authorized action or recovery. It is the ONLY place
@@ -343,7 +332,53 @@ func NewExplorer(
 		recoveryMeter:    newBoundedRequestMeter(recoveryRequestAllowance),
 		visits:           make(map[string]int),
 		tried:            make(map[string]map[string]bool),
+		// originID is deliberately left at its zero value ("") here — see
+		// Explorer.originID's own doc. The generic constructor NEVER
+		// grants the physical-origin guarantee, regardless of what
+		// Collector/Executor a caller passes.
 	}, nil
+}
+
+// NewHTTPExplorer builds an Explorer exactly like NewExplorer, EXCEPT it
+// takes a single *HTTPProfile in place of separately-supplied scope/
+// collector/executor, and is the ONLY constructor that ever grants the
+// resulting Explorer a non-empty originID.
+//
+// THE GAP THIS CLOSES: NewExplorer accepts collector and executor as two
+// INDEPENDENTLY supplied values — nothing there stops a caller from
+// wiring Collector=server-A alongside Executor=server-B (a real,
+// constructible mistake, not a hypothetical one). An earlier design tried
+// to derive origin by type-asserting e.collector against an exported,
+// single-method interface — but that only ever looked at the Collector,
+// never proved the Executor agreed, AND any external Collector
+// implementation (not just HTTPCollector) could satisfy that interface
+// and simply claim whatever origin it liked, since the interface itself
+// granted nothing beyond "has a method with this name". NewHTTPExplorer
+// closes both gaps at once: it takes profile.Collector() AND
+// profile.Executor() from the SAME *HTTPProfile — which HTTPProfile's own
+// construction already guarantees share one real baseURL, so
+// Collector≠Executor origin is structurally impossible here — and stamps
+// e.originID from profile.OriginID() itself, a value this package
+// controls end to end, never a capability an arbitrary external Collector
+// could forge.
+func NewHTTPExplorer(
+	profile *HTTPProfile,
+	projector *stateauth.BoundRegistry,
+	policy *actionauth.ActionPolicy,
+	budget ExplorationBudget,
+	recoveryRef actionauth.RecoveryPlanRef,
+	recoveryTimeout time.Duration,
+	recoveryRequestAllowance int,
+) (*Explorer, error) {
+	if profile == nil {
+		return nil, errors.New("research: NewHTTPExplorer requires a non-nil HTTPProfile")
+	}
+	exp, err := NewExplorer(profile.Scope(), profile.Collector(), projector, policy, profile.Executor(), budget, recoveryRef, recoveryTimeout, recoveryRequestAllowance)
+	if err != nil {
+		return nil, err
+	}
+	exp.originID = profile.OriginID()
+	return exp, nil
 }
 
 // Baseline collects and projects the CURRENT state without taking any
@@ -504,10 +539,13 @@ func (e *Explorer) Step(ctx context.Context) (StateTransition, error) {
 		AfterFingerprint:       after,
 		TransitionArtifactHash: transitionArtifactHash(e.scope.Hash(), beforeRaw, action.ID(), afterRaw, now),
 		Timestamp:              now,
-		// Frozen HERE, from e.collector — the SAME Collector that just
-		// issued the real requests above — never reconstructed later from
-		// a separately-supplied value. See originIdentifiable's own doc.
-		originID: collectorOriginID(e.collector),
+		// Frozen HERE, from e.originID — this Explorer's OWN trusted
+		// origin, set only by NewHTTPExplorer (never derived by type-
+		// asserting e.collector, which any external Collector could
+		// satisfy falsely — see Explorer.originID's own doc). "" for any
+		// Explorer built the generic way, regardless of what Collector/
+		// Executor it was given.
+		originID: e.originID,
 	}
 	if !transition.ScopeConsistent() {
 		// Should be unreachable given the checks above (before/after both came

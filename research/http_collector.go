@@ -72,12 +72,15 @@ func NewHTTPCollector(baseURL, path string) (*HTTPCollector, error) {
 	return &HTTPCollector{baseURL: u, path: path, client: newBudgetedHTTPClient()}, nil
 }
 
-// OriginID implements the optional originIdentifiable capability
-// Explorer.Step consults when freezing a StateTransition's own origin at
-// the moment of its creation — see that interface's own doc (explorer.go).
-// A pure function of this Collector's own baseURL, never a caller
-// assertion; canonicalHTTPOrigin is the SAME function HTTPProfile.OriginID
-// delegates to, so both always agree by construction.
+// OriginID is a pure function of this Collector's own baseURL, never a
+// caller assertion; canonicalHTTPOrigin is the SAME function
+// HTTPProfile.OriginID delegates to, so both always agree by construction.
+// NOT itself consulted by Explorer via any interface type-assertion —
+// Explorer.originID (explorer.go) is set ONLY by NewHTTPExplorer, reading
+// this method through the *HTTPProfile that also produced the matching
+// Executor, never by type-asserting an arbitrary Collector (which any
+// external implementation could satisfy falsely) — see NewHTTPExplorer's
+// own doc for the gap that closes.
 func (c *HTTPCollector) OriginID() string { return canonicalHTTPOrigin(c.baseURL) }
 
 // Collect issues the one fixed GET this Collector was built with and

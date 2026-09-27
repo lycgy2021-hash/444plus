@@ -185,17 +185,19 @@ type StateTransition struct {
 
 	Timestamp time.Time
 
-	// originID is the real network origin (for HTTP, scheme://host) the
-	// Collector that ACTUALLY produced this transition's own I/O was built
-	// from — frozen by Explorer.Step (or an equivalent real collect/
-	// execute/collect sequence) at the EXACT moment this StateTransition
-	// was created, via collectorOriginID(collector) — never reconstructed
-	// afterward from a separately-supplied value. Unexported and with no
-	// general-purpose setter: nothing outside a real collect/execute
-	// sequence can claim "this transition's origin was X" — see
-	// originIdentifiable's own doc (explorer.go) for the gap this closes.
-	// Empty for a Collector with no verifiable real-world origin (a fake/
-	// test Collector, or a future non-HTTP implementation).
+	// originID is the real network origin (for HTTP, scheme://host) this
+	// transition was actually produced against — frozen by Explorer.Step
+	// (or an equivalent real collect/execute/collect sequence) at the
+	// EXACT moment this StateTransition was created, from e.originID —
+	// the producing Explorer's OWN trusted origin, itself set ONLY by
+	// NewHTTPExplorer (explorer.go), never derived by asking an arbitrary
+	// Collector to identify itself. Unexported and with no general-purpose
+	// setter: nothing outside a real collect/execute sequence run by an
+	// Explorer built via NewHTTPExplorer can claim "this transition's
+	// origin was X". Empty for any Explorer built via the generic
+	// NewExplorer — regardless of what Collector/Executor it was given —
+	// since only NewHTTPExplorer, which takes both from a single
+	// *HTTPProfile, can prove they share one real origin.
 	originID string
 }
 

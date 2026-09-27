@@ -1618,21 +1618,62 @@ the guarantees hold under test:
     built, proven to have a genuinely different `OriginID()`, and then
     never touched again, because no function signature anywhere accepts it
     alongside an already-built transition. Every pre-existing E7/E8 fixture
-    was updated to stamp `originID` the same way `Step` does
-    (`collectorOriginID(collector)`, directly on the `StateTransition`
-    literal it hand-builds), since these tests drive collect/execute calls
-    manually rather than through a real `Explorer`.
+    was updated to stamp `originID` the same way `Step` does, since these
+    tests drive collect/execute calls manually rather than through a real
+    `Explorer`.
+  - **Sixth hardening item, found on a real code-level audit of the fifth
+    item's own mechanism (`originIdentifiable`): it was an EXPORTED,
+    single-method interface (`interface{ OriginID() string }`) type-
+    asserted against `e.collector`. Any external `Collector`
+    implementation — not just `HTTPCollector` — could satisfy it and
+    simply claim whatever origin it liked; the interface itself granted
+    nothing beyond "has a method with this name". Separately, the generic
+    `NewExplorer` still accepted `collector` and `executor` as two
+    INDEPENDENTLY supplied values — nothing stopped `Collector=server-A`
+    alongside `Executor=server-B`, after which `Step`'s own origin stamp
+    would reflect only the Collector's (possibly unrelated) claim about
+    where the Executor actually ran.** Fixed by moving trust from an
+    interface `Explorer` asks an external value to answer, to a private
+    field `Explorer` holds about ITSELF: `originIdentifiable` and
+    `collectorOriginID` are gone entirely. `Explorer` gained an unexported
+    `originID string`, left at `""` by the generic `NewExplorer` no matter
+    what `Collector`/`Executor` it is given — even a real, correctly-
+    matched `*HTTPCollector`/`*HTTPExecutor` pair never grants the
+    physical-origin guarantee through this constructor. The new
+    `NewHTTPExplorer(profile *HTTPProfile, projector, policy, budget,
+    recoveryRef, recoveryTimeout, recoveryRequestAllowance)` is the ONLY
+    way to obtain a non-empty `originID`: it takes a SINGLE `*HTTPProfile`
+    in place of separately-supplied collector/executor — `HTTPProfile`'s
+    own construction already guarantees `Collector()`/`Executor()` share
+    one real `baseURL`, so a `Collector`/`Executor` origin mismatch is
+    structurally impossible for any `Explorer` built this way — and stamps
+    `originID` from `profile.OriginID()` directly, a value this package
+    controls end to end. `Step` now stamps `e.originID` with no interface
+    and no type assertion at all.
+    `TestNewHTTPExplorerFreezesOriginIDFromTheProfile` proves the positive
+    path; `TestGenericNewExplorerNeverGrantsOriginIDEvenWithRealHTTPCollectorAndExecutor`
+    proves the generic constructor's fail-closed default holds even for a
+    correctly-matched real pair; the user's own exact adversarial
+    scenario, `TestGenericNewExplorerAcceptsMismatchedCollectorAndExecutorOriginsButRecordsNoOriginID`,
+    wires a real `Collector` for server-A alongside a real `Executor` for
+    a genuinely different server-B into the generic `NewExplorer` and
+    proves the resulting transition's `OriginID()` is `""` — never A's,
+    never B's — so a later strict-origin-binding replay validator fails
+    closed (`ErrReplayMissingOriginBinding`) rather than silently trusting
+    a mismatched pair.
 
   With this fix, `S10-E8`'s physical-origin chain now runs unbroken from
-  the real network call to the Candidate: **real network origin → frozen
-  on `StateTransition` at its own birth → copied unexamined onto
-  `StateMachineBinding` → independently checked against the replay
-  validator's own real origin before any I/O** — with no reconciliation
-  step anywhere in that chain that accepts a second, independently-supplied
-  origin claim. Combined with the fresh-session structural proof and the
-  Engine's own untouched authority, this is the state this document
-  presents S10-E8 in; `S10-E8 = SEALED` is a judgment for the next audit
-  round to confirm, not a status this document declares unilaterally.
+  the real network call to the Candidate, with no external value ever
+  trusted to self-report it: **`HTTPProfile`'s own construction (one
+  `baseURL`, both `Collector` and `Executor`) → `NewHTTPExplorer` alone
+  stamps `Explorer.originID` from it → `Step` freezes it onto
+  `StateTransition` at birth, with no interface asked of an external
+  value → copied unexamined onto `StateMachineBinding` → independently
+  checked against the replay validator's own real origin before any I/O**.
+  Combined with the fresh-session structural proof and the Engine's own
+  untouched authority, this is the state this document presents S10-E8
+  in; `S10-E8 = SEALED` is a judgment for the next audit round to confirm,
+  not a status this document declares unilaterally.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
   Any future state-preparation capability remains deferred — it needs its
