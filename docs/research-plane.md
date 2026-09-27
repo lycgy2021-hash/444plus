@@ -1559,22 +1559,54 @@ the guarantees hold under test:
     EXACT scenario above with two real, independent fixture servers and
     proves the rejection, with neither server's own hit-counter moving;
     `TestReplayRejectsMissingOriginBindingUnderStrictValidator` proves the
-    fail-closed half. Every pre-existing E7/E8 fixture now sets
-    `TransitionCase.OriginID` to its own real fixture server's canonical
-    origin (via a small test-only `e7FixtureOriginID` helper), so every
-    already-passing test continues to pass with real, correct evidence —
-    never a value invented to make the check pass.
+    fail-closed half.
+  - **Fourth hardening item, found on a real code-level construction of the
+    exact byte-for-byte gap it predicts (again): `TransitionCase.OriginID`
+    was a PLAIN EXPORTED STRING FIELD — the doc comment said "never a
+    caller assertion", but the type said otherwise. Nothing stopped
+    `TransitionCase{Transition: transitionFromServerA, Scope: scopeA,
+    OriginID: "http://server-B"}` — a real transition that ran against A,
+    permanently mislabeled as having come from B — after which every later
+    check (`ReplayTargetHash`, the origin self-consistency check, the
+    strict-origin-binding check the third hardening item just added) would
+    agree with that lie, because all of them, ultimately, just compare
+    against whatever string `Produce` copied out of this field.** Fixed,
+    WITHOUT a new package or a new authority layer, mirroring
+    `actionauth.BoundAction`'s own "identity comes from construction, never
+    a caller-supplied field" discipline: `TransitionCase.OriginID` is now
+    an unexported `originID` with a read-only `OriginID() string` getter,
+    and the ONLY way to obtain a non-empty one is the new
+    `NewHTTPTransitionCase(profile *HTTPProfile, transition StateTransition)
+    (TransitionCase, error)` — it requires `profile.Scope().Hash() ==
+    transition.ScopeHash` (proving profile really is the SAME profile that
+    produced this exact transition, not merely some other profile the
+    caller happens to also be holding) and then takes BOTH `Scope` and
+    `originID` FROM the profile itself, never from a separately-supplied
+    value — closing the identical gap for `Scope` that `originID` closes
+    for origin. A `TransitionCase` built the plain struct-literal way
+    (still the only path for a non-HTTP transition) has no field a caller
+    could set to fake an origin at all; `OriginID()` is simply `""`.
+    `TestNewHTTPTransitionCaseDerivesOriginIDFromProfile`,
+    `TestNewHTTPTransitionCaseRejectsScopeHashMismatch`,
+    `TestNewHTTPTransitionCaseRejectsNilProfile`, and
+    `TestPlainTransitionCaseLiteralHasEmptyOriginID` prove the primitive
+    directly; every pre-existing E7/E8 fixture (`e7BuildOriginalCandidateWithSafety`)
+    was rewritten to build its Collector/Executor through an `HTTPProfile`
+    and call `NewHTTPTransitionCase` — the SAME profile that actually
+    issues the fixture's requests is the only thing ever trusted for that
+    candidate's real origin, exactly as production code must.
 
-  **`S10-E8 = SEALED`** after this fourth hardening round: `hypothesis →
+  **`S10-E8 = SEALED`** after this fifth hardening round: `hypothesis →
   independent replay → reproducible` is a real, tested, end-to-end path
   through production code, with the Engine's authority untouched, the
   replay validator's own target/network binding structurally
   self-consistent AND independently proven to match the ORIGINAL
   candidate's real physical origin (never merely internally consistent
-  with itself), and session freshness a checked fact rather than a
-  documented intent. S10's own architecture stops expanding here — the next
-  stage is Value Proof against a real, authorized target, not further
-  infrastructure.
+  with itself, and never a caller-asserted string standing in for that
+  origin at ANY point in the chain), and session freshness a checked fact
+  rather than a documented intent. S10's own architecture stops expanding
+  here — the next stage is Value Proof against a real, authorized target,
+  not further infrastructure.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
   Any future state-preparation capability remains deferred — it needs its

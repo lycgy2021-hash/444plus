@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,20 +11,6 @@ import (
 	"gopoc/internal/actionauth"
 	"gopoc/internal/stateauth"
 )
-
-// e7FixtureOriginID returns f's own real network origin, canonicalized
-// exactly as HTTPProfile.OriginID() would — used to give every E7-fixture-
-// built Candidate a real, correct TransitionCase.OriginID (see that
-// field's own doc) rather than leaving it empty, so S10/E8's strict-origin-
-// binding tests have real evidence to check against.
-func e7FixtureOriginID(t *testing.T, f *e7Fixture) string {
-	t.Helper()
-	u, err := url.Parse(f.ts.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return canonicalHTTPOrigin(u)
-}
 
 // This file is E7's freeze-gate battery. Every "candidate under test" is
 // produced through the REAL E6 pipeline (StateMachineProducer.Produce
@@ -118,14 +103,15 @@ func e7DenyOnlyPolicy(projectorID stateauth.ProjectorID, safety actionauth.Actio
 func e7BuildOriginalCandidateWithSafety(t *testing.T, f *e7Fixture, sessionID string, safety actionauth.ActionSafety) (*Candidate, *TransitionRuleRegistry, *actionauth.ActionPolicy, TransitionRule) {
 	t.Helper()
 	scope := e7ReplayTarget().Scope(sessionID)
-	collector, err := NewHTTPCollector(f.ts.URL, "/state")
+	// Built via HTTPProfile — the SAME profile that actually issues the
+	// requests below is the ONLY thing NewHTTPTransitionCase (below) will
+	// ever trust for this candidate's real origin.
+	profile, err := NewHTTPProfile(scope, f.ts.URL, "/state", map[string]string{"deny": "/deny"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor, err := NewHTTPExecutor(f.ts.URL, map[string]string{"deny": "/deny"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	collector := profile.Collector()
+	executor := profile.Executor()
 	projector := stateauth.HTTPFixtureRegistry()
 	meter := newBoundedRequestMeter(10)
 	ctx := context.Background()
@@ -168,7 +154,11 @@ func e7BuildOriginalCandidateWithSafety(t *testing.T, f *e7Fixture, sessionID st
 	if err != nil {
 		t.Fatalf("NewTransitionRuleRegistry: %v", err)
 	}
-	candidates := NewStateMachineProducer(registry).Produce(TransitionCase{Transition: tr, Scope: scope, OriginID: e7FixtureOriginID(t, f)})
+	tc, err := NewHTTPTransitionCase(profile, tr)
+	if err != nil {
+		t.Fatalf("NewHTTPTransitionCase: %v", err)
+	}
+	candidates := NewStateMachineProducer(registry).Produce(tc)
 	if len(candidates) != 1 {
 		t.Fatalf("setup: expected exactly 1 real candidate, got %d", len(candidates))
 	}

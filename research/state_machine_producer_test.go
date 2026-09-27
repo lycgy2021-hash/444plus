@@ -779,3 +779,69 @@ func TestE6CaseArtifactHashChangesWhenExpectationSourceIDChanges(t *testing.T) {
 		t.Fatal("transitionCaseArtifactHash must change when ExpectationSource.ID changes")
 	}
 }
+
+// --- NewHTTPTransitionCase: OriginID can ONLY come from a real HTTPProfile,
+// never a caller-supplied string — S10/E8's final freeze blocker.
+
+// TestNewHTTPTransitionCaseDerivesOriginIDFromProfile proves the ONLY path
+// to a non-empty TransitionCase.OriginID() actually derives it from a real
+// *HTTPProfile — never accepts one as a bare argument the caller could
+// invent — and that Scope is likewise taken from the profile itself.
+func TestNewHTTPTransitionCaseDerivesOriginIDFromProfile(t *testing.T) {
+	ts := newHTTPFixtureServer(t)
+	scope := ExplorationScope{TargetID: "e6-http-target", SessionID: "s1"}
+	profile, err := NewHTTPProfile(scope, ts.URL, "/state", map[string]string{"get-root": "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := StateTransition{ScopeHash: scope.Hash()}
+
+	tc, err := NewHTTPTransitionCase(profile, tr)
+	if err != nil {
+		t.Fatalf("NewHTTPTransitionCase: %v", err)
+	}
+	if tc.OriginID() == "" {
+		t.Fatal("OriginID() must be non-empty when built via NewHTTPTransitionCase")
+	}
+	if tc.OriginID() != profile.OriginID() {
+		t.Fatalf("OriginID() = %q, want the profile's own OriginID() %q", tc.OriginID(), profile.OriginID())
+	}
+	if tc.Scope != profile.Scope() {
+		t.Fatalf("Scope = %+v, want the profile's own Scope() %+v", tc.Scope, profile.Scope())
+	}
+}
+
+// TestNewHTTPTransitionCaseRejectsScopeHashMismatch proves profile must
+// actually be the profile that produced transition — a caller cannot pair
+// a real transition from one scope with an unrelated profile built for a
+// different one and have OriginID silently attached anyway.
+func TestNewHTTPTransitionCaseRejectsScopeHashMismatch(t *testing.T) {
+	ts := newHTTPFixtureServer(t)
+	profile, err := NewHTTPProfile(ExplorationScope{TargetID: "a"}, ts.URL, "/state", map[string]string{"get-root": "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedTransition := StateTransition{ScopeHash: ExplorationScope{TargetID: "a-completely-different-scope"}.Hash()}
+	if _, err := NewHTTPTransitionCase(profile, unrelatedTransition); err == nil {
+		t.Fatal("NewHTTPTransitionCase must reject a transition whose ScopeHash does not match profile.Scope().Hash()")
+	}
+}
+
+// TestNewHTTPTransitionCaseRejectsNilProfile is the direct nil-guard proof.
+func TestNewHTTPTransitionCaseRejectsNilProfile(t *testing.T) {
+	if _, err := NewHTTPTransitionCase(nil, StateTransition{}); err == nil {
+		t.Fatal("NewHTTPTransitionCase must reject a nil profile")
+	}
+}
+
+// TestPlainTransitionCaseLiteralHasEmptyOriginID proves the "never a
+// caller assertion" claim holds structurally: the plain struct-literal
+// construction path (still the only one for a non-HTTP transition) simply
+// has no field a caller could set to fake an origin — OriginID() is always
+// "" unless NewHTTPTransitionCase built the value.
+func TestPlainTransitionCaseLiteralHasEmptyOriginID(t *testing.T) {
+	tc := TransitionCase{Transition: StateTransition{}, Scope: ExplorationScope{}}
+	if tc.OriginID() != "" {
+		t.Fatalf("OriginID() = %q, want \"\" for a plain struct-literal TransitionCase", tc.OriginID())
+	}
+}
