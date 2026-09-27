@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +12,20 @@ import (
 	"gopoc/internal/actionauth"
 	"gopoc/internal/stateauth"
 )
+
+// e7FixtureOriginID returns f's own real network origin, canonicalized
+// exactly as HTTPProfile.OriginID() would — used to give every E7-fixture-
+// built Candidate a real, correct TransitionCase.OriginID (see that
+// field's own doc) rather than leaving it empty, so S10/E8's strict-origin-
+// binding tests have real evidence to check against.
+func e7FixtureOriginID(t *testing.T, f *e7Fixture) string {
+	t.Helper()
+	u, err := url.Parse(f.ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonicalHTTPOrigin(u)
+}
 
 // This file is E7's freeze-gate battery. Every "candidate under test" is
 // produced through the REAL E6 pipeline (StateMachineProducer.Produce
@@ -153,7 +168,7 @@ func e7BuildOriginalCandidateWithSafety(t *testing.T, f *e7Fixture, sessionID st
 	if err != nil {
 		t.Fatalf("NewTransitionRuleRegistry: %v", err)
 	}
-	candidates := NewStateMachineProducer(registry).Produce(TransitionCase{Transition: tr, Scope: scope})
+	candidates := NewStateMachineProducer(registry).Produce(TransitionCase{Transition: tr, Scope: scope, OriginID: e7FixtureOriginID(t, f)})
 	if len(candidates) != 1 {
 		t.Fatalf("setup: expected exactly 1 real candidate, got %d", len(candidates))
 	}

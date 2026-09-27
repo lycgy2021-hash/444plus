@@ -138,6 +138,15 @@ type StateMachineReplayValidator struct {
 	policy    *actionauth.ActionPolicy
 	executor  Executor
 	budget    ReplayBudget
+	// strictOriginBinding is set ONLY by NewHTTPStateMachineReplayValidator
+	// (never by the generic NewStateMachineReplayValidator, and never
+	// exported — no caller outside this file can set it directly). When
+	// true, Replay additionally requires binding.OriginalOriginID() to be
+	// non-empty AND equal to v.target.OriginID — see Replay's own check for
+	// why this is a SEPARATE, per-Candidate proof from the origin
+	// self-consistency NewHTTPStateMachineReplayValidator already checks
+	// at construction time.
+	strictOriginBinding bool
 }
 
 // ReplayBudget bounds ONE replay attempt: a fresh baseline collection,
@@ -229,7 +238,20 @@ func NewHTTPStateMachineReplayValidator(
 		return nil, fmt.Errorf("research: ReplayTarget.OriginID %q does not match this HTTPProfile's own origin %q — the collector/executor would replay against a different real target than ReplayTarget claims",
 			target.OriginID, profile.OriginID())
 	}
-	return NewStateMachineReplayValidator(target, rules, policy, profile.Collector(), projector, profile.Executor(), budget)
+	v, err := NewStateMachineReplayValidator(target, rules, policy, profile.Collector(), projector, profile.Executor(), budget)
+	if err != nil {
+		return nil, err
+	}
+	// strictOriginBinding is the SECOND half of this constructor's own
+	// guarantee: the check above only proves target/profile are
+	// self-consistent with EACH OTHER; it says nothing about whether THIS
+	// validator's real origin matches the origin the ORIGINAL candidate
+	// actually came from. Replay itself performs that per-Candidate check
+	// — see its own doc — using binding.OriginalOriginID(), which only an
+	// HTTP-aware caller building the original TransitionCase could ever
+	// have set.
+	v.strictOriginBinding = true
+	return v, nil
 }
 
 // Name identifies this validator in ValidationResult.Validator and in
@@ -306,17 +328,19 @@ func (v *StateMachineReplayValidator) Validate(ctx context.Context, _ model.Targ
 // as an ordinary error too, per the "network error / scope drift / budget /
 // timeout -> error" rule).
 var (
-	ErrReplayUnsupportedOrigin = errors.New("research: replay validator only supports OriginStateMachine candidates")
-	ErrReplayMissingBinding    = errors.New("research: candidate has no StateMachineBinding to replay against")
-	ErrReplayMissingRuleID     = errors.New("research: candidate's StateMachineBinding has no RuleID to replay against")
-	ErrReplayUnknownRule       = errors.New("research: candidate's RuleID is not registered in this validator's TransitionRuleRegistry")
-	ErrReplayActionMismatch    = errors.New("research: candidate's bound action identity does not match the resolved rule's ActionID")
-	ErrReplayProjectorMismatch = errors.New("research: candidate's bound projector identity does not match the resolved rule's ProjectorID")
-	ErrReplayTargetMismatch    = errors.New("research: candidate's ReplayTargetHash does not match this validator's own ReplayTarget")
-	ErrReplayPolicyMismatch    = errors.New("research: this validator's ActionPolicy has a different PolicyID than the one the candidate's action was originally bound under")
-	ErrReplayActionNotReadOnly = errors.New("research: the freshly selected action's own registered Safety is not actionauth.ActionStrictReadOnly — v1 replays only strict read-only actions")
-	ErrReplaySessionIDRequired = errors.New("research: replay requires a non-empty, freshly chosen sessionID")
-	ErrReplaySessionNotFresh   = errors.New("research: this replay's own scope hash equals the ORIGINAL candidate's own scope hash — sessionID was not actually fresh")
+	ErrReplayUnsupportedOrigin    = errors.New("research: replay validator only supports OriginStateMachine candidates")
+	ErrReplayMissingBinding       = errors.New("research: candidate has no StateMachineBinding to replay against")
+	ErrReplayMissingRuleID        = errors.New("research: candidate's StateMachineBinding has no RuleID to replay against")
+	ErrReplayUnknownRule          = errors.New("research: candidate's RuleID is not registered in this validator's TransitionRuleRegistry")
+	ErrReplayActionMismatch       = errors.New("research: candidate's bound action identity does not match the resolved rule's ActionID")
+	ErrReplayProjectorMismatch    = errors.New("research: candidate's bound projector identity does not match the resolved rule's ProjectorID")
+	ErrReplayTargetMismatch       = errors.New("research: candidate's ReplayTargetHash does not match this validator's own ReplayTarget")
+	ErrReplayPolicyMismatch       = errors.New("research: this validator's ActionPolicy has a different PolicyID than the one the candidate's action was originally bound under")
+	ErrReplayActionNotReadOnly    = errors.New("research: the freshly selected action's own registered Safety is not actionauth.ActionStrictReadOnly — v1 replays only strict read-only actions")
+	ErrReplaySessionIDRequired    = errors.New("research: replay requires a non-empty, freshly chosen sessionID")
+	ErrReplaySessionNotFresh      = errors.New("research: this replay's own scope hash equals the ORIGINAL candidate's own scope hash — sessionID was not actually fresh")
+	ErrReplayMissingOriginBinding = errors.New("research: this validator requires strict origin binding, but the candidate's StateMachineBinding carries no OriginalOriginID — it predates origin binding and cannot get the same-physical-origin guarantee")
+	ErrReplayOriginMismatch       = errors.New("research: candidate's OriginalOriginID does not match this validator's own ReplayTarget.OriginID — replaying against a different real HTTP origin than the original candidate")
 )
 
 // Replay independently re-tests c against a FRESH session (sessionID) under
@@ -367,6 +391,30 @@ func (v *StateMachineReplayValidator) Replay(ctx context.Context, c *Candidate, 
 	}
 	if binding.ReplayTargetHash() != v.target.Hash() {
 		return ValidationResult{}, ErrReplayTargetMismatch
+	}
+	// SAME PHYSICAL HTTP ORIGIN AS THE ORIGINAL CANDIDATE, not merely
+	// "this validator's own target/profile happen to agree with each
+	// other". ReplayTargetHash (above) only proves TargetID/BuildID/
+	// Protocol/HarnessID — abstract, caller-chosen labels — match; it says
+	// nothing about a real network address, since ExplorationScope itself
+	// never carried one. NewHTTPStateMachineReplayValidator's own
+	// construction-time check (target.OriginID == profile.OriginID())
+	// only proves internal self-consistency of THIS validator's inputs —
+	// it does not prove those inputs describe the SAME origin the
+	// ORIGINAL candidate actually ran against. Only this check does: it
+	// compares v.target.OriginID against binding.OriginalOriginID(), the
+	// ORIGINAL TransitionCase's own declared origin, copied unexamined by
+	// Produce. strictOriginBinding is set ONLY by
+	// NewHTTPStateMachineReplayValidator — a validator built the generic
+	// way never enforces this, since it has no HTTP origin of its own to
+	// compare.
+	if v.strictOriginBinding {
+		if binding.OriginalOriginID() == "" {
+			return ValidationResult{}, ErrReplayMissingOriginBinding
+		}
+		if binding.OriginalOriginID() != v.target.OriginID {
+			return ValidationResult{}, ErrReplayOriginMismatch
+		}
 	}
 	// SAME action-authority semantics, not merely the same ActionID by
 	// coincidence — see this file's own top-of-file doc. A pure, no-I/O

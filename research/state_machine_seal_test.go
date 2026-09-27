@@ -3,6 +3,7 @@ package research
 import (
 	"context"
 	"testing"
+	"time"
 
 	"gopoc/internal/actionauth"
 	"gopoc/internal/model"
@@ -261,5 +262,128 @@ func TestStateMachineBindingCarriesOriginalScopeHash(t *testing.T) {
 	wantScope := e7ReplayTarget().Scope("original-session")
 	if binding.OriginalScopeHash() != wantScope.Hash() {
 		t.Fatalf("OriginalScopeHash() = %q, want %q (the original transition's own scope hash)", binding.OriginalScopeHash(), wantScope.Hash())
+	}
+}
+
+// --- "original HTTP origin -> replay HTTP origin": strict origin binding ---
+
+// TestReplayRejectsCandidateFromADifferentPhysicalOrigin is the direct
+// proof for the LAST S10/E8 hardening item: a Candidate whose ORIGINAL
+// TransitionCase declared one real HTTP origin (fixture server A) must be
+// refused when replayed through a strict-origin-binding validator whose
+// OWN real origin is a DIFFERENT server (B) — even though target.Hash()
+// (TargetID/BuildID/Protocol/HarnessID — abstract labels) and the
+// validator's own target/profile self-consistency check (target.OriginID
+// == profile.OriginID(), both B) both agree with EACH OTHER. Proving "same
+// logical target labels + internally consistent replay wiring" is NOT the
+// same claim as "same physical HTTP origin as the original candidate" —
+// exactly the gap ErrReplayOriginMismatch closes. Checked before any I/O:
+// neither fixture's deny-hit counter moves.
+func TestReplayRejectsCandidateFromADifferentPhysicalOrigin(t *testing.T) {
+	serverA := newE7Fixture(t) // where the ORIGINAL candidate's transition actually ran
+	c, registry, policy, _ := e7BuildOriginalCandidate(t, serverA, "original-session")
+	serverA.reset()
+
+	serverB := newE7Fixture(t) // a genuinely DIFFERENT real origin
+	profileB, err := NewHTTPProfile(ExplorationScope{}, serverB.ts.URL, "/state", map[string]string{"deny": "/deny"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetB := e7ReplayTarget() // SAME abstract labels (TargetID/BuildID/Protocol/HarnessID) as the original
+	targetB.OriginID = profileB.OriginID()
+
+	v, err := NewHTTPStateMachineReplayValidator(targetB, registry, policy, profileB, stateauth.HTTPFixtureRegistry(), e7DefaultBudget())
+	if err != nil {
+		t.Fatalf("construction must succeed — targetB and profileB are self-consistent with EACH OTHER: %v", err)
+	}
+
+	if _, err := v.Replay(context.Background(), c, "replay-session-against-server-b"); err != ErrReplayOriginMismatch {
+		t.Fatalf("Replay against a validator whose real origin differs from the original candidate's own: err = %v, want %v", err, ErrReplayOriginMismatch)
+	}
+	if got := serverA.denyHitCount(); got != 1 {
+		t.Fatalf("serverA denyHitCount = %d, want 1 (only the original run)", got)
+	}
+	if got := serverB.denyHitCount(); got != 0 {
+		t.Fatalf("serverB denyHitCount = %d, want 0 — the origin mismatch must be caught before any request ever reaches serverB", got)
+	}
+}
+
+// TestReplayRejectsMissingOriginBindingUnderStrictValidator proves the
+// other half: a strict-origin-binding validator refuses a candidate whose
+// original TransitionCase never declared an OriginID at all (predates
+// origin binding, or was produced by a caller that never set it) — it
+// never treats "no evidence" as "matches anything".
+func TestReplayRejectsMissingOriginBindingUnderStrictValidator(t *testing.T) {
+	f := newE7Fixture(t)
+	scope := e7ReplayTarget().Scope("original-session")
+	collector, err := NewHTTPCollector(f.ts.URL, "/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewHTTPExecutor(f.ts.URL, map[string]string{"deny": "/deny"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projector := stateauth.HTTPFixtureRegistry()
+	meter := newBoundedRequestMeter(10)
+	ctx := context.Background()
+	before, beforeRaw, err := collectAndProject(ctx, collector, projector, scope, meter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := e7DenyOnlyPolicy(before.ProjectorID(), actionauth.ActionStrictReadOnly)
+	boundAction, ok := policy.Select(scope.Hash(), before, nil)
+	if !ok {
+		t.Fatal("expected a match for 'deny'")
+	}
+	if err := executor.Execute(ContextWithRequestMeter(ctx, meter), boundAction); err != nil {
+		t.Fatal(err)
+	}
+	after, afterRaw, err := collectAndProject(ctx, collector, projector, scope, meter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tr := StateTransition{
+		ScopeHash:              scope.Hash(),
+		BeforeFingerprint:      before,
+		Action:                 boundAction,
+		AfterFingerprint:       after,
+		EvidenceRefs:           []string{"orig-evidence"},
+		TransitionArtifactHash: transitionArtifactHash(scope.Hash(), beforeRaw, boundAction.ID(), afterRaw, now),
+		Timestamp:              now,
+	}
+	rule := TransitionRule{
+		RuleID:            "deny-must-not-change-status-no-origin",
+		ActionID:          boundAction.ID(),
+		ProjectorID:       before.ProjectorID(),
+		Expectation:       TransitionExpectation{Kind: ExpectFactTransition, Fact: "status", BeforeValue: "200", AfterValue: "200"},
+		ExpectationSource: ExpectationSource{Kind: ExpectationSourceHumanConfig, ID: "e7-test-config"},
+	}
+	registry, err := NewTransitionRuleRegistry(rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately NO OriginID on this TransitionCase — simulates a
+	// candidate produced before origin binding existed.
+	candidates := NewStateMachineProducer(registry).Produce(TransitionCase{Transition: tr, Scope: scope})
+	if len(candidates) != 1 {
+		t.Fatalf("setup: expected exactly 1 candidate, got %d", len(candidates))
+	}
+	c := candidates[0]
+
+	f.reset()
+	profile, err := NewHTTPProfile(ExplorationScope{}, f.ts.URL, "/state", map[string]string{"deny": "/deny"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := e7ReplayTarget()
+	target.OriginID = profile.OriginID()
+	v, err := NewHTTPStateMachineReplayValidator(target, registry, policy, profile, stateauth.HTTPFixtureRegistry(), e7DefaultBudget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Replay(context.Background(), c, "replay-session"); err != ErrReplayMissingOriginBinding {
+		t.Fatalf("Replay of an origin-less candidate under a strict validator: err = %v, want %v", err, ErrReplayMissingOriginBinding)
 	}
 }

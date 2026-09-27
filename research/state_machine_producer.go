@@ -173,6 +173,22 @@ type StateMachineBinding struct {
 	// freshReplaySessionID never coincidentally repeating a caller's own
 	// past sessionID.
 	originalScopeHash string
+	// originalOriginID is the ORIGINAL TransitionCase's own OriginID (see
+	// that field's own doc) — the real HTTP network origin the ORIGINAL
+	// exploration actually ran against, copied unexamined from whatever
+	// the caller who built the original TransitionCase declared. This is
+	// DIFFERENT from ReplayTargetHash (which only proves TargetID/BuildID/
+	// Protocol/HarnessID — abstract labels — match) and from
+	// NewHTTPStateMachineReplayValidator's own target/profile
+	// self-consistency check (which only proves a replay's OWN inputs
+	// agree with EACH OTHER, never that they agree with the ORIGINAL
+	// candidate). A strict-origin-binding replay validator compares this
+	// against its OWN real origin before ever replaying — see
+	// ErrReplayOriginMismatch/ErrReplayMissingOriginBinding in
+	// state_machine_replay.go. Empty for any candidate whose original
+	// TransitionCase never set OriginID — never treated as "matches
+	// anything" by a validator that requires this binding.
+	originalOriginID string
 }
 
 func (b StateMachineBinding) RuleID() string                     { return b.ruleID }
@@ -182,6 +198,7 @@ func (b StateMachineBinding) ReplayTargetHash() string           { return b.repl
 func (b StateMachineBinding) CaseArtifactHash() string           { return b.caseArtifactHash }
 func (b StateMachineBinding) PolicyID() string                   { return b.policyID }
 func (b StateMachineBinding) SpecID() string                     { return b.specID }
+func (b StateMachineBinding) OriginalOriginID() string           { return b.originalOriginID }
 func (b StateMachineBinding) OriginalScopeHash() string          { return b.originalScopeHash }
 
 // ReplayTarget identifies WHAT is being explored/replayed against: the same
@@ -374,9 +391,26 @@ func (r *TransitionRuleRegistry) LookupByRuleID(ruleID string) (TransitionRule, 
 // recover from it alone. validate() (below) verifies Scope actually IS the
 // scope that produced this ScopeHash — a caller cannot claim an arbitrary
 // Scope for a real transition and have it accepted.
+//
+// OriginID is OPTIONAL and protocol-specific: for a transition collected
+// through an HTTPProfile, the caller building this TransitionCase (the one
+// who actually ran the original Explorer session, and therefore actually
+// holds the HTTPProfile) sets it to profile.OriginID() — the real network
+// origin the ORIGINAL Collector/Executor were built from, never a caller
+// assertion invented for this purpose. Produce copies it, unexamined, onto
+// StateMachineBinding.originalOriginID (see that field's own doc) — it is
+// the ONLY way a later NewHTTPStateMachineReplayValidator can prove a
+// replay ran against the SAME physical HTTP origin as the ORIGINAL
+// candidate, rather than merely a validator whose own target/profile pair
+// happens to be internally self-consistent. Left empty (as every
+// TransitionCase built before this field existed necessarily is), a
+// strict-origin-binding replay validator refuses outright — S10/E8
+// deliberately never pretends an old candidate carries evidence it never
+// actually recorded.
 type TransitionCase struct {
 	Transition StateTransition
 	Scope      ExplorationScope
+	OriginID   string
 }
 
 // resolvedTransitionCase pairs a TransitionCase with the ONE TransitionRule
@@ -387,6 +421,7 @@ type TransitionCase struct {
 type resolvedTransitionCase struct {
 	Transition StateTransition
 	Scope      ExplorationScope
+	OriginID   string
 	Rule       TransitionRule
 }
 
@@ -401,7 +436,7 @@ func (p *StateMachineProducer) resolve(c TransitionCase) (resolvedTransitionCase
 	if !ok {
 		return resolvedTransitionCase{}, false
 	}
-	return resolvedTransitionCase{Transition: c.Transition, Scope: c.Scope, Rule: rule}, true
+	return resolvedTransitionCase{Transition: c.Transition, Scope: c.Scope, OriginID: c.OriginID, Rule: rule}, true
 }
 
 // validate reports whether rc is well-formed and authorized enough to judge
@@ -704,6 +739,7 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 			policyID:          policyID,
 			specID:            specID,
 			originalScopeHash: rc.Transition.ScopeHash,
+			originalOriginID:  rc.OriginID,
 		}
 		cand.Refs = map[string]string{
 			"transition_artifact_hash": rc.Transition.TransitionArtifactHash,
@@ -725,6 +761,7 @@ func (p *StateMachineProducer) Produce(c TransitionCase) []*Candidate {
 			"policy_id":           policyID,
 			"action_spec_id":      specID,
 			"original_scope_hash": rc.Transition.ScopeHash,
+			"original_origin_id":  rc.OriginID,
 		}
 		candidates = append(candidates, cand)
 	}
@@ -758,6 +795,7 @@ func transitionCaseArtifactHash(rc resolvedTransitionCase) string {
 	b.WriteString("scope_session_id=" + rc.Scope.SessionID + "\n")
 	b.WriteString("scope_protocol=" + rc.Scope.Protocol + "\n")
 	b.WriteString("scope_harness_id=" + rc.Scope.HarnessID + "\n")
+	b.WriteString("origin_id=" + rc.OriginID + "\n")
 	b.WriteString("before=" + canonicalTransitionFingerprint(t.BeforeFingerprint) + "\n")
 	b.WriteString("action_registry_key=" + t.Action.ID().RegistryKey + "\n")
 	b.WriteString("action_variant_id=" + t.Action.ID().VariantID + "\n")

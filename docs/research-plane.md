@@ -1518,12 +1518,63 @@ the guarantees hold under test:
     test's own hand-chosen sessionID already produced a genuinely different
     scope hash from the original; this check only makes that fact provable
     rather than assumed.
+  - **Third hardening item, found on a real code-level construction of the
+    exact byte-for-byte scenario it predicts: the first hardening item's
+    own `target.OriginID == profile.OriginID()` check only proves a
+    replay's OWN target and profile agree with EACH OTHER — it never
+    compares against anything the ORIGINAL candidate actually recorded,
+    because `StateMachineBinding` never carried the original's real HTTP
+    origin at all. A caller could therefore construct: an original
+    candidate that really ran against `server-A`, whose `ReplayTargetHash`
+    only ever encoded the abstract labels `(target-1, build-1, http, h1)`
+    — and a fully self-consistent `NewHTTPStateMachineReplayValidator`
+    pointed at a COMPLETELY DIFFERENT `server-B`, with `target.OriginID ==
+    profile.OriginID()` both equal to B. Every existing check
+    (`ReplayTargetHash`, the first hardening item's own origin
+    self-consistency check) would pass, while the replay silently ran
+    against the wrong physical target — proving only "same logical target
+    labels + internally consistent replay wiring", never "same physical
+    HTTP origin as the original candidate".** Fixed, WITHOUT touching
+    `ReplayTarget.Hash()`'s frozen semantics again: `TransitionCase`
+    (E6 producer's own input type, already extended once before for
+    `Scope`) gained an optional, protocol-specific `OriginID string` — set
+    by whoever built the ORIGINAL `TransitionCase` from their own
+    `HTTPProfile.OriginID()`, never invented after the fact.
+    `StateMachineBinding` gained `originalOriginID` (copied unexamined from
+    `TransitionCase.OriginID` at `Produce` time, plus
+    `Refs["original_origin_id"]` for human audit) and an
+    `OriginalOriginID()` getter; `transitionCaseArtifactHash` gained an
+    `origin_id=` line, keeping the lossless-hash discipline. Deliberately
+    VERSIONED rather than silently assumed: `StateMachineReplayValidator`
+    gained an unexported `strictOriginBinding bool`, set ONLY by
+    `NewHTTPStateMachineReplayValidator` (never by the generic
+    constructor, and never settable from outside this file) — a validator
+    built the generic way enforces nothing about origin, exactly as
+    before. When `strictOriginBinding` is true, `Replay` now checks, before
+    any I/O, that `binding.OriginalOriginID()` is non-empty
+    (`ErrReplayMissingOriginBinding` otherwise — an old-style candidate
+    that never recorded this evidence gets NO pretended guarantee) AND
+    equals `v.target.OriginID` (`ErrReplayOriginMismatch` otherwise).
+    `TestReplayRejectsCandidateFromADifferentPhysicalOrigin` builds the
+    EXACT scenario above with two real, independent fixture servers and
+    proves the rejection, with neither server's own hit-counter moving;
+    `TestReplayRejectsMissingOriginBindingUnderStrictValidator` proves the
+    fail-closed half. Every pre-existing E7/E8 fixture now sets
+    `TransitionCase.OriginID` to its own real fixture server's canonical
+    origin (via a small test-only `e7FixtureOriginID` helper), so every
+    already-passing test continues to pass with real, correct evidence —
+    never a value invented to make the check pass.
 
-  **`S10-E8 = SEALED`**: `hypothesis → independent replay → reproducible` is
-  now a real, tested, end-to-end path through production code, with the
-  Engine's authority untouched, the replay validator's own target/network
-  binding structurally self-consistent, and session freshness a checked
-  fact rather than a documented intent.
+  **`S10-E8 = SEALED`** after this fourth hardening round: `hypothesis →
+  independent replay → reproducible` is a real, tested, end-to-end path
+  through production code, with the Engine's authority untouched, the
+  replay validator's own target/network binding structurally
+  self-consistent AND independently proven to match the ORIGINAL
+  candidate's real physical origin (never merely internally consistent
+  with itself), and session freshness a checked fact rather than a
+  documented intent. S10's own architecture stops expanding here — the next
+  stage is Value Proof against a real, authorized target, not further
+  infrastructure.
 - **Deferred:** `S7` large-scale source audit — the local-model signal-to-noise on
   a whole repo is lower than the diff/fuzz/differential sources already built.
   Any future state-preparation capability remains deferred — it needs its
